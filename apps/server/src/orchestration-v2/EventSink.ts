@@ -73,17 +73,21 @@ export type EventSinkV2Error = typeof EventSinkV2Error.Type;
 export interface EventSinkV2Shape {
   readonly write: (input: {
     readonly guardPendingUserInputCancellations?: boolean;
+    /** Drop node.updated events that would rewrite their projection row unchanged. */
+    readonly dropUnchangedNodeUpdates?: boolean;
     readonly commandId?: CommandId;
     readonly events: ReadonlyArray<OrchestrationV2DomainEvent>;
   }) => Effect.Effect<ReadonlyArray<OrchestrationV2StoredEvent>, EventSinkV2Error>;
   readonly writeWithEffects: (input: {
     readonly guardPendingUserInputCancellations?: boolean;
+    readonly dropUnchangedNodeUpdates?: boolean;
     readonly commandId?: CommandId;
     readonly events: ReadonlyArray<OrchestrationV2DomainEvent>;
     readonly effects: ReadonlyArray<EffectOutbox.PendingOrchestrationEffectV2>;
   }) => Effect.Effect<ReadonlyArray<OrchestrationV2StoredEvent>, EventSinkV2Error>;
   readonly writeIfRunCurrent: (input: {
     readonly guardPendingUserInputCancellations?: boolean;
+    readonly dropUnchangedNodeUpdates?: boolean;
     readonly commandId?: CommandId;
     readonly threadId: ThreadId;
     readonly runId: RunId;
@@ -105,6 +109,7 @@ export interface EventSinkV2Shape {
    */
   readonly writeIfProviderThreadOwner: (input: {
     readonly guardPendingUserInputCancellations?: boolean;
+    readonly dropUnchangedNodeUpdates?: boolean;
     readonly commandId?: CommandId;
     readonly providerThreadId: ProviderThreadId;
     readonly runId: RunId;
@@ -328,6 +333,68 @@ const baseLayer: Layer.Layer<
       );
     };
 
+    // Providers resend unchanged node snapshots: OpenCode repeats a running
+    // reasoning node on every part update. The node projection is a
+    // last-write-wins upsert of the encoded payload, so an event that encodes
+    // to the stored row changes nothing a client, resume or rebuild can see.
+    // The comparison runs inside the write transaction, so no other writer can
+    // change the row between the read and the append.
+    const dropUnchangedNodeUpdates = (events: ReadonlyArray<OrchestrationV2DomainEvent>) =>
+      Effect.gen(function* () {
+        const nodeIds = Array.from(
+          new Set(
+            events.flatMap((event) => (event.type === "node.updated" ? [event.payload.id] : [])),
+          ),
+        );
+        if (nodeIds.length === 0) return events;
+        const rows = yield* sql<{ readonly node_id: string; readonly payload_json: string }>`
+          SELECT node_id, payload_json
+          FROM orchestration_v2_projection_nodes
+          WHERE node_id IN ${sql.in(nodeIds)}
+        `;
+        const latest = new Map<string, string>(rows.map((row) => [row.node_id, row.payload_json]));
+        const kept: Array<OrchestrationV2DomainEvent> = [];
+        for (const event of events) {
+          if (event.type === "node.updated") {
+            const payloadJson = yield* ProjectionStore.encodeNodePayload(event.payload);
+            if (latest.get(event.payload.id) === payloadJson) continue;
+            latest.set(event.payload.id, payloadJson);
+          }
+          kept.push(event);
+        }
+        return kept;
+      });
+
+    const prepareEvents = (input: {
+      readonly guardPendingUserInputCancellations?: boolean;
+      readonly dropUnchangedNodeUpdates?: boolean;
+      readonly events: ReadonlyArray<OrchestrationV2DomainEvent>;
+    }) =>
+      Effect.gen(function* () {
+        const guarded =
+          input.guardPendingUserInputCancellations === true
+            ? yield* guardUserInputCancellations(input.events)
+            : input.events;
+        const normalized = yield* normalizeEvents(guarded);
+        return input.dropUnchangedNodeUpdates === true
+          ? yield* dropUnchangedNodeUpdates(normalized)
+          : normalized;
+      });
+
+    const appendAndApply = (
+      commandId: CommandId | undefined,
+      events: ReadonlyArray<OrchestrationV2DomainEvent>,
+    ) =>
+      Effect.gen(function* () {
+        if (events.length === 0) return [] as ReadonlyArray<OrchestrationV2StoredEvent>;
+        const storedEvents = yield* eventStore.append({
+          ...(commandId === undefined ? {} : { commandId }),
+          events,
+        });
+        yield* applyStoredEvents(storedEvents);
+        return storedEvents;
+      });
+
     const applyStoredEvents = (storedEvents: ReadonlyArray<OrchestrationV2StoredEvent>) =>
       Effect.gen(function* () {
         yield* Effect.forEach(storedEvents, (stored) => projectionStore.apply(stored.event), {
@@ -369,16 +436,7 @@ const baseLayer: Layer.Layer<
 
       return yield* commitThenPublish(
         Effect.gen(function* () {
-          const normalized = yield* normalizeEvents(
-            input.guardPendingUserInputCancellations === true
-              ? yield* guardUserInputCancellations(input.events)
-              : input.events,
-          );
-          const committed = yield* eventStore.append({
-            ...(input.commandId === undefined ? {} : { commandId: input.commandId }),
-            events: normalized,
-          });
-          yield* applyStoredEvents(committed);
+          const committed = yield* appendAndApply(input.commandId, yield* prepareEvents(input));
           yield* effectOutbox.enqueue(input.effects);
           return committed;
         }),
@@ -387,7 +445,7 @@ const baseLayer: Layer.Layer<
             if (input.effects.length > 0) {
               yield* effectOutbox.notifyAvailable(input.effects.length);
             }
-            yield* publishStoredEvents(storedEvents);
+            if (storedEvents.length > 0) yield* publishStoredEvents(storedEvents);
           }),
       );
     });
@@ -427,19 +485,16 @@ const baseLayer: Layer.Layer<
               };
             }
 
-            const normalized = yield* normalizeEvents(
-              input.guardPendingUserInputCancellations === true
-                ? yield* guardUserInputCancellations(input.events)
-                : input.events,
+            const storedEvents = yield* appendAndApply(
+              input.commandId,
+              yield* prepareEvents(input),
             );
-            const storedEvents = yield* eventStore.append({
-              ...(input.commandId === undefined ? {} : { commandId: input.commandId }),
-              events: normalized,
-            });
-            yield* applyStoredEvents(storedEvents);
             return { committed: true as const, storedEvents };
           }),
-          (result) => (result.committed ? publishStoredEvents(result.storedEvents) : Effect.void),
+          (result) =>
+            result.committed && result.storedEvents.length > 0
+              ? publishStoredEvents(result.storedEvents)
+              : Effect.void,
         );
       },
     );
@@ -484,19 +539,13 @@ const baseLayer: Layer.Layer<
             };
           }
 
-          const normalized = yield* normalizeEvents(
-            input.guardPendingUserInputCancellations === true
-              ? yield* guardUserInputCancellations(input.events)
-              : input.events,
-          );
-          const storedEvents = yield* eventStore.append({
-            ...(input.commandId === undefined ? {} : { commandId: input.commandId }),
-            events: normalized,
-          });
-          yield* applyStoredEvents(storedEvents);
+          const storedEvents = yield* appendAndApply(input.commandId, yield* prepareEvents(input));
           return { committed: true as const, storedEvents };
         }),
-        (result) => (result.committed ? publishStoredEvents(result.storedEvents) : Effect.void),
+        (result) =>
+          result.committed && result.storedEvents.length > 0
+            ? publishStoredEvents(result.storedEvents)
+            : Effect.void,
       );
     });
 

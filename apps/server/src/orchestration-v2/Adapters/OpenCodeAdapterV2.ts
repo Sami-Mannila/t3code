@@ -284,6 +284,9 @@ interface ActiveOpenCodeTurn {
   readonly runAttemptId: OrchestrationV2ProviderTurn["runAttemptId"];
   readonly startedAt: DateTime.Utc;
   readonly itemOrdinals: Map<string, number>;
+  // First-seen start time of parts OpenCode sends without `time.start`, so
+  // repeated snapshots of the same part encode identically.
+  readonly partStartedAt: Map<string, DateTime.Utc>;
   readonly parts: Map<string, Exclude<OpenCodePart, ToolPart>>;
   readonly partIdsByMessage: Map<string, Set<string>>;
   readonly toolNamesByCallId: Map<string, string>;
@@ -1206,7 +1209,9 @@ export function makeOpenCodeAdapterV2(
           if (part.text.length === 0) return;
           const emittedAt = yield* DateTime.now;
           const isCompleted = forceCompleted || part.time?.end !== undefined;
-          const startedAt = dateTimeFromEpoch(part.time?.start, emittedAt);
+          const fallbackStartedAt = turn.partStartedAt.get(part.id) ?? emittedAt;
+          turn.partStartedAt.set(part.id, fallbackStartedAt);
+          const startedAt = dateTimeFromEpoch(part.time?.start, fallbackStartedAt);
           const completedAt = isCompleted ? dateTimeFromEpoch(part.time?.end, emittedAt) : null;
           const nativeItemRef = providerRef(part.id);
           const nodeId = idAllocator.derive.nodeFromProviderItem({
@@ -2261,6 +2266,7 @@ export function makeOpenCodeAdapterV2(
             runAttemptId: null,
             startedAt,
             itemOrdinals: new Map(),
+            partStartedAt: new Map(),
             usage: makeOpenCodeTurnTokenUsageAccumulator(),
             parts: new Map(),
             partIdsByMessage: new Map(),
@@ -3195,6 +3201,7 @@ export function makeOpenCodeAdapterV2(
                 runAttemptId: turnInput.attemptId,
                 startedAt,
                 itemOrdinals: new Map(),
+                partStartedAt: new Map(),
                 usage: makeOpenCodeTurnTokenUsageAccumulator(),
                 parts: new Map(),
                 partIdsByMessage: new Map(),
