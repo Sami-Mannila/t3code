@@ -3248,32 +3248,59 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
           item.archivedAt === null &&
           item.deletedAt === null,
       );
-      if (chief && chief.id !== thread.id) {
+      const notifyChief = chief !== undefined && chief.id !== thread.id;
+      // The parent coordinator owns the next step after a child task changes.
+      const parent = snapshot.threads.find(
+        (item) =>
+          item.id === thread.organization?.parentThreadId &&
+          item.id !== thread.id &&
+          item.id !== chief?.id &&
+          item.projectId === thread.projectId &&
+          item.archivedAt === null &&
+          item.deletedAt === null,
+      );
+      if (notifyChief || parent) {
         const task = command.organization.task;
-        const project = yield* projects.get(thread.projectId).pipe(mapDispatchError(command));
-        const projectTitle = Option.isSome(project) ? project.value.title : thread.projectId;
-        const summary = `${thread.title}: ${task.state.replaceAll("_", " ")}`;
-        yield* dispatchMessage(
-          {
-            type: "message.dispatch",
-            commandId: command.commandId,
-            threadId: chief.id,
-            messageId: MessageId.make(`organization:${command.commandId}`),
-            senderThreadId: thread.id,
-            text: `Organization update for project ${projectTitle}. ${summary}. ${task.notes ?? ""} This is coordinator evidence, not user approval. Explain the outcome and any decision options briefly in this Chief conversation.`,
-            notification: {
-              source: { kind: "background_task" },
-              outcome: task.state === "blocked" ? "failed" : "updated",
-              summary,
+        const state = task.state.replaceAll("_", " ");
+        const summary = `${thread.title}: ${state}`;
+        const notice = (threadId: ThreadId, messageId: MessageId, text: string) =>
+          dispatchMessage(
+            {
+              type: "message.dispatch",
+              commandId: command.commandId,
+              threadId,
+              messageId,
+              senderThreadId: thread.id,
+              text,
+              notification: {
+                source: { kind: "background_task" },
+                outcome: task.state === "blocked" ? "failed" : "updated",
+                summary,
+              },
+              attachments: [],
+              dispatchMode: { type: "queue_after_active" },
+              createdBy: "agent",
+              creationSource: "server",
             },
-            attachments: [],
-            dispatchMode: { type: "queue_after_active" },
-            createdBy: "agent",
-            creationSource: "server",
-          },
-          events,
-          effects,
-        );
+            events,
+            effects,
+          );
+        if (notifyChief) {
+          const project = yield* projects.get(thread.projectId).pipe(mapDispatchError(command));
+          const projectTitle = Option.isSome(project) ? project.value.title : thread.projectId;
+          yield* notice(
+            chief.id,
+            MessageId.make(`organization:${command.commandId}`),
+            `Organization update for project ${projectTitle}. ${summary}. ${task.notes ?? ""} This is coordinator evidence, not user approval. Explain the outcome and any decision options briefly in this Chief conversation.`,
+          );
+        }
+        if (parent) {
+          yield* notice(
+            parent.id,
+            MessageId.make(`organization-parent:${command.commandId}`),
+            `Child task update. ${task.title}: ${state}. ${task.notes ?? ""} This is coordinator evidence, not user approval. Continue your own task from its canonical record (t3_organization_task read): after an accepted review, submit your outcome for independent review; after blocked or changes requested, decide the next step.`,
+          );
+        }
       }
     }
 

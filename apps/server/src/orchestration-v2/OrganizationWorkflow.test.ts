@@ -347,6 +347,11 @@ it.effect(
         { state: "accepted", reviewedRevision: current.revision, reviewerThreadId: reviewer },
         reviewer,
       );
+      assert.isTrue(
+        (yield* threads.getThreadProjection(lead)).messages.some(
+          (message) => message.id === "organization-parent:review",
+        ),
+      );
       yield* update(lead, "consolidate", { state: "awaiting_review" }, lead);
       current = (yield* threads.getThreadProjection(lead)).thread.organization!.task!;
       assert.deepEqual(current.dependencyThreadIds, [executor]);
@@ -885,3 +890,116 @@ it("wire commands cannot provide server artifact verification or spoof an agent 
   });
   assert.isFalse("organizationActorThreadId" in bound);
 });
+
+const taskNoticeSetup = Effect.gen(function* () {
+  const orchestrator = yield* Orchestrator.OrchestratorV2;
+  const threads = yield* ThreadManagement.ThreadManagementService;
+  const projects = yield* ProjectService.ProjectService;
+  const fs = yield* FileSystem.FileSystem;
+  const root = yield* fs.makeTempDirectoryScoped();
+  const projectId = ProjectId.make("notice-project");
+  yield* projects.create({
+    commandId: CommandId.make("notice-project-create"),
+    projectId,
+    title: "Notices",
+    workspaceRoot: root,
+  });
+  const create = (id: ThreadId, organization: OrganizationThread) =>
+    orchestrator.dispatch({
+      type: "thread.create",
+      commandId: CommandId.make(`notice-create-${id}`),
+      threadId: id,
+      projectId,
+      title: id,
+      modelSelection,
+      runtimeMode: "full-access",
+      interactionMode: "default",
+      branch: null,
+      worktreePath: root,
+      createdBy: "user",
+      creationSource: "web",
+      organization,
+    });
+  const task = (id: ThreadId): OrganizationTask => ({
+    title: `${id} work`,
+    ownerThreadId: id,
+    dependencyThreadIds: [],
+    state: "queued",
+    revision: null,
+    reviewedRevision: null,
+    reviewerThreadId: null,
+    notes: null,
+  });
+  const chief = ThreadId.make("notice-chief"),
+    lead = ThreadId.make("notice-lead"),
+    executor = ThreadId.make("notice-executor");
+  yield* create(chief, { role: "chief", parentThreadId: null });
+  yield* create(lead, { role: "lead", parentThreadId: chief, task: task(lead) });
+  yield* create(executor, { role: "executor", parentThreadId: lead, task: task(executor) });
+  const block = (id: ThreadId, key: string) =>
+    Effect.gen(function* () {
+      const org = (yield* threads.getThreadProjection(id)).thread.organization!;
+      yield* threads.dispatch({
+        type: "thread.metadata.update",
+        commandId: CommandId.make(key),
+        threadId: id,
+        organizationActorThreadId: id,
+        organization: { ...org, task: { ...org.task!, state: "blocked", notes: "Needs input." } },
+      });
+    });
+  const notices = (id: ThreadId) =>
+    threads
+      .getThreadProjection(id)
+      .pipe(
+        Effect.map((projection) =>
+          projection.messages.filter((message) => message.id.startsWith("organization")),
+        ),
+      );
+  const noticeIds = (id: ThreadId) =>
+    notices(id).pipe(Effect.map((messages) => messages.map((message) => message.id as string)));
+  return { orchestrator, chief, lead, executor, block, notices, noticeIds };
+});
+
+const taskNoticeLayer = ThreadManagement.layer.pipe(
+  Layer.provideMerge(TestLayer),
+  Layer.provideMerge(NodeServices.layer),
+);
+
+it.effect("a child task update wakes both the Chief and the parent lead", () =>
+  Effect.gen(function* () {
+    const { chief, lead, executor, block, notices, noticeIds } = yield* taskNoticeSetup;
+    yield* block(executor, "executor-blocked");
+    assert.deepEqual(yield* noticeIds(chief), ["organization:executor-blocked"]);
+    assert.deepEqual(yield* noticeIds(lead), ["organization-parent:executor-blocked"]);
+    const [leadNotice] = yield* notices(lead);
+    assert.equal(leadNotice?.senderThreadId, executor);
+    assert.include(leadNotice?.text, "Continue your own task");
+    assert.deepEqual(yield* noticeIds(executor), []);
+  }).pipe(Effect.provide(taskNoticeLayer)),
+);
+
+it.effect("a lead task update notifies only its Chief parent, once", () =>
+  Effect.gen(function* () {
+    const { chief, lead, executor, block, noticeIds } = yield* taskNoticeSetup;
+    yield* block(lead, "lead-blocked");
+    assert.deepEqual(yield* noticeIds(chief), ["organization:lead-blocked"]);
+    assert.deepEqual(yield* noticeIds(lead), []);
+    assert.deepEqual(yield* noticeIds(executor), []);
+  }).pipe(Effect.provide(taskNoticeLayer)),
+);
+
+it.effect("an archived parent lead receives no child task notice", () =>
+  Effect.gen(function* () {
+    const { orchestrator, chief, lead, executor, block, noticeIds } = yield* taskNoticeSetup;
+    yield* orchestrator.dispatch({
+      type: "thread.archive",
+      commandId: CommandId.make("notice-archive-lead"),
+      threadId: lead,
+    });
+    // An archived lead breaks the reporting chain, so the update itself is refused.
+    const orphaned = yield* block(executor, "executor-blocked-orphan").pipe(Effect.result);
+    assert.equal(orphaned._tag, "Failure");
+    assert.deepEqual(yield* noticeIds(chief), []);
+    assert.deepEqual(yield* noticeIds(lead), []);
+  }).pipe(Effect.provide(taskNoticeLayer)),
+);
