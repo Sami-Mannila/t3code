@@ -175,8 +175,25 @@ describe("searchSettings", () => {
       "auto-settle-inactive-threads",
       "auto-settle-merged-threads",
       "days-before-auto-settle",
+      "organization-role-models",
     ]);
     expect(available.map((item) => item.id).filter((id) => gatedIds.has(id))).toEqual([]);
+  });
+
+  it("offers organization role models only for an environment with organizations", () => {
+    const itemIds = (hasOrganizationEnvironment: boolean) =>
+      filterAvailableSettingsSearchItems({
+        hasCloudPublicConfig: false,
+        hasEnvironment: true,
+        hasProviderSettingsEnvironment: true,
+        hasMacProviderSettingsEnvironment: false,
+        canManageLocalBackend: false,
+        isWslSettingsRowVisible: false,
+        hasThreadAutoSettlement: false,
+        hasOrganizationEnvironment,
+      }).map((item) => item.id);
+    expect(itemIds(false)).not.toContain("organization-role-models");
+    expect(itemIds(true)).toContain("organization-role-models");
   });
 
   it("offers Cursor Keychain settings only when a macOS provider environment is available", () => {

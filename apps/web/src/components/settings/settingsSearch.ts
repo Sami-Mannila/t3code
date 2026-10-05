@@ -66,6 +66,8 @@ export interface SettingsSearchItem {
    */
   readonly secondary?: boolean;
   readonly requiresThreadAutoSettlement?: boolean;
+  /** Its section renders only for an environment with organizations. */
+  readonly requiresOrganization?: boolean;
 }
 
 export interface SettingsSearchAvailability {
@@ -77,6 +79,7 @@ export interface SettingsSearchAvailability {
   readonly canManageLocalBackend: boolean;
   readonly isWslSettingsRowVisible: boolean;
   readonly hasThreadAutoSettlement: boolean;
+  readonly hasOrganizationEnvironment?: boolean;
 }
 
 /**
@@ -499,6 +502,7 @@ export const SETTINGS_SEARCH_ITEMS = [
     to: "/settings/general",
     scope: "environment",
     environmentOnly: true,
+    requiresOrganization: true,
     searchTerms: [
       "chief advisor lead executor reviewer delegate task default provider model organization",
     ],
@@ -1021,7 +1025,8 @@ export function filterAvailableSettingsSearchItems(
       (!item.localBackendManagementOnly || availability.canManageLocalBackend) &&
       (!item.localEnvironmentOnly || !availability.localEnvironmentDisabled) &&
       (!item.wslAvailableOnly || availability.isWslSettingsRowVisible) &&
-      (!item.requiresThreadAutoSettlement || availability.hasThreadAutoSettlement),
+      (!item.requiresThreadAutoSettlement || availability.hasThreadAutoSettlement) &&
+      (!item.requiresOrganization || availability.hasOrganizationEnvironment === true),
   );
 }
 

@@ -1321,6 +1321,14 @@ it("organization instructions name each role's configured model", () => {
   );
   assert.include(text, "executor opencode-work work-model");
   assert.include(text, "reviewer codex gpt-6.1-sol");
+  // Chief and Advisor are added by the user, not delegated.
+  const delegated = text.slice(
+    text.indexOf("delegate_task omits target"),
+    text.indexOf("The user adds Chief and Advisor on"),
+  );
+  assert.include(delegated, "lead codex gpt-6.1-sol");
+  assert.notInclude(delegated, "chief ");
+  assert.include(text, "The user adds Chief and Advisor on chief codex gpt-6.1-sol, advisor");
   assert.notInclude(text, "executor opencode fireworks");
 });
 

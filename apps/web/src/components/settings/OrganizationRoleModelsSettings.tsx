@@ -42,10 +42,9 @@ export function OrganizationRoleModelsSettingsSection() {
   const settings = useScopedSettings();
   const updateSettings = useUpdateScopedSettings();
   const navigate = useNavigate();
-  const { environment, connectedEnvironments } = useSettingsScope();
-  const supported = connectedEnvironments.some(
-    (target) => target.serverConfig?.environment.capabilities.organizationV1 === true,
-  );
+  const { environment } = useSettingsScope();
+  // The scoped environment supplies the providers; it must also be the one with organizations.
+  const supported = environment?.serverConfig?.environment.capabilities.organizationV1 === true;
   const providers = environment?.serverConfig?.providers ?? EMPTY_SERVER_PROVIDERS;
   const instanceEntries = sortProviderInstanceEntries(
     applyProviderInstanceSettings(deriveProviderInstanceEntries(providers), settings),

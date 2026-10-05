@@ -403,18 +403,78 @@ it.layer(
     }),
   );
 
+  it.effect("a checkout killed before it wrote its index is removed and recreated", () =>
+    Effect.gen(function* () {
+      const fs = yield* FileSystem.FileSystem;
+      const own = yield* ownWorktree;
+      // Tracked files, so a worktree without its index shows every one as changed.
+      for (const name of ["one.txt", "two.txt", "three.txt"])
+        yield* fs.writeFileString(`${own.repository}/${name}`, `${name}\n`);
+      assert.equal((yield* git(own.repository, "add", ".")).code, 0);
+      assert.equal((yield* git(own.repository, "commit", "-m", "files")).code, 0);
+      yield* interruptedAdd(own);
+      // What `git worktree add` leaves when killed mid-checkout: the files written so far,
+      // its .git file and admin directory, but no index yet.
+      const adminDir = (yield* git(
+        own.workspace,
+        "rev-parse",
+        "--path-format=absolute",
+        "--git-dir",
+      )).stdout.trim();
+      yield* fs.remove(`${adminDir}/index`);
+      yield* fs.remove(`${own.workspace}/three.txt`);
+      yield* fs.writeFileString(`${own.workspace}/two.txt`, "tw");
+      assert.notEqual((yield* git(own.workspace, "status", "--porcelain")).stdout.trim(), "");
+      yield* preparedWorktree(yield* own.run, own);
+      assert.equal(yield* fs.readFileString(`${own.workspace}/three.txt`), "three.txt\n");
+      assert.equal(yield* fs.readFileString(`${own.workspace}/two.txt`), "two.txt\n");
+    }),
+  );
+
+  const refusal = (result: Effect.Success<ReturnType<typeof prepareThread>>) => {
+    assert.deepEqual(result.dispatched, []);
+    const error = Exit.isFailure(result.exit) ? Cause.squash(result.exit.cause) : undefined;
+    assert.isTrue(OrganizationWorkspace.isTerminalWorkspaceFailure(error), String(error));
+    return error as OrganizationWorkspace.OrganizationWorkspaceError;
+  };
+
   it.effect("an interrupted worktree with changes in it is never deleted", () =>
     Effect.gen(function* () {
       const fs = yield* FileSystem.FileSystem;
       const own = yield* ownWorktree;
       yield* interruptedAdd(own);
       yield* fs.writeFileString(`${own.workspace}/notes.txt`, "keep me\n");
-      const { exit, dispatched } = yield* own.run;
-      assert.deepEqual(dispatched, []);
-      const error = Exit.isFailure(exit) ? Cause.squash(exit.cause) : undefined;
-      assert.isTrue(OrganizationWorkspace.isTerminalWorkspaceFailure(error));
-      assert.include((error as Error).message, "move its contents away");
+      assert.include(refusal(yield* own.run).message, "move its contents away");
       assert.equal(yield* fs.readFileString(`${own.workspace}/notes.txt`), "keep me\n");
+    }),
+  );
+
+  it.effect("an interrupted worktree Git cannot read is never deleted", () =>
+    Effect.gen(function* () {
+      const fs = yield* FileSystem.FileSystem;
+      // A corrupt index: rev-parse succeeds, status exits non-zero.
+      const corrupt = yield* ownWorktree;
+      yield* interruptedAdd(corrupt);
+      yield* fs.writeFileString(`${corrupt.workspace}/notes.txt`, "keep me\n");
+      const adminDir = (yield* git(
+        corrupt.workspace,
+        "rev-parse",
+        "--path-format=absolute",
+        "--git-dir",
+      )).stdout.trim();
+      yield* fs.writeFileString(`${adminDir}/index`, "not an index");
+      const statusError = refusal(yield* corrupt.run);
+      assert.include(statusError.reason, "git status exited");
+      assert.isNotEmpty(statusError.detail);
+      assert.equal(yield* fs.readFileString(`${corrupt.workspace}/notes.txt`), "keep me\n");
+
+      // A .git file pointing nowhere: rev-parse exits non-zero.
+      const detached = yield* ownWorktree;
+      yield* interruptedAdd(detached);
+      yield* fs.writeFileString(`${detached.workspace}/notes.txt`, "keep me\n");
+      yield* fs.writeFileString(`${detached.workspace}/.git`, "gitdir: /nonexistent/admin\n");
+      assert.include(refusal(yield* detached.run).reason, "git rev-parse");
+      assert.equal(yield* fs.readFileString(`${detached.workspace}/notes.txt`), "keep me\n");
     }),
   );
 

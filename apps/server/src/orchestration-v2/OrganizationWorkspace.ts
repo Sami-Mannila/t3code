@@ -232,11 +232,20 @@ export const prepare = Effect.fn("OrganizationWorkspace.prepare")(function* (inp
     // add that was killed, which never released a run, so the folder holds only Git's partial
     // checkout. It may lack even its .git file, so Git cannot remove it itself.
     if (entry?.includes("locked initializing")) {
-      // Delete only what Git would call clean, or a folder without its .git file. Anything
-      // else stays for the user, even if that means removing a killed checkout by hand.
-      // Without its own .git, status would describe whatever repository encloses the folder.
-      const status = (yield* fs.exists(path.join(workspace, ".git")))
-        ? yield* process.run({
+      // Deleted only when Git vouches that nothing in it is anyone's work:
+      // - no .git of its own: the add was killed before it wrote one (status would otherwise
+      //   describe whatever repository encloses the folder);
+      // - no index in its admin directory: checkout writes the index last, so it never
+      //   finished and no run was ever released (status would show every file as changed);
+      // - otherwise only a clean status.
+      // A Git exit refuses without retrying; a timeout or spawn failure retries; neither deletes.
+      if (yield* fs.exists(path.join(workspace, ".git"))) {
+        const adminDir = yield* git(
+          ["rev-parse", "--path-format=absolute", "--git-dir"],
+          workspace,
+        );
+        if (yield* fs.exists(path.join(adminDir, "index"))) {
+          const status = yield* process.run({
             command: "git",
             args: ["status", "--porcelain"],
             cwd: workspace,
@@ -244,12 +253,18 @@ export const prepare = Effect.fn("OrganizationWorkspace.prepare")(function* (inp
             maxOutputBytes: GIT_OUTPUT_BYTES,
             outputMode: "truncate",
             env: GIT_ENV,
-          })
-        : null;
-      if (status?.code === 0 && status.stdout.trim() !== "")
-        return yield* fail(
-          `${workspace} is an interrupted worktree with changes in it; move its contents away, then retry`,
-        );
+          });
+          if (status.code !== 0)
+            return yield* fail(
+              `git status exited with code ${status.code} in the interrupted worktree ${workspace}; move its contents away, then retry`,
+              excerpt(status.stderr || status.stdout),
+            );
+          if (status.stdout.trim() !== "")
+            return yield* fail(
+              `${workspace} is an interrupted worktree with changes in it; move its contents away, then retry`,
+            );
+        }
+      }
       yield* git(["worktree", "unlock", workspace]);
       yield* fs.remove(workspace, { recursive: true });
       yield* git(["worktree", "prune"]);
