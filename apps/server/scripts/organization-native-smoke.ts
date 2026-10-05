@@ -7,6 +7,7 @@ import {
 import * as NodeCrypto from "@effect/platform-node/NodeCrypto";
 import * as NodeChildProcess from "node:child_process";
 import * as NodeFS from "node:fs";
+import * as NodeOS from "node:os";
 import * as NodePath from "node:path";
 /** Disposable native-RPC pilot. Does not start a server and refuses model work without --authorized-run.
  * Run from the fork root with its private T3_PILOT_BOOTSTRAP_TOKEN already in the environment.
@@ -54,6 +55,9 @@ if (requestedRoot !== undefined && !NodePath.isAbsolute(requestedRoot))
   throw new Error("--project-root must be an absolute directory.");
 const workspaceRoot = requestedRoot ?? `${process.cwd()}/.t3-pilot/project`;
 const multiRepo = process.argv.includes("--multi-repo");
+// Every other mode runs only in the disposable default root, never in a real checkout.
+if (requestedRoot !== undefined && !multiRepo)
+  throw new Error("--project-root is accepted only together with --multi-repo.");
 const observeIndex = process.argv.indexOf("--observe-chief");
 const observeChief = observeIndex >= 0 ? process.argv[observeIndex + 1]?.trim() : undefined;
 if (observeIndex >= 0 && (!observeChief || observeChief.startsWith("--")))
@@ -91,6 +95,11 @@ const validateMultiRepoRoot = (root: string) => {
   const stat = NodeFS.statSync(root, { throwIfNoEntry: false });
   if (!stat?.isDirectory()) throw new Error("--multi-repo: the project root is not a directory.");
   const real = NodeFS.realpathSync(root);
+  // The owner's real repositories live under ~/git; a full-access pilot must never run there.
+  const ownerGit = NodePath.join(NodeOS.homedir(), "git");
+  const ownerGitReal = NodeFS.existsSync(ownerGit) ? NodeFS.realpathSync(ownerGit) : ownerGit;
+  if (real === ownerGitReal || real.startsWith(`${ownerGitReal}${NodePath.sep}`))
+    throw new Error(`--multi-repo: the project root must not be under ${ownerGitReal}.`);
   if (gitOutput(real, ["rev-parse", "--is-inside-work-tree"]) === "true")
     throw new Error(
       "--multi-repo: the project root is inside a Git work tree; use a plain folder.",
@@ -117,11 +126,7 @@ const validateMultiRepoRoot = (root: string) => {
 if (multiRepo) {
   const repositories = validateMultiRepoRoot(workspaceRoot);
   console.log(`Pilot multi-repo root validated: repositories=${repositories.join(",")}`);
-} else if (
-  requestedRoot !== undefined &&
-  !NodeFS.statSync(requestedRoot, { throwIfNoEntry: false })?.isDirectory()
-)
-  throw new Error("--project-root is not a directory.");
+}
 if (!process.argv.includes("--authorized-run") && !probeOnly && !observeChief) {
   console.log(
     "Prepared only: isolated native pilot, loopback 3783, no server or model calls. Root readiness approval is required before --authorized-run.",
