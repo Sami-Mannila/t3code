@@ -19,6 +19,7 @@ import {
   compactTraceAttributes,
   decodeOtlpTraceRecords,
   errorTag,
+  isVerboseTraceSpan,
   makeLocalFileTracer,
   makeTraceSink,
   type EffectTraceRecord,
@@ -240,6 +241,46 @@ describe("observability", () => {
           );
         }
       }),
+  );
+
+  it.effect("leaves omitted spans out of the trace file but still delegates them", () =>
+    Effect.gen(function* () {
+      const delegated: Array<string> = [];
+      const recorded: Array<string> = [];
+      const tracer = yield* makeLocalFileTracer({
+        filePath: "unused",
+        maxBytes: 1024,
+        maxFiles: 1,
+        batchWindowMs: 10_000,
+        omitSpan: isVerboseTraceSpan,
+        sink: {
+          filePath: "unused",
+          push: (record) => {
+            if (record.type === "effect-span") recorded.push(record.name);
+          },
+          flush: Effect.void,
+          close: () => Effect.void,
+        },
+        delegate: Tracer.make({
+          span: (options) => {
+            delegated.push(options.name);
+            return new Tracer.NativeSpan(options);
+          },
+        }),
+      });
+      const names = [
+        "sql.execute",
+        "orchestrationV2.EventSink.write",
+        "ThreadLiveEventCoalescer.flushPending",
+        "OrchestrationEventStore.rowToV2StoredEvent",
+        "ws.rpc.subscribeThread",
+      ];
+      yield* Effect.forEach(names, (name) =>
+        Effect.void.pipe(Effect.withSpan(name), Effect.provideService(Tracer.Tracer, tracer)),
+      );
+      assert.deepStrictEqual(delegated, names);
+      assert.deepStrictEqual(recorded, ["ws.rpc.subscribeThread"]);
+    }),
   );
 
   it.effect("preserves failure and interruption causes in spans and exported traces", () =>

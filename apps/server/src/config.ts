@@ -67,6 +67,8 @@ export class ServerConfig extends Context.Service<
     readonly logLevel: LogLevel.LogLevel;
     readonly traceMinLevel: LogLevel.LogLevel;
     readonly traceTimingEnabled: boolean;
+    /** Keep per-query and per-event spans in the trace file (T3CODE_TRACE_VERBOSE). */
+    readonly traceVerbose: boolean;
     readonly traceBatchWindowMs: number;
     readonly traceMaxBytes: number;
     readonly traceMaxFiles: number;
@@ -211,6 +213,7 @@ const makeTest = Effect.fn("ServerConfig.makeTest")(function* (
     logLevel: "Error",
     traceMinLevel: "Info",
     traceTimingEnabled: true,
+    traceVerbose: false,
     traceBatchWindowMs: 200,
     traceMaxBytes: 10 * 1024 * 1024,
     traceMaxFiles: 10,

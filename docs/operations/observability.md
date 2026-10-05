@@ -563,6 +563,10 @@ Local trace file:
 - `T3CODE_TRACE_BATCH_WINDOW_MS`: flush window, default `200`
 - `T3CODE_TRACE_MIN_LEVEL`: minimum trace level, default `Info`
 - `T3CODE_TRACE_TIMING_ENABLED`: enable timing metadata, default `true`
+- `T3CODE_TRACE_VERBOSE`: also write the high-volume per-query and per-event spans
+  (`sql.execute`, `sql.transaction`, `db.transaction.commit`, `orchestrationV2.EventSink.*`,
+  `ThreadLiveEventCoalescer.*`, `OrchestrationEventStore.rowToV2StoredEvent`) to the trace file,
+  default `false`. OTLP trace export receives them either way.
 
 OTLP export:
 
