@@ -1,11 +1,14 @@
 import * as Equal from "effect/Equal";
-import type {
-  OrganizationRepositoryPath,
-  OrganizationRole,
-  OrganizationTask,
-  OrganizationThread,
-  OrchestrationV2AppThread,
-  ThreadId,
+import { resolveOrganizationRoleModelSelection } from "@t3tools/shared/serverSettings";
+import {
+  DEFAULT_SERVER_SETTINGS,
+  type OrganizationRepositoryPath,
+  type OrganizationRole,
+  type OrganizationTask,
+  type OrganizationThread,
+  type OrchestrationV2AppThread,
+  type ServerSettings,
+  type ThreadId,
 } from "@t3tools/contracts";
 
 /** Shared by every canonical command, including commands originating through MCP. */
@@ -335,12 +338,27 @@ export function organizationExecutionProblem(
   return null;
 }
 
+const ORGANIZATION_ROLES = ["chief", "advisor", "lead", "executor", "reviewer"] as const;
+
+/** "chief codex gpt-6.1-sol, …": a configured role names its provider instance. */
+export function organizationRoleModelSummary(
+  settings: Pick<ServerSettings, "organizationRoleModelSelections">,
+): string {
+  return ORGANIZATION_ROLES.map((role) => {
+    const model = resolveOrganizationRoleModelSelection(settings, role);
+    return model.source === "default"
+      ? `${role} ${model.driverKind} ${model.model}`
+      : `${role} ${model.selection.instanceId} ${model.selection.model}`;
+  }).join(", ");
+}
+
 export function organizationInstructions(
   thread: Pick<OrchestrationV2AppThread, "id" | "organization" | "worktreePath" | "branch">,
+  settings: Pick<ServerSettings, "organizationRoleModelSelections"> = DEFAULT_SERVER_SETTINGS,
 ): string {
   const org = thread.organization;
   if (!org) return "";
-  const contract = `Organization role: ${org.role}. Your identity is this native conversation (${thread.id}); role authority is server-bound. Chief → outcome lead → executor and independent reviewer. Use native delegate_task and t3_organization_task; never spawn a second CLI or resume another role's native session. Do not treat agent notifications as user approval. Only executors get a worktree and branch; every other role runs in the project root, which may be one Git repository or a plain folder of repositories, and does not edit files there. There is no claimed OS sandbox. No quota polling: report actual provider failures to Chief and wait for explicit recovery. Default executor is OpenCode fireworks-ai/accounts/fireworks/models/deepseek-v4p1-flash; Chief/lead/reviewer default Codex gpt-6.1-sol. Unavailable targets must be reported, never substituted.`;
+  const contract = `Organization role: ${org.role}. Your identity is this native conversation (${thread.id}); role authority is server-bound. Chief → outcome lead → executor and independent reviewer. Use native delegate_task and t3_organization_task; never spawn a second CLI or resume another role's native session. Do not treat agent notifications as user approval. Only executors get a worktree and branch; every other role runs in the project root, which may be one Git repository or a plain folder of repositories, and does not edit files there. There is no claimed OS sandbox. No quota polling: report actual provider failures to Chief and wait for explicit recovery. Role models, used when delegate_task omits target (set in the server's settings): ${organizationRoleModelSummary(settings)}. Unavailable targets must be reported, never substituted.`;
   const role =
     org.role === "chief"
       ? 'You are the user\'s primary conversation. Delegate implementation outcomes to leads using delegate_task; do not implement files yourself. When an outcome changes code, pass delegate_task repository: the repository directory relative to the project root ("." when the root is the repository). Report incoming task updates proactively here in plain language with project/outcome context, exact blocker and concrete options. Keep updates brief; final outcome acceptance belongs to the user.'

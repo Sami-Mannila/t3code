@@ -1,4 +1,6 @@
 import {
+  DEFAULT_ORGANIZATION_ROLE_MODEL_SELECTIONS,
+  type OrganizationRole,
   isProviderDriverKind,
   isProviderAvailable,
   resolveProviderInstanceEnabled,
@@ -100,6 +102,33 @@ export function resolveSourceControlWriterModelSelection(
     isProviderTextGenerationCapable(provider)
     ? selection
     : settings.textGenerationModelSelection;
+}
+
+/** The model a role starts on: a configured selection, or its default driver and model. */
+export type OrganizationRoleModel =
+  | { readonly source: "configured"; readonly selection: ModelSelection }
+  | {
+      readonly source: "default";
+      readonly driverKind: ProviderDriverKind;
+      readonly model: string;
+    };
+
+/**
+ * Unlike the writer model, a role's model is never substituted: an unavailable configured
+ * provider is reported, so the user sees which role needs a different choice.
+ */
+export function resolveOrganizationRoleModelSelection(
+  settings: Pick<ServerSettings, "organizationRoleModelSelections">,
+  role: OrganizationRole,
+): OrganizationRoleModel {
+  const selection = settings.organizationRoleModelSelections[role];
+  if (selection) return { source: "configured", selection };
+  const fallback = DEFAULT_ORGANIZATION_ROLE_MODEL_SELECTIONS[role];
+  return {
+    source: "default",
+    driverKind: fallback.driverKind as ProviderDriverKind,
+    model: fallback.model,
+  };
 }
 
 export interface PersistedServerObservabilitySettings {
@@ -405,6 +434,19 @@ export function applyServerSettingsPatch(
       : {}),
     ...(patch.sourceControlWriterModelSelection !== undefined
       ? { sourceControlWriterModelSelection: patch.sourceControlWriterModelSelection }
+      : {}),
+    // A role's selection is replaced whole; deepMerge would keep options of the old model.
+    ...(patch.organizationRoleModelSelections !== undefined
+      ? {
+          organizationRoleModelSelections: {
+            ...current.organizationRoleModelSelections,
+            ...Object.fromEntries(
+              Object.entries(patch.organizationRoleModelSelections).filter(
+                ([, selection]) => selection !== undefined,
+              ),
+            ),
+          },
+        }
       : {}),
     ...(automaticGitFetchInterval !== undefined ? { automaticGitFetchInterval } : {}),
     ...(providerHealthRefreshInterval !== undefined ? { providerHealthRefreshInterval } : {}),

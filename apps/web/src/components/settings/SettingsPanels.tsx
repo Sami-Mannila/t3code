@@ -84,6 +84,7 @@ import {
 import { useScopedModelDisabledReason } from "./useScopedModelAvailability";
 import { useSettingsScope } from "./SettingsScopeContext";
 import { ProjectDefaultsSettings } from "./ProjectDefaultsSettings";
+import { OrganizationRoleModelsSettingsSection } from "./OrganizationRoleModelsSettings";
 import { useThreadActions } from "../../hooks/useThreadActions";
 import { useDesktopUpdateState } from "../../state/desktopUpdate";
 import {
@@ -3329,6 +3330,8 @@ export function GeneralSettingsPanel() {
           }
         />
       </SettingsSection>
+
+      <OrganizationRoleModelsSettingsSection />
 
       <SettingsSection id="about" title="About">
         {isElectron || HOSTED_APP_CHANNEL ? (

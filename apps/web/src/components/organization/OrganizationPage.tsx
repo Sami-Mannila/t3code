@@ -3,7 +3,9 @@ import * as Crypto from "effect/Crypto";
 import { deriveProviderInstanceEntries, isProviderInstancePickerReady } from "~/providerInstances";
 import { useEffect, useEffectEvent, useMemo, useRef, useState } from "react";
 import { Link } from "@tanstack/react-router";
-import { ThreadId, type OrganizationRole } from "@t3tools/contracts";
+import { DEFAULT_SERVER_SETTINGS, ThreadId, type OrganizationRole } from "@t3tools/contracts";
+import { resolveOrganizationRoleModelSelection } from "@t3tools/shared/serverSettings";
+import { roleModelLabel, roleModelProvider, roleModelSlug } from "./organizationRoleModels";
 import {
   createThread,
   updateThreadMetadata,
@@ -80,18 +82,24 @@ export function OrganizationPage() {
   const providers = deriveProviderInstanceEntries(environment?.serverConfig?.providers ?? [])
     .filter(isProviderInstancePickerReady)
     .map((p) => p.snapshot);
-  const defaultDriver = role === "executor" ? "opencode" : "codex";
-  const defaultModel =
-    role === "executor"
-      ? "fireworks-ai/accounts/fireworks/models/deepseek-v4p1-flash"
-      : "gpt-6.1-sol";
+  // The same role model delegate_task uses on this server.
+  const roleModel = resolveOrganizationRoleModelSelection(
+    environment?.serverConfig?.settings ?? DEFAULT_SERVER_SETTINGS,
+    role,
+  );
+  const defaultModel = roleModelSlug(roleModel);
   const selectedProvider = provider
     ? providers.find((p) => p.instanceId === provider)
-    : providers.find(
-        (p) => p.driver === defaultDriver && p.models.some((m) => m.slug === defaultModel),
-      );
+    : roleModelProvider(roleModel, providers);
   const selectedModel =
     selectedProvider?.models.find((m) => m.slug === (model || defaultModel))?.slug ?? "";
+  // A configured role model keeps its options when it is what the user creates.
+  const selectedOptions =
+    roleModel.source === "configured" &&
+    selectedProvider?.instanceId === roleModel.selection.instanceId &&
+    selectedModel === roleModel.selection.model
+      ? roleModel.selection.options
+      : undefined;
   const scoped = threads.filter(
     (t) =>
       t.environmentId === project?.environmentId &&
@@ -230,7 +238,11 @@ export function OrganizationPage() {
         input: {
           projectId: project.id,
           title: ROLE_LABELS[role],
-          modelSelection: { instanceId: selectedProvider.instanceId, model: selectedModel },
+          modelSelection: {
+            instanceId: selectedProvider.instanceId,
+            model: selectedModel,
+            ...(selectedOptions ? { options: selectedOptions } : {}),
+          },
           runtimeMode: "full-access",
           interactionMode: "default",
           branch: null,
@@ -391,8 +403,12 @@ export function OrganizationPage() {
           </Button>
           {!selectedModel && (
             <p>
-              The role default ({defaultDriver} · {defaultModel}) is unavailable. Select an
-              available provider and model explicitly.
+              The {ROLE_LABELS[role]} model ({roleModelLabel(roleModel)}) is unavailable on this
+              server. Choose another in{" "}
+              <Link to="/settings/general" hash="organization-role-models">
+                Settings · Organization role models
+              </Link>
+              , or select an available provider and model explicitly.
             </p>
           )}
           <p>

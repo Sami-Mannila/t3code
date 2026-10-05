@@ -1105,3 +1105,30 @@ describe("branch naming settings", () => {
     },
   );
 });
+
+describe("organization role model settings", () => {
+  const executor = { instanceId: ProviderInstanceId.make("opencode-work"), model: "work-model" };
+
+  it("defaults every role when the field or a role is missing", () => {
+    expect(decodeServerSettings({}).organizationRoleModelSelections).toEqual({
+      advisor: null,
+      chief: null,
+      lead: null,
+      executor: null,
+      reviewer: null,
+    });
+    expect(
+      decodeServerSettings({ organizationRoleModelSelections: { executor } })
+        .organizationRoleModelSelections,
+    ).toEqual({ advisor: null, chief: null, lead: null, executor, reviewer: null });
+  });
+
+  it("accepts a patch naming only some roles, with null to restore a default", () => {
+    expect(
+      decodeServerSettingsPatch({ organizationRoleModelSelections: { executor, lead: null } }),
+    ).toEqual({ organizationRoleModelSelections: { executor, lead: null } });
+    expect(() =>
+      decodeServerSettingsPatch({ organizationRoleModelSelections: { executor: "codex" } }),
+    ).toThrow();
+  });
+});

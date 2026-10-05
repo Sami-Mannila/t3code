@@ -494,6 +494,16 @@ export const SETTINGS_SEARCH_ITEMS = [
     searchTerms: ["generated thread titles source control content default provider"],
   },
   {
+    id: "organization-role-models",
+    title: "Organization role models",
+    to: "/settings/general",
+    scope: "environment",
+    environmentOnly: true,
+    searchTerms: [
+      "chief advisor lead executor reviewer delegate task default provider model organization",
+    ],
+  },
+  {
     id: "diagnostics",
     title: "Diagnostics",
     to: "/settings/general",

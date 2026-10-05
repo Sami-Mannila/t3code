@@ -40,3 +40,14 @@ repositories, so worktrees are tied to tasks, not to the root.
   correction round with feedback on the current revision and to `queued` otherwise; admission
   would otherwise hold an executor's run until a coordinator unblocked it. A block recorded by a
   coordinator or worker stays.
+
+## Role models
+
+Each role starts on the model in the server setting `organizationRoleModelSelections` (Settings →
+General → Organization role models), resolved by `resolveOrganizationRoleModelSelection` in
+`packages/shared/src/serverSettings.ts`. `delegate_task` without a `target`, the organization
+page's Add role, the role instructions and the native smoke all read it. An unset role uses
+`DEFAULT_ORGANIZATION_ROLE_MODEL_SELECTIONS`, which names a driver rather than an instance, so a
+child keeps its parent's instance of that driver when it can. A configured model is never
+replaced: an unavailable provider or model fails the delegation with `provider_unavailable` or
+`model_unavailable`.

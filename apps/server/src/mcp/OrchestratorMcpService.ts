@@ -1,6 +1,6 @@
 import {
   CommandId,
-  ProviderDriverKind,
+  DEFAULT_SERVER_SETTINGS,
   type RunId,
   isProviderAvailable,
   MessageId,
@@ -54,6 +54,11 @@ import {
   ThreadId,
 } from "@t3tools/contracts";
 import { runRanAfter } from "@t3tools/shared/orchestrationV2ThreadError";
+import {
+  type OrganizationRoleModel,
+  resolveOrganizationRoleModelSelection,
+} from "@t3tools/shared/serverSettings";
+import * as ServerSettings from "../serverSettings.ts";
 import * as Context from "effect/Context";
 import * as Crypto from "effect/Crypto";
 import * as DateTime from "effect/DateTime";
@@ -185,6 +190,13 @@ function threadManagementFailure(error: unknown): OrchestratorMcpFailure {
 
 function errorMessage(error: unknown): string {
   return error instanceof Error ? error.message : String(error);
+}
+
+/** A role default names a driver, so the child keeps its parent's instance of it when it can. */
+function organizationRoleTarget(model: OrganizationRoleModel): OrchestratorMcpTarget {
+  if (model.source === "default") return { driverKind: model.driverKind, model: model.model };
+  const { instanceId, model: slug, options } = model.selection;
+  return { providerInstanceId: instanceId, model: slug, ...(options ? { options } : {}) };
 }
 
 /**
@@ -767,6 +779,18 @@ const make = Effect.gen(function* () {
   const providerRegistry = yield* ProviderRegistry.ProviderRegistry;
   const providerAdapters = yield* ProviderAdapterRegistry.ProviderAdapterRegistryV2;
   const scheduledTasks = yield* ScheduledTaskService.ScheduledTaskService;
+  // Organization delegations read each role's default model; layers without settings use the
+  // built-in defaults.
+  const settingsService = yield* Effect.serviceOption(ServerSettings.ServerSettingsService);
+  const loadSettings = Option.isNone(settingsService)
+    ? Effect.succeed({
+        organizationRoleModelSelections: DEFAULT_SERVER_SETTINGS.organizationRoleModelSelections,
+      })
+    : settingsService.value.getSettings.pipe(
+        Effect.mapError((error) =>
+          failure("orchestration_error", `Unable to read server settings: ${errorMessage(error)}`),
+        ),
+      );
   // Only organization delegations need these, to validate a task's repository.
   const projects = yield* Effect.serviceOption(ProjectStore.ProjectStoreV2);
   const fileSystem = yield* Effect.serviceOption(FileSystem.FileSystem);
@@ -1471,19 +1495,12 @@ const make = Effect.gen(function* () {
         if (repository !== undefined)
           yield* validateOrganizationRepository(parent.thread.projectId, repository);
         const providers = yield* loadProviders;
+        // An explicit target wins; otherwise the child role's configured model, never substituted.
         const organizationTarget =
-          parent.thread.organization && !input.target
-            ? {
-                driverKind: ProviderDriverKind.make(
-                  parent.thread.organization.role === "lead" && input.role !== "review"
-                    ? "opencode"
-                    : "codex",
-                ),
-                model:
-                  parent.thread.organization.role === "lead" && input.role !== "review"
-                    ? "fireworks-ai/accounts/fireworks/models/deepseek-v4p1-flash"
-                    : "gpt-6.1-sol",
-              }
+          childRole !== null && !input.target
+            ? organizationRoleTarget(
+                resolveOrganizationRoleModelSelection(yield* loadSettings, childRole),
+              )
             : input.target;
         const target = yield* resolveTarget({
           parent,

@@ -484,6 +484,7 @@ const ATOMIC_SETTINGS_KEYS: ReadonlySet<string> = new Set([
   "sourceControlWriterModelSelection",
   "textGenerationModelSelection",
   "pullRequestMergeMethod",
+  "organizationRoleModelSelections",
 ]);
 
 // Preserve both enabled states because provider history cannot recover a new opt-in.

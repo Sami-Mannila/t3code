@@ -10,7 +10,10 @@ import {
   ThreadId,
   type OrchestrationV2ThreadProjection,
   type ServerProvider,
+  DEFAULT_SERVER_SETTINGS,
+  type ServerSettings,
 } from "@t3tools/contracts";
+import * as ServerSettingsModule from "../serverSettings.ts";
 import * as DateTime from "effect/DateTime";
 import * as Effect from "effect/Effect";
 import * as FileSystem from "effect/FileSystem";
@@ -1285,8 +1288,17 @@ describe("OrchestratorMcpService provider resolution", () => {
       Parameters<OrchestratorMcpService.OrchestratorMcpService["Service"]["delegateTask"]>[1]
     >;
     readonly workspaceRoot?: string;
+    readonly providers?: ReadonlyArray<ServerProvider>;
+    readonly roleModels?: Partial<ServerSettings["organizationRoleModelSelections"]>;
   }) =>
     Effect.gen(function* () {
+      const providers = input.providers ?? [
+        providerSnapshot({
+          instanceId: codexInstanceId,
+          driver: ProviderDriverKind.make("codex"),
+          model: "gpt-5.4",
+        }),
+      ];
       const dispatched = yield* Ref.make<ReadonlyArray<unknown>>([]);
       const task = {
         id: taskId,
@@ -1333,17 +1345,22 @@ describe("OrchestratorMcpService provider resolution", () => {
             ),
         }),
         Layer.mock(ProviderRegistry.ProviderRegistry)({
-          getProviders: Effect.succeed([
-            providerSnapshot({
-              instanceId: codexInstanceId,
-              driver: ProviderDriverKind.make("codex"),
-              model: "gpt-5.4",
-            }),
-          ]),
+          getProviders: Effect.succeed([...providers]),
         }),
-        adapterRegistryLayer([codexInstanceId]),
+        adapterRegistryLayer(providers.map((provider) => provider.instanceId)),
         Layer.mock(ScheduledTaskService.ScheduledTaskService)({}),
         input.workspaceRoot === undefined ? Layer.empty : projectsLayer(input.workspaceRoot),
+        input.roleModels === undefined
+          ? Layer.empty
+          : Layer.mock(ServerSettingsModule.ServerSettingsService)({
+              getSettings: Effect.succeed({
+                ...DEFAULT_SERVER_SETTINGS,
+                organizationRoleModelSelections: {
+                  ...DEFAULT_SERVER_SETTINGS.organizationRoleModelSelections,
+                  ...input.roleModels,
+                },
+              }),
+            }),
       );
       const result = yield* Effect.gen(function* () {
         const service = yield* OrchestratorMcpService.OrchestratorMcpService;
@@ -1359,7 +1376,10 @@ describe("OrchestratorMcpService provider resolution", () => {
         Effect.result,
       );
       const command = (yield* Ref.get(dispatched))[0] as
-        | { readonly organizationRepository?: string }
+        | {
+            readonly organizationRepository?: string;
+            readonly modelSelection: { readonly instanceId: string; readonly model: string };
+          }
         | undefined;
       return { result, command };
     });
@@ -1381,6 +1401,114 @@ describe("OrchestratorMcpService provider resolution", () => {
   });
   const failureCode = (result: { readonly _tag: string; readonly failure?: unknown }) =>
     result._tag === "Failure" ? (result.failure as { readonly code?: string }).code : undefined;
+
+  describe("configured organization role models", () => {
+    const workInstanceId = ProviderInstanceId.make("opencode-work");
+    const fastInstanceId = ProviderInstanceId.make("opencode-fast");
+    const providers = [
+      providerSnapshot({
+        instanceId: codexInstanceId,
+        driver: ProviderDriverKind.make("codex"),
+        model: "gpt-5.4",
+      }),
+      providerSnapshot({
+        instanceId: workInstanceId,
+        driver: ProviderDriverKind.make("opencode"),
+        model: "work-model",
+      }),
+      providerSnapshot({
+        instanceId: fastInstanceId,
+        driver: ProviderDriverKind.make("opencode"),
+        model: "fireworks-ai/accounts/fireworks/models/deepseek-v4p1-flash",
+      }),
+    ];
+    const roleModels = {
+      executor: { instanceId: workInstanceId, model: "work-model" },
+      reviewer: { instanceId: codexInstanceId, model: "gpt-5.4" },
+    };
+
+    it.effect("an executor and a reviewer start on their configured models", () =>
+      withRepositories(
+        Effect.gen(function* () {
+          const workspaceRoot = yield* repositoryRoot(["."]);
+          const executor = yield* delegateFromOrganization({
+            organization: lead(),
+            delegate: { target: undefined },
+            workspaceRoot,
+            providers,
+            roleModels,
+          });
+          assert.equal(executor.result._tag, "Success");
+          assert.deepEqual(executor.command?.modelSelection, {
+            instanceId: workInstanceId,
+            model: "work-model",
+          });
+          const reviewer = yield* delegateFromOrganization({
+            organization: lead(),
+            delegate: {
+              target: undefined,
+              role: "review",
+              reviewTaskThreadId: ThreadId.make("submitted-task"),
+            },
+            providers,
+            roleModels,
+          });
+          assert.equal(reviewer.command?.modelSelection.instanceId, codexInstanceId);
+          assert.equal(reviewer.command?.modelSelection.model, "gpt-5.4");
+        }),
+      ),
+    );
+
+    it.effect("an explicit target wins over the configured model", () =>
+      withRepositories(
+        Effect.gen(function* () {
+          const workspaceRoot = yield* repositoryRoot(["."]);
+          const { result, command } = yield* delegateFromOrganization({
+            organization: lead(),
+            delegate: {
+              target: {
+                providerInstanceId: fastInstanceId,
+                model: "fireworks-ai/accounts/fireworks/models/deepseek-v4p1-flash",
+              },
+            },
+            workspaceRoot,
+            providers,
+            roleModels,
+          });
+          assert.equal(result._tag, "Success");
+          assert.equal(command?.modelSelection.instanceId, fastInstanceId);
+        }),
+      ),
+    );
+
+    it.effect("an unavailable configured provider is reported, never substituted", () =>
+      withRepositories(
+        Effect.gen(function* () {
+          const workspaceRoot = yield* repositoryRoot(["."]);
+          const missing = yield* delegateFromOrganization({
+            organization: lead(),
+            delegate: { target: undefined },
+            workspaceRoot,
+            providers,
+            roleModels: {
+              executor: { instanceId: ProviderInstanceId.make("opencode-gone"), model: "x" },
+            },
+          });
+          assert.equal(failureCode(missing.result), "provider_unavailable");
+          assert.isUndefined(missing.command);
+          const model = yield* delegateFromOrganization({
+            organization: lead(),
+            delegate: { target: undefined },
+            workspaceRoot,
+            providers,
+            roleModels: { executor: { instanceId: workInstanceId, model: "retired-model" } },
+          });
+          assert.equal(failureCode(model.result), "model_unavailable");
+          assert.isUndefined(model.command);
+        }),
+      ),
+    );
+  });
 
   it.effect("an executor's repository must be a Git repository under the project root", () =>
     withRepositories(

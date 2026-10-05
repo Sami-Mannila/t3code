@@ -22,7 +22,12 @@ import {
   CommandId,
   MessageId,
   type OrchestrationV2ThreadShell,
+  type OrganizationRole,
 } from "@t3tools/contracts";
+import {
+  type OrganizationRoleModel,
+  resolveOrganizationRoleModelSelection,
+} from "@t3tools/shared/serverSettings";
 import * as Cause from "effect/Cause";
 import * as Data from "effect/Data";
 import * as Crypto from "effect/Crypto";
@@ -104,28 +109,34 @@ const program = Effect.gen(function* () {
   if (!config.environment.capabilities.organizationV1)
     return yield* Effect.die("Pilot server lacks organization capability.");
   mark("required provider catalog readiness");
-  const chiefProvider = config.providers.find(
-    (p) =>
-      p.driver === "codex" &&
-      p.enabled &&
-      p.status === "ready" &&
-      p.models.some((m) => m.slug === "gpt-6.1-sol"),
-  );
-  const executorProvider = config.providers.find(
-    (p) =>
-      p.driver === "opencode" &&
-      p.enabled &&
-      p.status === "ready" &&
-      p.models.some((m) => m.slug === "fireworks-ai/accounts/fireworks/models/deepseek-v4p1-flash"),
-  );
+  // The same role models delegate_task uses, from the pilot server's settings.
+  const roleModel = (role: OrganizationRole) =>
+    resolveOrganizationRoleModelSelection(config.settings, role);
+  const slugOf = (model: OrganizationRoleModel) =>
+    model.source === "default" ? model.model : model.selection.model;
+  const describe = (model: OrganizationRoleModel) =>
+    model.source === "default"
+      ? `${model.driverKind} ${model.model}`
+      : `${model.selection.instanceId} ${model.selection.model}`;
+  const readyProvider = (model: OrganizationRoleModel) =>
+    config.providers.find(
+      (p) =>
+        (model.source === "default"
+          ? p.driver === model.driverKind
+          : p.instanceId === model.selection.instanceId) &&
+        p.enabled &&
+        p.status === "ready" &&
+        p.models.some((m) => m.slug === slugOf(model)),
+    );
+  const chiefModel = roleModel("chief");
+  const executorModel = roleModel("executor");
+  const requiredModels = new Set([chiefModel, executorModel].map(slugOf));
+  const chiefProvider = readyProvider(chiefModel);
+  const executorProvider = readyProvider(executorModel);
   if (probeOnly || !chiefProvider || !executorProvider) {
     for (const provider of config.providers) {
       const matched = provider.models
-        .filter((m) =>
-          ["gpt-6.1-sol", "fireworks-ai/accounts/fireworks/models/deepseek-v4p1-flash"].includes(
-            m.slug,
-          ),
-        )
+        .filter((m) => requiredModels.has(m.slug))
         .map((m) => m.slug)
         .join(",");
       const clean = (value: string) => value.replace(/[^a-zA-Z0-9_./:-]/g, "_").slice(0, 160);
@@ -192,7 +203,10 @@ const program = Effect.gen(function* () {
   } else {
     projectId = ProjectId.make(yield* uuid());
     threadId = ThreadId.make(yield* uuid());
-    const modelSelection = { instanceId: chiefProvider!.instanceId, model: "gpt-6.1-sol" };
+    const modelSelection =
+      chiefModel.source === "configured"
+        ? chiefModel.selection
+        : { instanceId: chiefProvider!.instanceId, model: chiefModel.model };
     mark("native project create RPC");
     yield* client[WS_METHODS.projectsMutate]({
       type: "project.create",
@@ -231,7 +245,7 @@ const program = Effect.gen(function* () {
       messageId: MessageId.make(yield* uuid()),
       text: resumeChief
         ? "The organization review lookup defect has been repaired and independently reviewed. Recover this existing isolated smoke workstream: ask the same project lead to resume its same assigned reviewer on the existing smoke-test.txt artifact. Do not create another Chief, outcome or executor task. Do not redo executor work unless independent review establishes a real artifact correction is necessary. Use the existing native task IDs and review assignment; no orgctl or duplicate coordinator. Finish the existing reviewed lead outcome awaiting my final acceptance, never accept it on my behalf. The only permitted artifact remains smoke-test.txt with exactly organization works followed by a newline, 19 bytes and SHA256 a74f3d39459e0245fe64e6360b24c033930204d115611ad5f5083c4fcb600707. No assets/research/credentials/production."
-        : "Run the isolated organization smoke described in AGENTS.md. Coordinate through a project lead, an executor and an independent reviewer using native T3 tools. Change only smoke-test.txt to exactly organization works followed by one newline (19 UTF-8 bytes; SHA256 a74f3d39459e0245fe64e6360b24c033930204d115611ad5f5083c4fcb600707). Use Codex gpt-6.1-sol for coordination/review and OpenCode fireworks-ai/accounts/fireworks/models/deepseek-v4p1-flash for execution. No research, installation, external source access, or other files. Finish at reviewed final outcome awaiting my acceptance, do not accept on my behalf.",
+        : `Run the isolated organization smoke described in AGENTS.md. Coordinate through a project lead, an executor and an independent reviewer using native T3 tools. Change only smoke-test.txt to exactly organization works followed by one newline (19 UTF-8 bytes; SHA256 a74f3d39459e0245fe64e6360b24c033930204d115611ad5f5083c4fcb600707). Use the configured role models: lead ${describe(roleModel("lead"))}, executor ${describe(executorModel)}, reviewer ${describe(roleModel("reviewer"))}. No research, installation, external source access, or other files. Finish at reviewed final outcome awaiting my acceptance, do not accept on my behalf.`,
       attachments: [],
       dispatchMode: { type: queueBehindActive ? "queue_after_active" : "start_immediately" },
     });

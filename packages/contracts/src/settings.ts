@@ -21,6 +21,7 @@ import {
   ProviderOptionSelections,
 } from "./model.ts";
 import { ModelSelection } from "./modelSelection.ts";
+import type { OrganizationRole } from "./organization.ts";
 import { ProjectScript } from "./project.ts";
 import { DEFAULT_RUNTIME_MODE, RuntimeMode } from "./providerPolicy.ts";
 import { BrowserProfile, BrowserProfileId, DEFAULT_BROWSER_PROFILE_ID } from "./browserProfile.ts";
@@ -1181,6 +1182,34 @@ const NULLABLE_PROJECT_SETTINGS_OVERRIDES: ReadonlySet<ProjectScopedServerSettin
   "sidebarAutoSettleAfterDays",
 ]);
 
+/**
+ * The model each organization role starts with when nobody chose one. A default names a driver,
+ * not an instance: a child keeps its parent's instance of that driver when it can serve it.
+ */
+export const DEFAULT_ORGANIZATION_ROLE_MODEL_SELECTIONS = {
+  advisor: { driverKind: "codex", model: "gpt-6.1-sol" },
+  chief: { driverKind: "codex", model: "gpt-6.1-sol" },
+  lead: { driverKind: "codex", model: "gpt-6.1-sol" },
+  executor: {
+    driverKind: "opencode",
+    model: "fireworks-ai/accounts/fireworks/models/deepseek-v4p1-flash",
+  },
+  reviewer: { driverKind: "codex", model: "gpt-6.1-sol" },
+} as const satisfies Record<OrganizationRole, { driverKind: string; model: string }>;
+
+/** A role's configured model; `null` keeps its default. */
+const organizationRoleModelSelection = Schema.NullOr(ModelSelection).pipe(
+  Schema.withDecodingDefault(Effect.succeed(null)),
+);
+export const OrganizationRoleModelSelections = Schema.Struct({
+  advisor: organizationRoleModelSelection,
+  chief: organizationRoleModelSelection,
+  lead: organizationRoleModelSelection,
+  executor: organizationRoleModelSelection,
+  reviewer: organizationRoleModelSelection,
+});
+export type OrganizationRoleModelSelections = typeof OrganizationRoleModelSelections.Type;
+
 export const StorageCleanupSettings = Schema.Struct({
   worktreeAfterDays: StorageRetentionDays.pipe(Schema.withDecodingDefault(Effect.succeed(null))),
   worktreeOnMerge: Schema.Boolean.pipe(Schema.withDecodingDefault(Effect.succeed(false))),
@@ -1356,6 +1385,10 @@ export const ServerSettings = Schema.Struct({
   ),
   sourceControlWriterModelSelection: Schema.NullOr(ModelSelection).pipe(
     Schema.withDecodingDefault(Effect.succeed(null)),
+  ),
+  /** Server-wide: delegations and the organization page start each role on its model. */
+  organizationRoleModelSelections: OrganizationRoleModelSelections.pipe(
+    Schema.withDecodingDefault(Effect.succeed({})),
   ),
   /**
    * The merge method pull requests start with; `null` reuses the method
@@ -1664,6 +1697,16 @@ export const ServerSettingsPatch = Schema.Struct({
     }),
   ),
   sourceControlWriterModelSelection: Schema.optionalKey(Schema.NullOr(ModelSelection)),
+  /** Each role present is replaced; `null` restores its default. */
+  organizationRoleModelSelections: Schema.optionalKey(
+    Schema.Struct({
+      advisor: Schema.optionalKey(Schema.NullOr(ModelSelection)),
+      chief: Schema.optionalKey(Schema.NullOr(ModelSelection)),
+      lead: Schema.optionalKey(Schema.NullOr(ModelSelection)),
+      executor: Schema.optionalKey(Schema.NullOr(ModelSelection)),
+      reviewer: Schema.optionalKey(Schema.NullOr(ModelSelection)),
+    }),
+  ),
   pullRequestMergeMethod: Schema.optionalKey(Schema.NullOr(PullRequestMergeMethod)),
   observability: Schema.optionalKey(
     Schema.Struct({

@@ -1,5 +1,6 @@
 import { organizationTaskContext } from "./OrganizationTaskContext.ts";
 import {
+  organizationInstructions,
   organizationPreparationBlock,
   organizationPreparationUnblock,
 } from "./OrganizationPolicy.ts";
@@ -22,6 +23,7 @@ import {
   ProjectId,
   ProviderDriverKind,
   ProviderInstanceId,
+  DEFAULT_SERVER_SETTINGS,
   ProviderThreadId,
   RunId,
   ThreadId,
@@ -1299,6 +1301,27 @@ it("a preparation failure blocks only work about to run, and its retry restores 
   assert.equal(resumed.notes, null);
   assert.isNull(organizationPreparationUnblock(task({ state: "blocked", notes: "Needs input." })));
   assert.isNull(organizationPreparationUnblock(task({ state: "accepted" })));
+});
+
+it("organization instructions name each role's configured model", () => {
+  const settings = {
+    organizationRoleModelSelections: {
+      ...DEFAULT_SERVER_SETTINGS.organizationRoleModelSelections,
+      executor: { instanceId: ProviderInstanceId.make("opencode-work"), model: "work-model" },
+    },
+  };
+  const text = organizationInstructions(
+    {
+      id: ThreadId.make("instructions-chief"),
+      organization: { role: "chief", parentThreadId: null },
+      worktreePath: null,
+      branch: null,
+    },
+    settings,
+  );
+  assert.include(text, "executor opencode-work work-model");
+  assert.include(text, "reviewer codex gpt-6.1-sol");
+  assert.notInclude(text, "executor opencode fireworks");
 });
 
 it("t3_organization_task read reports a repository only for a conversation with a task", () => {

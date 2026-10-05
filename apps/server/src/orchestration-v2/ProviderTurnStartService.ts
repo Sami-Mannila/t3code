@@ -4,6 +4,7 @@ import {
   organizationRepositoryRoot,
 } from "./OrganizationPolicy.ts";
 import * as OrganizationArtifacts from "./OrganizationArtifacts.ts";
+import * as ServerSettings from "../serverSettings.ts";
 import * as Path from "effect/Path";
 import { modelSelectionsEqual } from "@t3tools/shared/model";
 import { projectComposerContextForProvider } from "@t3tools/shared/composerContextReferences";
@@ -116,6 +117,8 @@ export const layer: Layer.Layer<
     const providerSessions = yield* ProviderSessionManager.ProviderSessionManagerV2;
     const runExecution = yield* RunExecutionService.RunExecutionServiceV2;
     const runtimePolicy = yield* RuntimePolicy.RuntimePolicyV2;
+    // Organization instructions name each role's model; layers without settings use defaults.
+    const settingsService = yield* Effect.serviceOption(ServerSettings.ServerSettingsService);
 
     // These callbacks outlive startup while a run drains background work. Build
     // them outside start's scope so they cannot retain its full thread history.
@@ -1221,7 +1224,15 @@ export const layer: Layer.Layer<
           const context = [
             delivery.context,
             restartNote,
-            organizationInstructions(projection.thread),
+            projection.thread.organization && Option.isSome(settingsService)
+              ? organizationInstructions(
+                  projection.thread,
+                  yield* settingsService.value.getSettings.pipe(
+                    // The defaults still describe the roles if settings cannot be read.
+                    Effect.orElseSucceed(() => undefined),
+                  ),
+                )
+              : organizationInstructions(projection.thread),
           ]
             .filter((part) => part !== "")
             .join("\n\n");

@@ -15,6 +15,7 @@ import {
   applyServerSettingsPatch,
   isModelSelectionProviderEnabled,
   parsePersistedServerObservabilitySettings,
+  resolveOrganizationRoleModelSelection,
   resolveSourceControlWriterModelSelection,
   resolveProjectAgentBrowserAccess,
   resolveProjectAutoPull,
@@ -793,5 +794,47 @@ describe("serverSettings helpers", () => {
     });
 
     expect(resolved.pauseWhenOnBattery).toBe(false);
+  });
+});
+
+describe("organization role models", () => {
+  const work = createModelSelection(ProviderInstanceId.make("opencode-work"), "work-model", [
+    { id: "reasoningEffort", value: "high" },
+  ]);
+
+  it("resolves an untouched role to its default driver and model", () => {
+    expect(resolveOrganizationRoleModelSelection(DEFAULT_SERVER_SETTINGS, "executor")).toEqual({
+      source: "default",
+      driverKind: "opencode",
+      model: "fireworks-ai/accounts/fireworks/models/deepseek-v4p1-flash",
+    });
+    expect(resolveOrganizationRoleModelSelection(DEFAULT_SERVER_SETTINGS, "reviewer")).toEqual({
+      source: "default",
+      driverKind: "codex",
+      model: "gpt-6.1-sol",
+    });
+  });
+
+  it("replaces a patched role whole, keeps the others and restores a default with null", () => {
+    const configured = applyServerSettingsPatch(DEFAULT_SERVER_SETTINGS, {
+      organizationRoleModelSelections: { executor: work, lead: work },
+    });
+    expect(resolveOrganizationRoleModelSelection(configured, "executor")).toEqual({
+      source: "configured",
+      selection: work,
+    });
+    const replaced = applyServerSettingsPatch(configured, {
+      organizationRoleModelSelections: {
+        executor: createModelSelection(ProviderInstanceId.make("codex"), "gpt-5.4"),
+        lead: null,
+      },
+    });
+    // The new model does not inherit the old model's options.
+    expect(replaced.organizationRoleModelSelections.executor).toEqual({
+      instanceId: "codex",
+      model: "gpt-5.4",
+    });
+    expect(replaced.organizationRoleModelSelections.lead).toBeNull();
+    expect(replaced.organizationRoleModelSelections.chief).toBeNull();
   });
 });
