@@ -47,6 +47,7 @@ it.layer(NodeServices.layer)("cli config resolution", (it) => {
   const defaultObservabilityConfig = {
     traceMinLevel: "Info",
     traceTimingEnabled: true,
+    traceVerbose: false,
     traceBatchWindowMs: 1_000,
     traceMaxBytes: 10 * 1024 * 1024,
     traceMaxFiles: 10,
@@ -1059,6 +1060,22 @@ it.layer(NodeServices.layer)("cli config resolution", (it) => {
     tailscaleServeEnabled: Option.none<boolean>(),
     tailscaleServePort: Option.none<number>(),
   });
+
+  it.effect("keeps verbose trace spans off unless T3CODE_TRACE_VERBOSE is set", () =>
+    Effect.gen(function* () {
+      const { join } = yield* Path.Path;
+      const baseDir = join(NodeOS.tmpdir(), "t3-cli-config-trace-verbose-base");
+      const resolve = (env: Record<string, string>) =>
+        resolveServerConfig(minimalWebFlags(baseDir), Option.none()).pipe(
+          Effect.provide(
+            Layer.mergeAll(ConfigProvider.layer(ConfigProvider.fromEnv({ env })), NetService.layer),
+          ),
+        );
+
+      expect((yield* resolve({})).traceVerbose).toBe(false);
+      expect((yield* resolve({ T3CODE_TRACE_VERBOSE: "true" })).traceVerbose).toBe(true);
+    }),
+  );
 
   it.effect(
     "resolves each signal's endpoint through T3CODE_OTLP_*_URL, an OTEL endpoint, the bootstrap envelope, and persisted Settings, in that order",

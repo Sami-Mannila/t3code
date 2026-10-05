@@ -1,5 +1,6 @@
 import { httpHeaderRedactionLayer } from "@t3tools/shared/httpObservability";
 import {
+  isVerboseTraceSpan,
   makeLocalFileTracer,
   makeTraceSink,
   otlpSerializationLayer,
@@ -69,6 +70,7 @@ export const ObservabilityLive = Layer.unwrap(
           batchWindowMs: config.traceBatchWindowMs,
           sink,
           ...(delegate ? { delegate } : {}),
+          ...(config.traceVerbose ? {} : { omitSpan: isVerboseTraceSpan }),
         });
 
         return Layer.mergeAll(
