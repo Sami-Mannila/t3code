@@ -416,7 +416,6 @@ describe("ProviderInstanceRegistryLive — multi-instance codex slice", () => {
       ))
         .trim()
         .split("\n")
-        // @effect-diagnostics-next-line preferSchemaOverJson:off - request log written by the external Codex mock peer.
         .map((line) => JSON.parse(line) as { method: string; params: unknown })
         .filter((request) => request.method === "account/read");
       expect(accountReads.length).toBeGreaterThan(0);
