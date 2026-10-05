@@ -21,6 +21,8 @@ const GIT_TIMEOUT: Duration.Input = "30 seconds";
 /** Checking out a large repository can take minutes. */
 const WORKTREE_ADD_TIMEOUT: Duration.Input = "5 minutes";
 const GIT_OUTPUT_BYTES = 1_048_576;
+/** Untranslated Git output, so worktree listings and error text can be matched. */
+const GIT_ENV = { LC_ALL: "C", LANGUAGE: "C" };
 const DETAIL_CHARS = 2_000;
 const MAX_CANDIDATES = 20;
 
@@ -133,6 +135,7 @@ export const resolveRepository = Effect.fn("OrganizationWorkspace.resolveReposit
         cwd: directory.value,
         timeout: GIT_TIMEOUT,
         maxOutputBytes: GIT_OUTPUT_BYTES,
+        env: GIT_ENV,
       });
     const toplevel = yield* git(["rev-parse", "--show-toplevel"]);
     if (toplevel.code !== 0)
@@ -194,7 +197,7 @@ export const prepare = Effect.fn("OrganizationWorkspace.prepare")(function* (inp
       timeout: Duration.Input = GIT_TIMEOUT,
     ) =>
       process
-        .run({ command: "git", args, cwd, timeout, maxOutputBytes: GIT_OUTPUT_BYTES })
+        .run({ command: "git", args, cwd, timeout, maxOutputBytes: GIT_OUTPUT_BYTES, env: GIT_ENV })
         .pipe(
           Effect.flatMap((result) =>
             result.code === 0
@@ -229,6 +232,24 @@ export const prepare = Effect.fn("OrganizationWorkspace.prepare")(function* (inp
     // add that was killed, which never released a run, so the folder holds only Git's partial
     // checkout. It may lack even its .git file, so Git cannot remove it itself.
     if (entry?.includes("locked initializing")) {
+      // Delete only what Git would call clean, or a folder without its .git file. Anything
+      // else stays for the user, even if that means removing a killed checkout by hand.
+      // Without its own .git, status would describe whatever repository encloses the folder.
+      const status = (yield* fs.exists(path.join(workspace, ".git")))
+        ? yield* process.run({
+            command: "git",
+            args: ["status", "--porcelain"],
+            cwd: workspace,
+            timeout: WORKTREE_ADD_TIMEOUT,
+            maxOutputBytes: GIT_OUTPUT_BYTES,
+            outputMode: "truncate",
+            env: GIT_ENV,
+          })
+        : null;
+      if (status?.code === 0 && status.stdout.trim() !== "")
+        return yield* fail(
+          `${workspace} is an interrupted worktree with changes in it; move its contents away, then retry`,
+        );
       yield* git(["worktree", "unlock", workspace]);
       yield* fs.remove(workspace, { recursive: true });
       yield* git(["worktree", "prune"]);
@@ -248,6 +269,7 @@ export const prepare = Effect.fn("OrganizationWorkspace.prepare")(function* (inp
           cwd: repositoryRoot,
           timeout: GIT_TIMEOUT,
           maxOutputBytes: GIT_OUTPUT_BYTES,
+          env: GIT_ENV,
         })
         .pipe(Effect.map((result) => result.code === 0));
       yield* git(

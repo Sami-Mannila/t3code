@@ -21,8 +21,9 @@ repositories, so worktrees are tied to tasks, not to the root.
   thread ID and belong to that task alone. Preparation prunes stale registrations, checks out the
   task's existing branch when the folder is gone (a killed checkout, or storage cleanup, which
   keeps the branch), and replaces a folder only when it is empty or is a registered worktree
-  still carrying the `initializing` lock of an add that was killed. A folder with other contents
-  is never deleted; preparation fails and names it. `worktree add` gets five minutes, since a
+  still carrying the `initializing` lock of an add that was killed, and only while `git status`
+  shows it clean or it has no `.git` of its own. A folder with other contents is never deleted;
+  preparation fails and names it. Git runs in the C locale so its output can be matched. `worktree add` gets five minutes, since a
   large repository's checkout can take longer than the other Git commands' 30 seconds.
 - A Git exit during preparation is usually deterministic, so the effect worker fails the run on the
   first attempt, with the command's stderr in the task notes that reach the parent and the Chief.

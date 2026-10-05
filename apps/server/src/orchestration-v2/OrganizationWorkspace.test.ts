@@ -370,12 +370,10 @@ it.layer(
     }),
   );
 
-  it.effect("an add killed mid-checkout is removed and recreated", () =>
+  /** What `git worktree add` leaves when killed before its checkout finished. */
+  const interruptedAdd = (own: Effect.Success<typeof ownWorktree>) =>
     Effect.gen(function* () {
-      const fs = yield* FileSystem.FileSystem;
-      const own = yield* ownWorktree;
       assert.equal((yield* git(own.repository, "branch", own.branch)).code, 0);
-      // What `git worktree add` leaves when killed before its checkout finished.
       assert.equal(
         (yield* git(
           own.repository,
@@ -389,10 +387,34 @@ it.layer(
         )).code,
         0,
       );
-      yield* fs.remove(`${own.workspace}/.git`);
-      yield* preparedWorktree(yield* own.run, own);
-      const listed = (yield* git(own.repository, "worktree", "list", "--porcelain")).stdout;
-      assert.notInclude(listed, "locked initializing");
+    });
+
+  it.effect("an add killed mid-checkout is removed and recreated", () =>
+    Effect.gen(function* () {
+      const fs = yield* FileSystem.FileSystem;
+      for (const missingGitFile of [true, false]) {
+        const own = yield* ownWorktree;
+        yield* interruptedAdd(own);
+        if (missingGitFile) yield* fs.remove(`${own.workspace}/.git`);
+        yield* preparedWorktree(yield* own.run, own);
+        const listed = (yield* git(own.repository, "worktree", "list", "--porcelain")).stdout;
+        assert.notInclude(listed, "locked initializing");
+      }
+    }),
+  );
+
+  it.effect("an interrupted worktree with changes in it is never deleted", () =>
+    Effect.gen(function* () {
+      const fs = yield* FileSystem.FileSystem;
+      const own = yield* ownWorktree;
+      yield* interruptedAdd(own);
+      yield* fs.writeFileString(`${own.workspace}/notes.txt`, "keep me\n");
+      const { exit, dispatched } = yield* own.run;
+      assert.deepEqual(dispatched, []);
+      const error = Exit.isFailure(exit) ? Cause.squash(exit.cause) : undefined;
+      assert.isTrue(OrganizationWorkspace.isTerminalWorkspaceFailure(error));
+      assert.include((error as Error).message, "move its contents away");
+      assert.equal(yield* fs.readFileString(`${own.workspace}/notes.txt`), "keep me\n");
     }),
   );
 
