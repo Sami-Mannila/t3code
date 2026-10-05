@@ -430,6 +430,40 @@ it.layer(TestLayer, { excludeTestServices: true })("WorkspaceEntries", (it) => {
       }),
     );
 
+    it.effect("defers the rescan after refresh to the next read of a live index", () =>
+      Effect.gen(function* () {
+        const cwd = yield* makeTempDir({ prefix: "t3code-workspace-lazy-refresh-" });
+        yield* writeTextFile(cwd, "src/index.ts", "export {};\n");
+
+        const workspaceEntries = yield* WorkspaceEntries.WorkspaceEntries;
+        const createSpy = vi.spyOn(FileFinder, "create");
+        const scanSpy = vi.spyOn(FileFinder.prototype, "scanFiles");
+
+        // Nothing is indexed yet, so a refresh neither builds nor scans an index.
+        yield* workspaceEntries.refresh(cwd);
+        expect(createSpy).not.toHaveBeenCalled();
+
+        yield* workspaceEntries.list({ cwd });
+        yield* writeTextFile(cwd, "src/added.ts", "export {};\n");
+        yield* workspaceEntries.refresh(cwd);
+        yield* workspaceEntries.refresh(cwd);
+        expect(scanSpy).not.toHaveBeenCalled();
+
+        const listed = yield* workspaceEntries.list({ cwd });
+        expect(scanSpy).toHaveBeenCalledTimes(1);
+        expect(listed.entries).toEqual(
+          expect.arrayContaining([{ path: "src/added.ts", kind: "file" }]),
+        );
+        yield* workspaceEntries.search({ cwd, query: "added", limit: 10 });
+        expect(scanSpy).toHaveBeenCalledTimes(1);
+
+        // Invalidation drops the index; the next read builds a new one.
+        yield* workspaceEntries.invalidate(cwd);
+        yield* workspaceEntries.list({ cwd });
+        expect(createSpy).toHaveBeenCalledTimes(2);
+      }),
+    );
+
     it.effect("rebuilds the cached index after refresh fails", () =>
       Effect.gen(function* () {
         const cwd = yield* makeTempDir({ prefix: "t3code-workspace-refresh-failure-" });
