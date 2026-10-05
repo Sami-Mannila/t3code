@@ -377,6 +377,55 @@ describe("ProviderInstanceRegistryLive — multi-instance codex slice", () => {
     }).pipe(Effect.provide(testLayer)),
   );
 
+  it.live("reads the Codex account without asking Codex to refresh its token", () =>
+    Effect.gen(function* () {
+      if (yield* isHostWindows) return;
+      const fileSystem = yield* FileSystem.FileSystem;
+      const fixtures = yield* makeTildeProviderFixtures();
+      yield* fileSystem.writeFileString(
+        fixtures.codexScriptPath,
+        // @effect-diagnostics-next-line preferSchemaOverJson:off - fixed script document read by the external Codex mock peer.
+        JSON.stringify({
+          rootThreadId: "probe-thread",
+          notifications: [],
+          account: { type: "chatgpt", email: "test@example.com", planType: "plus" },
+          recordRequests: true,
+        }),
+      );
+      const codexId = ProviderInstanceId.make("codex_account_read");
+      const { registry } = yield* makeProviderInstanceRegistry({
+        drivers: [CodexDriver],
+        configMap: {
+          [codexId]: {
+            driver: ProviderDriverKind.make("codex"),
+            enabled: true,
+            environment: [
+              { name: "T3_CODEX_COLLAB_SCRIPT", value: fixtures.codexScriptPath, sensitive: false },
+            ],
+            config: makeCodexConfig({ enabled: true, binaryPath: fixtures.codexBinaryPath }),
+          },
+        },
+      });
+      const codex = yield* registry.getInstance(codexId);
+      expect(codex).toBeDefined();
+      const snapshot = yield* codex!.snapshot.refresh;
+      expect(snapshot).toMatchObject({ status: "ready", auth: { status: "authenticated" } });
+
+      const accountReads = (yield* fileSystem.readFileString(
+        `${fixtures.codexScriptPath}.requests`,
+      ))
+        .trim()
+        .split("\n")
+        // @effect-diagnostics-next-line preferSchemaOverJson:off - request log written by the external Codex mock peer.
+        .map((line) => JSON.parse(line) as { method: string; params: unknown })
+        .filter((request) => request.method === "account/read");
+      expect(accountReads.length).toBeGreaterThan(0);
+      for (const request of accountReads) {
+        expect(request.params).toStrictEqual({ refreshToken: false });
+      }
+    }).pipe(Effect.provide(testLayer)),
+  );
+
   it.live("runs Codex and Claude readiness probes from configured tilde paths", () =>
     Effect.gen(function* () {
       if (yield* isHostWindows) return;

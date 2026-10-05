@@ -84,6 +84,12 @@ rl.on("line", (line) => {
     return;
   }
   if (method === "account/read") {
+    if (script.recordRequests) {
+      NodeFS.appendFileSync(
+        `${process.env.T3_CODEX_COLLAB_SCRIPT}.requests`,
+        `${JSON.stringify({ method, params: message.params })}\n`,
+      );
+    }
     write({
       id,
       result: { account: script.account ?? { type: "apiKey" }, requiresOpenaiAuth: false },

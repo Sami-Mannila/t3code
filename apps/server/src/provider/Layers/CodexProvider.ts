@@ -429,7 +429,10 @@ const probeCodexAppServerProvider = Effect.fn("probeCodexAppServerProvider")(fun
   const versionMatch = initialize.userAgent.match(/\/([^\s]+)/);
   const version = versionMatch ? versionMatch[1] : undefined;
 
-  const accountResponse = yield* client.request("account/read", {});
+  // A readiness probe only reads the account; it must never refresh tokens.
+  // Say so explicitly: Codex 0.160 answered `{}` with an internal error after
+  // outlasting the probe timeout, while `refreshToken: false` answered in ~3s.
+  const accountResponse = yield* client.request("account/read", { refreshToken: false });
   if (!accountResponse.account && accountResponse.requiresOpenaiAuth) {
     return {
       account: accountResponse,
