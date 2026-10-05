@@ -936,14 +936,14 @@ const taskNoticeSetup = Effect.gen(function* () {
   yield* create(chief, { role: "chief", parentThreadId: null });
   yield* create(lead, { role: "lead", parentThreadId: chief, task: task(lead) });
   yield* create(executor, { role: "executor", parentThreadId: lead, task: task(executor) });
-  const block = (id: ThreadId, key: string) =>
+  const block = (id: ThreadId, key: string, actor = id) =>
     Effect.gen(function* () {
       const org = (yield* threads.getThreadProjection(id)).thread.organization!;
       yield* threads.dispatch({
         type: "thread.metadata.update",
         commandId: CommandId.make(key),
         threadId: id,
-        organizationActorThreadId: id,
+        organizationActorThreadId: actor,
         organization: { ...org, task: { ...org.task!, state: "blocked", notes: "Needs input." } },
       });
     });
@@ -988,7 +988,16 @@ it.effect("a lead task update notifies only its Chief parent, once", () =>
   }).pipe(Effect.provide(taskNoticeLayer)),
 );
 
-it.effect("an archived parent lead receives no child task notice", () =>
+it.effect("a lead updating its executor's task does not notify itself", () =>
+  Effect.gen(function* () {
+    const { chief, lead, executor, block, noticeIds } = yield* taskNoticeSetup;
+    yield* block(executor, "lead-blocks-executor", lead);
+    assert.deepEqual(yield* noticeIds(chief), ["organization:lead-blocks-executor"]);
+    assert.deepEqual(yield* noticeIds(lead), []);
+  }).pipe(Effect.provide(taskNoticeLayer)),
+);
+
+it.effect("a child update under an archived lead is refused and sends no notices", () =>
   Effect.gen(function* () {
     const { orchestrator, chief, lead, executor, block, noticeIds } = yield* taskNoticeSetup;
     yield* orchestrator.dispatch({

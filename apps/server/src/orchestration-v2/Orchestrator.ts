@@ -3255,6 +3255,7 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
           item.id === thread.organization?.parentThreadId &&
           item.id !== thread.id &&
           item.id !== chief?.id &&
+          item.id !== command.organizationActorThreadId &&
           item.projectId === thread.projectId &&
           item.archivedAt === null &&
           item.deletedAt === null,
