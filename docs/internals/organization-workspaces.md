@@ -17,6 +17,13 @@ repositories, so worktrees are tied to tasks, not to the root.
 - Every organization child still goes through the `organization-workspace.prepare` effect, even
   when it gets no worktree. That effect ends in `prepared-run.release`, which is the admission and
   worker-capacity gate; skipping it for roles without a worktree would let them start unadmitted.
+- Creating an executor's worktree is idempotent, because its path and branch derive from the
+  thread ID and belong to that task alone. Preparation prunes stale registrations, checks out the
+  task's existing branch when the folder is gone (a killed checkout, or storage cleanup, which
+  keeps the branch), and replaces a folder only when it is empty or is a registered worktree
+  still carrying the `initializing` lock of an add that was killed. A folder with other contents
+  is never deleted; preparation fails and names it. `worktree add` gets five minutes, since a
+  large repository's checkout can take longer than the other Git commands' 30 seconds.
 - A Git exit during preparation is usually deterministic, so the effect worker fails the run on the
   first attempt, with the command's stderr in the task notes that reach the parent and the Chief.
   Lock contention (`index.lock`, `could not lock`, `cannot lock ref`), typically from another

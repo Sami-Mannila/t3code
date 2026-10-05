@@ -317,6 +317,112 @@ it.layer(
       assert.isFalse(OrganizationWorkspace.isTerminalWorkspaceFailure(error));
     }),
   );
+
+  /** The path and branch prepare derives for a thread, and a prepare of it in repository `b`. */
+  const ownWorktree = Effect.gen(function* () {
+    const config = yield* ServerConfig.ServerConfig;
+    const root = yield* multiRepositoryRoot;
+    const threadId = ThreadId.make(`workspace-thread-${prepared++}`);
+    const key = NodeCrypto.createHash("sha256").update(threadId).digest("hex").slice(0, 24);
+    const run = prepareThread({
+      workspaceRoot: root,
+      threadId,
+      organization: { role: "executor", parentThreadId: ThreadId.make("lead"), task: task("b") },
+    });
+    return {
+      root,
+      repository: `${root}/b`,
+      workspace: `${config.worktreesDir}/organization/${key}`,
+      branch: `t3/organization/${key}`,
+      run,
+    };
+  });
+  const preparedWorktree = (
+    result: Effect.Success<ReturnType<typeof prepareThread>>,
+    expected: { workspace: string; branch: string },
+  ) =>
+    Effect.gen(function* () {
+      assert.equal(result.exit._tag, "Success", String(result.exit));
+      const metadata = result.dispatched[0] as Extract<
+        OrchestrationV2ServerCommand,
+        { readonly type: "thread.metadata.update" }
+      >;
+      assert.equal(metadata.worktreePath, expected.workspace);
+      assert.equal(metadata.branch, expected.branch);
+      assert.equal(
+        (yield* git(expected.workspace, "branch", "--show-current")).stdout.trim(),
+        expected.branch,
+      );
+    });
+
+  it.effect("an interrupted creation that left the branch and an empty folder is completed", () =>
+    Effect.gen(function* () {
+      const fs = yield* FileSystem.FileSystem;
+      const own = yield* ownWorktree;
+      // A checkout killed by the timeout: the branch exists, the worktree does not.
+      assert.equal((yield* git(own.repository, "branch", own.branch)).code, 0);
+      yield* preparedWorktree(yield* own.run, own);
+
+      const second = yield* ownWorktree;
+      assert.equal((yield* git(second.repository, "branch", second.branch)).code, 0);
+      yield* fs.makeDirectory(second.workspace, { recursive: true });
+      yield* preparedWorktree(yield* second.run, second);
+    }),
+  );
+
+  it.effect("an add killed mid-checkout is removed and recreated", () =>
+    Effect.gen(function* () {
+      const fs = yield* FileSystem.FileSystem;
+      const own = yield* ownWorktree;
+      assert.equal((yield* git(own.repository, "branch", own.branch)).code, 0);
+      // What `git worktree add` leaves when killed before its checkout finished.
+      assert.equal(
+        (yield* git(
+          own.repository,
+          "worktree",
+          "add",
+          "--lock",
+          "--reason",
+          "initializing",
+          own.workspace,
+          own.branch,
+        )).code,
+        0,
+      );
+      yield* fs.remove(`${own.workspace}/.git`);
+      yield* preparedWorktree(yield* own.run, own);
+      const listed = (yield* git(own.repository, "worktree", "list", "--porcelain")).stdout;
+      assert.notInclude(listed, "locked initializing");
+    }),
+  );
+
+  it.effect("a worktree storage cleanup removed is recreated on its branch with its commits", () =>
+    Effect.gen(function* () {
+      const own = yield* ownWorktree;
+      yield* preparedWorktree(yield* own.run, own);
+      assert.equal((yield* git(own.workspace, "commit", "--allow-empty", "-m", "work")).code, 0);
+      const head = (yield* git(own.workspace, "rev-parse", "HEAD")).stdout.trim();
+      // Storage cleanup keeps the branch so a resumed task continues from it.
+      assert.equal((yield* git(own.repository, "worktree", "remove", own.workspace)).code, 0);
+      yield* preparedWorktree(yield* own.run, own);
+      assert.equal((yield* git(own.workspace, "rev-parse", "HEAD")).stdout.trim(), head);
+    }),
+  );
+
+  it.effect("a folder with contents that is not this task's worktree is never deleted", () =>
+    Effect.gen(function* () {
+      const fs = yield* FileSystem.FileSystem;
+      const own = yield* ownWorktree;
+      yield* fs.makeDirectory(own.workspace, { recursive: true });
+      yield* fs.writeFileString(`${own.workspace}/notes.txt`, "keep me\n");
+      const { exit, dispatched } = yield* own.run;
+      assert.deepEqual(dispatched, []);
+      const error = Exit.isFailure(exit) ? Cause.squash(exit.cause) : undefined;
+      assert.isTrue(OrganizationWorkspace.isTerminalWorkspaceFailure(error));
+      assert.include((error as Error).message, "is not a worktree of");
+      assert.equal(yield* fs.readFileString(`${own.workspace}/notes.txt`), "keep me\n");
+    }),
+  );
 });
 
 it("classifies only Git lock contention as transient", () => {
@@ -331,6 +437,11 @@ it("classifies only Git lock contention as transient", () => {
     "fatal: invalid reference: no-such-ref",
     "fatal: a branch named 't3/organization/abc' already exists",
     "fatal: '/worktrees/abc' already exists",
+    // Lock wording without the lock file in the way.
+    "error: could not lock config file .git/config: Permission denied",
+    "fatal: cannot lock ref 'refs/heads/main': is at 1234 but expected 5678",
+    // A ref directory/file conflict never clears on its own.
+    "fatal: cannot lock ref 'refs/heads/t3/organization/abc': 'refs/heads/t3' exists; cannot create 'refs/heads/t3/organization/abc'",
     "",
   ])
     assert.isFalse(OrganizationWorkspace.isGitLockContention(stderr), stderr);

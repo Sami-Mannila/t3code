@@ -8,6 +8,7 @@ import {
   type RunId,
   type ThreadId,
 } from "@t3tools/contracts";
+import type * as Duration from "effect/Duration";
 import * as Effect from "effect/Effect";
 import * as Option from "effect/Option";
 import * as Schema from "effect/Schema";
@@ -16,7 +17,9 @@ import { organizationNeedsWorktree, organizationRepository } from "./Organizatio
 import * as Projects from "./ProjectStore.ts";
 import * as Threads from "./ThreadManagementService.ts";
 
-const GIT_TIMEOUT = "30 seconds";
+const GIT_TIMEOUT: Duration.Input = "30 seconds";
+/** Checking out a large repository can take minutes. */
+const WORKTREE_ADD_TIMEOUT: Duration.Input = "5 minutes";
 const GIT_OUTPUT_BYTES = 1_048_576;
 const DETAIL_CHARS = 2_000;
 const MAX_CANDIDATES = 20;
@@ -47,7 +50,12 @@ export class OrganizationWorkspaceError extends Schema.TaggedError<OrganizationW
  * preparation. The lock clears on its own, so that exit is worth retrying.
  */
 export const isGitLockContention = (output: string) =>
-  /Unable to create '[^']*\.lock': File exists|could not lock|cannot lock ref/i.test(output);
+  // A ref directory/file conflict ("'refs/heads/a' exists; cannot create 'refs/heads/a/b'")
+  // is permanent even though Git reports it as a lock failure.
+  !/exists; cannot create/i.test(output) &&
+  /Unable to create '[^']*\.lock': File exists|(?:could not|cannot) lock[^\n]*File exists/i.test(
+    output,
+  );
 
 /** Deterministic preparation failures fail the run at once instead of burning retries. */
 const isWorkspaceError = Schema.is(OrganizationWorkspaceError);
@@ -180,9 +188,13 @@ export const prepare = Effect.fn("OrganizationWorkspace.prepare")(function* (inp
     const key = NodeCrypto.createHash("sha256").update(input.threadId).digest("hex").slice(0, 24);
     const workspace = path.join(config.worktreesDir, "organization", key);
     const branch = `t3/organization/${key}`;
-    const git = (args: ReadonlyArray<string>, cwd = repositoryRoot) =>
+    const git = (
+      args: ReadonlyArray<string>,
+      cwd = repositoryRoot,
+      timeout: Duration.Input = GIT_TIMEOUT,
+    ) =>
       process
-        .run({ command: "git", args, cwd, timeout: GIT_TIMEOUT, maxOutputBytes: GIT_OUTPUT_BYTES })
+        .run({ command: "git", args, cwd, timeout, maxOutputBytes: GIT_OUTPUT_BYTES })
         .pipe(
           Effect.flatMap((result) =>
             result.code === 0
@@ -197,15 +209,64 @@ export const prepare = Effect.fn("OrganizationWorkspace.prepare")(function* (inp
           ),
         );
     yield* fs.makeDirectory(path.join(config.worktreesDir, "organization"), { recursive: true });
-    if (!(yield* fs.exists(workspace)))
-      yield* git([
-        "worktree",
-        "add",
-        "-b",
-        branch,
-        workspace,
-        run.workspacePreparation?.type === "worktree" ? run.workspacePreparation.baseRef : "HEAD",
-      ]);
+    // Creation is idempotent: an earlier attempt may have been killed mid-checkout, and storage
+    // cleanup removes idle worktrees but keeps their branch. Both the path and the branch derive
+    // from this thread's ID, so they belong to this task alone.
+    yield* git(["worktree", "prune"]);
+    const registered = yield* git(["worktree", "list", "--porcelain"]);
+    // Git records the real path; the workspace itself may not exist.
+    const realWorkspace = path.join(
+      yield* fs.realPath(path.join(config.worktreesDir, "organization")),
+      key,
+    );
+    const entry = registered
+      .split("\n\n")
+      .map((block) => block.split("\n"))
+      .find((lines) =>
+        [workspace, realWorkspace].includes(lines[0]?.replace(/^worktree /, "") ?? ""),
+      );
+    // `git worktree add` holds this lock until its checkout finishes; a leftover one marks an
+    // add that was killed, which never released a run, so the folder holds only Git's partial
+    // checkout. It may lack even its .git file, so Git cannot remove it itself.
+    if (entry?.includes("locked initializing")) {
+      yield* git(["worktree", "unlock", workspace]);
+      yield* fs.remove(workspace, { recursive: true });
+      yield* git(["worktree", "prune"]);
+    } else if (!entry && (yield* fs.exists(workspace))) {
+      // Not a worktree of this repository: recreate it only if nothing is in it.
+      if ((yield* fs.readDirectory(workspace)).length > 0)
+        return yield* fail(
+          `${workspace} exists but is not a worktree of ${repositoryRoot}; move its contents away, then retry`,
+        );
+      yield* fs.remove(workspace, { recursive: true });
+    }
+    if (!(yield* fs.exists(workspace))) {
+      const branchExists = yield* process
+        .run({
+          command: "git",
+          args: ["rev-parse", "--verify", "--quiet", `refs/heads/${branch}`],
+          cwd: repositoryRoot,
+          timeout: GIT_TIMEOUT,
+          maxOutputBytes: GIT_OUTPUT_BYTES,
+        })
+        .pipe(Effect.map((result) => result.code === 0));
+      yield* git(
+        branchExists
+          ? ["worktree", "add", workspace, branch]
+          : [
+              "worktree",
+              "add",
+              "-b",
+              branch,
+              workspace,
+              run.workspacePreparation?.type === "worktree"
+                ? run.workspacePreparation.baseRef
+                : "HEAD",
+            ],
+        repositoryRoot,
+        WORKTREE_ADD_TIMEOUT,
+      );
+    }
     const actual = yield* git(["rev-parse", "--show-toplevel"], workspace);
     const expectedCommon = yield* git(["rev-parse", "--path-format=absolute", "--git-common-dir"]);
     const actualCommon = yield* git(
