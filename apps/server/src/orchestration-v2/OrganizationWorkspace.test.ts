@@ -16,6 +16,7 @@ import * as FileSystem from "effect/FileSystem";
 import * as Layer from "effect/Layer";
 import * as Option from "effect/Option";
 import * as Ref from "effect/Ref";
+import * as NodeCrypto from "node:crypto";
 
 import * as ServerConfig from "../config.ts";
 import * as ProcessRunner from "../processRunner.ts";
@@ -149,10 +150,11 @@ const prepareThread = (input: {
   readonly workspaceRoot: string;
   readonly organization: OrganizationThread;
   readonly baseRef?: string;
+  readonly threadId?: ThreadId;
 }) =>
   Effect.gen(function* () {
     // Worktree paths derive from the thread ID, and the suite shares one worktrees directory.
-    const threadId = ThreadId.make(`workspace-thread-${prepared++}`);
+    const threadId = input.threadId ?? ThreadId.make(`workspace-thread-${prepared++}`);
     const dispatched = yield* Ref.make<ReadonlyArray<OrchestrationV2ServerCommand>>([]);
     const projection = {
       thread: {
@@ -293,4 +295,43 @@ it.layer(
       assert.include(badRefError.detail, "no-such-ref");
     }),
   );
+
+  it.effect("lock contention with another Git process in the repository stays retryable", () =>
+    Effect.gen(function* () {
+      const fs = yield* FileSystem.FileSystem;
+      const root = yield* multiRepositoryRoot;
+      const threadId = ThreadId.make(`workspace-thread-${prepared++}`);
+      // A concurrent preparation holding this task's branch ref lock.
+      const key = NodeCrypto.createHash("sha256").update(threadId).digest("hex").slice(0, 24);
+      yield* fs.makeDirectory(`${root}/b/.git/refs/heads/t3/organization`, { recursive: true });
+      yield* fs.writeFileString(`${root}/b/.git/refs/heads/t3/organization/${key}.lock`, "");
+      const { exit, dispatched } = yield* prepareThread({
+        workspaceRoot: root,
+        threadId,
+        organization: { role: "executor", parentThreadId: ThreadId.make("lead"), task: task("b") },
+      });
+      assert.deepEqual(dispatched, []);
+      const error = Exit.isFailure(exit) ? Cause.squash(exit.cause) : undefined;
+      assert.instanceOf(error, OrganizationWorkspace.OrganizationWorkspaceError);
+      assert.include((error as OrganizationWorkspace.OrganizationWorkspaceError).detail, ".lock");
+      assert.isFalse(OrganizationWorkspace.isTerminalWorkspaceFailure(error));
+    }),
+  );
+});
+
+it("classifies only Git lock contention as transient", () => {
+  for (const stderr of [
+    "fatal: Unable to create '/repo/.git/index.lock': File exists.\n\nAnother git process seems to be running in this repository",
+    "error: could not lock config file .git/config: File exists",
+    "fatal: cannot lock ref 'refs/heads/t3/organization/abc': Unable to create '/repo/.git/refs/heads/t3/organization/abc.lock': File exists.",
+  ])
+    assert.isTrue(OrganizationWorkspace.isGitLockContention(stderr), stderr);
+  for (const stderr of [
+    "fatal: not a git repository (or any of the parent directories): .git",
+    "fatal: invalid reference: no-such-ref",
+    "fatal: a branch named 't3/organization/abc' already exists",
+    "fatal: '/worktrees/abc' already exists",
+    "",
+  ])
+    assert.isFalse(OrganizationWorkspace.isGitLockContention(stderr), stderr);
 });

@@ -288,7 +288,8 @@ const OrganizationTaskTool = Tool.make("t3_organization_task", {
     threadId: ThreadId,
     organization: Schema.NullOr(OrganizationThread),
     workspace: Schema.NullOr(Schema.String),
-    repository: Schema.String,
+    /** The task's repository; null for a conversation without a task. */
+    repository: Schema.NullOr(Schema.String),
     branch: Schema.NullOr(Schema.String),
     currentOwner: Schema.NullOr(
       Schema.Struct({

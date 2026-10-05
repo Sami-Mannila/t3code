@@ -105,6 +105,9 @@ export function OrganizationPage() {
   const selectedParent = parent ? parents.find((t) => t.id === parent) : parents[0];
   const acceptedThread = scoped.find((t) => t.id === accepting?.id);
   const acceptedTask = acceptedThread?.source.organization?.task;
+  // Computed once per render rather than in the dialog markup; React Compiler memoizes it on
+  // these inputs, and a manual useMemo here would make the compiler skip this component.
+  const acceptedFileGroups = outcomeFileGroups(acceptedTask?.files ?? [], scoped);
   const chief = scoped.find(
     (t) =>
       t.id === acceptedThread?.source.organization?.parentThreadId &&
@@ -566,7 +569,7 @@ export function OrganizationPage() {
             <p>{acceptedTask?.title}</p>
             <p className="break-all">Reviewed revision: {accepting?.revision ?? "Unavailable"}</p>
             <div className="max-h-64 space-y-3 overflow-auto">
-              {outcomeFileGroups(acceptedTask?.files ?? [], scoped).map((group) => (
+              {acceptedFileGroups.map((group) => (
                 <section key={group.child?.id ?? ""} className="space-y-1">
                   <p className="break-all font-medium">
                     {group.child?.title ?? "Other files"}

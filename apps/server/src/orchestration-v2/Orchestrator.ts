@@ -9,6 +9,8 @@ import {
   delegatedOrganization,
   organizationExecutionProblem,
   organizationRepository,
+  organizationPreparationUnblock,
+  organizationPreparesRuns,
 } from "./OrganizationPolicy.ts";
 import {
   latestExecutedRun,
@@ -8243,23 +8245,24 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
         payload: { ...state.run, status: "preparing", completedAt: null },
       });
       const organization = projection.thread.organization;
-      // The failed preparation blocked the task; retrying it is the explicit unblock,
+      // A failed preparation blocked the task; retrying it is the explicit unblock,
       // otherwise admission would hold the retried run until a coordinator intervened.
-      if (organization?.task?.state === "blocked")
+      const unblocked = organization?.task
+        ? organizationPreparationUnblock(organization.task)
+        : null;
+      if (organization && unblocked)
         yield* emitEvent({
           type: "thread.metadata-updated",
           threadId: command.threadId,
           occurredAt: now,
           payload: {
             ...projection.thread,
-            organization: {
-              ...organization,
-              task: { ...organization.task, state: "queued", notes: null },
-            },
+            organization: { ...organization, task: unblocked },
             updatedAt: now,
           },
         });
-      if (organization)
+      // Chief and Advisor runs retry the generic preparation instead (ThreadLaunchService).
+      if (organization && organizationPreparesRuns(organization.role))
         yield* Ref.update(effects, (existing) => [
           ...existing,
           {

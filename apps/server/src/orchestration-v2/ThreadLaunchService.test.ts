@@ -1369,6 +1369,70 @@ it.effect("retries a failed workspace preparation on the same run", () => {
   }).pipe(Effect.provide(harness.layer));
 });
 
+it.effect("a Chief enrolled after a failed launch preparation retries that preparation", () => {
+  let fetchFailures = 1;
+  const harness = makeHarness({
+    fetchRemote: () =>
+      fetchFailures-- > 0
+        ? Effect.fail(
+            new GitCommandError({
+              operation: "GitVcsDriver.fetchRemote",
+              command: "git",
+              cwd: project.workspaceRoot,
+              detail: "Git could not update a local reference.",
+              exitCode: 1,
+            }),
+          )
+        : Effect.void,
+  });
+  return Effect.gen(function* () {
+    const launches = yield* ThreadLaunch.ThreadLaunchService;
+    const outbox = yield* EffectOutbox.EffectOutboxV2;
+    const threads = yield* ThreadManagement.ThreadManagementService;
+    const launched = yield* launches.launch(
+      launchInput({
+        command: "command:launch:chief-retry",
+        thread: "thread:launch:chief-retry",
+        message: "Retry me as Chief",
+        workspace: { type: "worktree", baseRef: "main", startFromOrigin: true },
+      }),
+    );
+    yield* waitUntil(() =>
+      threads
+        .getThreadProjection(launched.threadId)
+        .pipe(Effect.map((projection) => projection.runs[0]?.status === "failed")),
+    );
+    yield* threads.dispatch({
+      type: "thread.metadata.update",
+      commandId: CommandId.make("command:launch:chief-retry:enroll"),
+      threadId: launched.threadId,
+      organization: { role: "chief", parentThreadId: null },
+    });
+    const failed = yield* threads.getThreadProjection(launched.threadId);
+    assert.equal(failed.thread.organization?.role, "chief");
+    const retry = CommandId.make("command:launch:chief-retry:1");
+    yield* launches.retryPreparation({
+      commandId: retry,
+      threadId: launched.threadId,
+      runId: failed.runs[0]!.id,
+    });
+    yield* waitUntil(() =>
+      outbox
+        .listByCommandId(CommandId.make("command:launch:chief-retry:1:release"))
+        .pipe(Effect.map((effects) => effects.length === 1)),
+    );
+    // The Chief's worktree comes from the generic preparation, not the organization's.
+    assert.deepEqual(
+      (yield* outbox.listByCommandId(retry)).map((effect) => effect.request.type),
+      [],
+    );
+    const retried = yield* threads.getThreadProjection(launched.threadId);
+    assert.equal(retried.runs[0]?.status, "starting");
+    assert.equal(retried.thread.worktreePath, "/repo-worktrees/feature");
+    assert.equal(harness.createWorktree.mock.calls.length, 1);
+  }).pipe(Effect.provide(harness.layer));
+});
+
 it.effect("a retry reuses a recorded worktree without undoing its branch rename", () => {
   let setupFailures = 1;
   const harness = makeHarness({

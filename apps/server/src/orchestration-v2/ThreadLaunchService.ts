@@ -40,6 +40,7 @@ import * as TextGeneration from "../textGeneration/TextGeneration.ts";
 import * as CommandReceiptStore from "./CommandReceiptStore.ts";
 import * as IdAllocator from "./IdAllocator.ts";
 import type * as Orchestrator from "./Orchestrator.ts";
+import { organizationPreparesRuns } from "./OrganizationPolicy.ts";
 import { makeProviderFailure } from "./ProviderFailure.ts";
 import { randomUuidV4 } from "./RandomUuid.ts";
 import * as ThreadManagement from "./ThreadManagementService.ts";
@@ -907,8 +908,9 @@ const make = Effect.gen(function* () {
       const run = projection.runs.find((candidate) => candidate.id === input.runId);
       const workspacePreparation = run?.workspacePreparation;
       if (run?.status !== "preparing" || workspacePreparation === undefined) return;
-      // The retry command enqueued the organization's own preparation effect.
-      if (projection.thread.organization) return;
+      // The retry command enqueued a delegated child's own organization preparation. A
+      // user-enrolled Chief or Advisor launched through here retries this generic one.
+      if (organizationPreparesRuns(projection.thread.organization?.role)) return;
       if (!(yield* reservePreparation(input.commandId))) return;
       yield* scheduleRetriedPreparation(input, projection, run, workspacePreparation).pipe(
         Effect.onError(() => releasePreparation(input.commandId)),

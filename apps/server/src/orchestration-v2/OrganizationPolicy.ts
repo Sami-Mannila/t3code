@@ -2,6 +2,7 @@ import * as Equal from "effect/Equal";
 import type {
   OrganizationRepositoryPath,
   OrganizationRole,
+  OrganizationTask,
   OrganizationThread,
   OrchestrationV2AppThread,
   ThreadId,
@@ -204,6 +205,50 @@ export function organizationRepositoryRoot(
  */
 export function organizationNeedsWorktree(role: OrganizationRole | undefined) {
   return role === "executor";
+}
+
+/**
+ * Delegated children are admitted by the organization's own preparation, which a Retry re-runs.
+ * Chief and Advisor are user conversations whose runs use the generic workspace preparation.
+ */
+export function organizationPreparesRuns(role: OrganizationRole | undefined) {
+  return role === "lead" || role === "executor" || role === "reviewer";
+}
+
+const PREPARATION_BLOCK_NOTES = "Workspace preparation failed: ";
+
+/**
+ * A preparation failure blocks only work that was about to run. A submission awaiting review or
+ * an accepted task keeps its state: the failed run is a follow-up, not a change to that work.
+ */
+export function organizationPreparationBlock(
+  task: OrganizationTask,
+  message: string,
+): OrganizationTask | null {
+  return ["queued", "working", "changes_requested"].includes(task.state)
+    ? {
+        ...task,
+        state: "blocked",
+        notes: `${PREPARATION_BLOCK_NOTES}${message.slice(0, 1_200)}\nFix the cause, then retry the run or delegate again.`,
+      }
+    : null;
+}
+
+/**
+ * Retrying the failed preparation lifts only the block that preparation recorded; any other
+ * block stays for the coordinator. A correction round (review feedback on the current
+ * revision) resumes as changes_requested, anything else as queued.
+ */
+export function organizationPreparationUnblock(task: OrganizationTask): OrganizationTask | null {
+  if (task.state !== "blocked" || !task.notes?.startsWith(PREPARATION_BLOCK_NOTES)) return null;
+  return {
+    ...task,
+    state:
+      task.lastReview !== undefined && task.lastReview.revision === task.revision
+        ? "changes_requested"
+        : "queued",
+    notes: null,
+  };
 }
 
 export function delegatedOrganization(

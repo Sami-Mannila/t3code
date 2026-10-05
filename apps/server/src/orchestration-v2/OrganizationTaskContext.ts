@@ -46,7 +46,8 @@ export function organizationTaskContext(thread: TaskThread, threads: ReadonlyArr
         ? [thread]
         : [];
   return {
-    repository: organizationRepository(thread),
+    // A conversation without a task, such as a reviewer, has no repository of its own.
+    repository: task ? organizationRepository(thread) : null,
     branch: thread.branch,
     currentOwner: owner
       ? {

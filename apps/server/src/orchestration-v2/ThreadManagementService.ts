@@ -478,8 +478,10 @@ const make = Effect.gen(function* () {
         const current = yield* orchestrator.getThreadProjection(command.threadId);
         const task = command.organization.task;
         // A lead outcome aggregates its executors' worktrees; leads have none of their own.
+        // The recorded role decides: verification runs before the policy rejects a reassignment.
+        const lead = current.thread.organization?.role === "lead";
         if (
-          (command.organization.role !== "lead" && !current.thread.worktreePath) ||
+          (!lead && !current.thread.worktreePath) ||
           Option.isNone(organizationFs) ||
           Option.isNone(organizationPath)
         )
@@ -507,7 +509,7 @@ const make = Effect.gen(function* () {
           revision: string;
           files: Array<{ path: string; sha256: string; bytes: number }>;
         };
-        if (command.organization.role === "lead") {
+        if (lead) {
           const shell = yield* orchestrator.getShellSnapshot();
           const children = shell.threads
             .filter(

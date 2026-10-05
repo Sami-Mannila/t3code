@@ -296,9 +296,11 @@ export function outcomeFileGroups(
     string,
     { child: EnvironmentThreadShell | undefined; files: Array<OutcomeFile> }
   >();
+  if (files.length === 0) return [];
+  const byId = new Map<string, EnvironmentThreadShell>(threads.map((t) => [t.id, t]));
   for (const file of files) {
     const slash = file.path.indexOf("/");
-    const child = threads.find((t) => t.id === file.path.slice(0, slash));
+    const child = slash > 0 ? byId.get(file.path.slice(0, slash)) : undefined;
     const key = child ? child.id : "";
     const group = groups.get(key) ?? { child, files: [] };
     group.files.push(child ? { ...file, path: file.path.slice(slash + 1) } : file);

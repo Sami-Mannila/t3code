@@ -33,7 +33,7 @@ export class OrganizationWorkspaceError extends Schema.TaggedError<OrganizationW
     reason: Schema.String,
     /** Truncated output of the failing Git command, when there is one. */
     detail: Schema.optional(Schema.String),
-    /** False when retrying would repeat the same failure, such as a Git exit code. */
+    /** False when retrying would repeat the same failure, such as a Git exit other than lock contention. */
     retryable: Schema.Boolean,
   },
 ) {
@@ -41,6 +41,13 @@ export class OrganizationWorkspaceError extends Schema.TaggedError<OrganizationW
     return `Unable to prepare the organization's isolated Git worktree: ${this.reason}${this.detail ? `\n${this.detail}` : ""}`;
   }
 }
+
+/**
+ * Another Git process holding a lock in the same repository, such as a concurrent executor
+ * preparation. The lock clears on its own, so that exit is worth retrying.
+ */
+export const isGitLockContention = (output: string) =>
+  /Unable to create '[^']*\.lock': File exists|could not lock|cannot lock ref/i.test(output);
 
 /** Deterministic preparation failures fail the run at once instead of burning retries. */
 const isWorkspaceError = Schema.is(OrganizationWorkspaceError);
@@ -155,12 +162,12 @@ export const prepare = Effect.fn("OrganizationWorkspace.prepare")(function* (inp
     const fs = yield* FileSystem.FileSystem;
     const path = yield* Path.Path;
     const process = yield* ProcessRunner.ProcessRunner;
-    const fail = (reason: string, detail?: string) =>
+    const fail = (reason: string, detail?: string, retryable = false) =>
       new OrganizationWorkspaceError({
         threadId: input.threadId,
         reason,
         ...(detail ? { detail } : {}),
-        retryable: false,
+        retryable,
       });
     const project = yield* projects.get(projection.thread.projectId);
     if (Option.isNone(project)) return yield* fail("the project no longer exists");
@@ -184,6 +191,7 @@ export const prepare = Effect.fn("OrganizationWorkspace.prepare")(function* (inp
                   fail(
                     `git ${args.join(" ")} exited with code ${result.code} in ${cwd}`,
                     excerpt(result.stderr || result.stdout),
+                    isGitLockContention(result.stderr),
                   ),
                 ),
           ),

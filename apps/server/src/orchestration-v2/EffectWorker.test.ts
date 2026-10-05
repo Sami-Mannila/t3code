@@ -5,6 +5,7 @@ import {
   CommandId,
   type OrchestrationV2ServerCommand,
   type OrchestrationV2ThreadProjection,
+  type OrganizationTask,
   ProjectId,
   ProviderSessionId,
   ProviderThreadId,
@@ -929,6 +930,7 @@ it.effect(
 const organizationPrepareCase = (input: {
   readonly workspaceRoot: Effect.Effect<string, never, FileSystem.FileSystem | Scope.Scope>;
   readonly project?: Effect.Effect<Option.Option<never>, ProjectStore.ProjectStoreV2Error>;
+  readonly state?: OrganizationTask["state"];
 }) =>
   Effect.gen(function* () {
     const workspaceRoot = yield* input.workspaceRoot;
@@ -954,7 +956,7 @@ const organizationPrepareCase = (input: {
             title: "Implementation",
             ownerThreadId: threadId,
             dependencyThreadIds: [],
-            state: "queued",
+            state: input.state ?? "queued",
             revision: null,
             reviewedRevision: null,
             reviewerThreadId: null,
@@ -1032,4 +1034,25 @@ it.effect("a transient organization preparation failure stays retryable", () =>
     assert.equal(result._tag, "Failure");
     assert.deepEqual(dispatched, []);
   }).pipe(Effect.scoped, Effect.provide(NodeServices.layer)),
+);
+
+it.effect(
+  "a preparation failure on a follow-up fails the run but leaves reviewed, accepted or blocked work alone",
+  () =>
+    Effect.gen(function* () {
+      for (const state of ["awaiting_review", "accepted", "blocked"] as const) {
+        const { result, dispatched } = yield* organizationPrepareCase({
+          workspaceRoot: Effect.flatMap(FileSystem.FileSystem, (fs) =>
+            fs.makeTempDirectoryScoped(),
+          ).pipe(Effect.orDie),
+          state,
+        });
+        assert.equal(result._tag, "Success", state);
+        assert.deepEqual(
+          dispatched.map((command) => command.type),
+          ["prepared-run.fail"],
+          state,
+        );
+      }
+    }).pipe(Effect.scoped, Effect.provide(NodeServices.layer)),
 );

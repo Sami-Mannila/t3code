@@ -1,4 +1,8 @@
-import type { organizationTaskContext } from "./OrganizationTaskContext.ts";
+import { organizationTaskContext } from "./OrganizationTaskContext.ts";
+import {
+  organizationPreparationBlock,
+  organizationPreparationUnblock,
+} from "./OrganizationPolicy.ts";
 import { McpSchema, McpServer } from "effect/unstable/ai";
 import * as McpHttpServer from "../mcp/McpHttpServer.ts";
 import * as McpInvocationContext from "../mcp/McpInvocationContext.ts";
@@ -1191,41 +1195,62 @@ it.effect("retrying a failed organization preparation runs the organization prep
     const lead = yield* threads.getThreadProjection(leadId);
     const runId = lead.runs[0]!.id;
     // What the effect worker records when preparation fails for good.
-    yield* threads.dispatch({
-      type: "prepared-run.fail",
-      commandId: CommandId.make("retry-failed"),
-      threadId: leadId,
-      runId,
-      failure: {
-        class: "unknown",
-        message: "simulated",
-        code: "organization_workspace_failed",
-        retryable: false,
-      },
-    });
-    yield* threads.dispatch({
-      type: "thread.metadata.update",
-      commandId: CommandId.make("retry-blocked"),
-      threadId: leadId,
-      organization: {
-        ...lead.thread.organization!,
-        task: { ...lead.thread.organization!.task!, state: "blocked", notes: "simulated" },
-      },
-    });
-    const retry = CommandId.make("retry-run");
-    yield* threads.dispatch({
-      type: "prepared-run.retry",
-      commandId: retry,
-      threadId: leadId,
-      runId,
-    });
-    assert.deepEqual(
-      (yield* outbox.listByCommandId(retry)).map((effect) => effect.request.type),
-      ["organization-workspace.prepare"],
-    );
-    const retried = yield* threads.getThreadProjection(leadId);
-    assert.equal(retried.runs[0]?.status, "preparing");
-    assert.equal(retried.thread.organization?.task?.state, "queued");
+    const failAndBlock = (key: string, notes: (task: OrganizationTask) => OrganizationTask) =>
+      Effect.gen(function* () {
+        yield* threads.dispatch({
+          type: "prepared-run.fail",
+          commandId: CommandId.make(`${key}-failed`),
+          threadId: leadId,
+          runId,
+          failure: {
+            class: "unknown",
+            message: "simulated",
+            code: "organization_workspace_failed",
+            retryable: false,
+          },
+        });
+        const org = (yield* threads.getThreadProjection(leadId)).thread.organization!;
+        yield* threads.dispatch({
+          type: "thread.metadata.update",
+          commandId: CommandId.make(`${key}-blocked`),
+          threadId: leadId,
+          organization: { ...org, task: notes(org.task!) },
+        });
+      });
+    const retryRun = (key: string) =>
+      Effect.gen(function* () {
+        const retry = CommandId.make(key);
+        yield* threads.dispatch({
+          type: "prepared-run.retry",
+          commandId: retry,
+          threadId: leadId,
+          runId,
+        });
+        assert.deepEqual(
+          (yield* outbox.listByCommandId(retry)).map((effect) => effect.request.type),
+          ["organization-workspace.prepare"],
+        );
+        const retried = yield* threads.getThreadProjection(leadId);
+        assert.equal(retried.runs[0]?.status, "preparing");
+        return { retry, task: retried.thread.organization!.task! };
+      });
+
+    // Retrying lifts the block the failed preparation recorded.
+    yield* failAndBlock("retry-1", (task) => organizationPreparationBlock(task, "simulated")!);
+    const first = yield* retryRun("retry-run-1");
+    assert.equal(first.task.state, "queued");
+    assert.equal(first.task.notes, null);
+
+    // A block the coordinator recorded is not the preparation's to lift.
+    yield* failAndBlock("retry-2", (task) => ({
+      ...task,
+      state: "blocked",
+      notes: "Waiting for the Chief's decision.",
+    }));
+    const second = yield* retryRun("retry-run-2");
+    assert.equal(second.task.state, "blocked");
+    assert.equal(second.task.notes, "Waiting for the Chief's decision.");
+    const retry = second.retry;
     yield* OrganizationWorkspace.prepare({ commandId: retry, threadId: leadId, runId });
     assert.equal((yield* threads.getThreadProjection(leadId)).runs[0]?.status, "starting");
   }).pipe(
@@ -1237,6 +1262,80 @@ it.effect("retrying a failed organization preparation runs the organization prep
     ),
   ),
 );
+
+it("a preparation failure blocks only work about to run, and its retry restores that work", () => {
+  const task = (patch: Partial<OrganizationTask>): OrganizationTask => ({
+    title: "Work",
+    ownerThreadId: ThreadId.make("executor"),
+    dependencyThreadIds: [],
+    state: "queued",
+    revision: null,
+    reviewedRevision: null,
+    reviewerThreadId: null,
+    notes: null,
+    ...patch,
+  });
+  for (const state of ["awaiting_review", "accepted", "blocked"] as const)
+    assert.isNull(organizationPreparationBlock(task({ state }), "boom"), state);
+  for (const state of ["queued", "working"] as const) {
+    const blocked = organizationPreparationBlock(task({ state }), "boom")!;
+    assert.equal(blocked.state, "blocked");
+    assert.include(blocked.notes, "boom");
+    assert.equal(organizationPreparationUnblock(blocked)?.state, "queued");
+  }
+  // A correction round keeps its review feedback and resumes as one.
+  const lastReview = {
+    reviewerThreadId: ThreadId.make("reviewer"),
+    revision: "r1",
+    verdict: "changes_requested" as const,
+  };
+  const correction = organizationPreparationBlock(
+    task({ state: "changes_requested", revision: "r1", lastReview }),
+    "boom",
+  )!;
+  const resumed = organizationPreparationUnblock(correction)!;
+  assert.equal(resumed.state, "changes_requested");
+  assert.deepEqual(resumed.lastReview, lastReview);
+  assert.equal(resumed.notes, null);
+  assert.isNull(organizationPreparationUnblock(task({ state: "blocked", notes: "Needs input." })));
+  assert.isNull(organizationPreparationUnblock(task({ state: "accepted" })));
+});
+
+it("t3_organization_task read reports a repository only for a conversation with a task", () => {
+  const thread = (id: string, organization: OrganizationThread) =>
+    ({
+      id: ThreadId.make(id),
+      projectId: ProjectId.make("context-project"),
+      title: id,
+      worktreePath: null,
+      branch: null,
+      organization,
+      deletedAt: null,
+      archivedAt: null,
+    }) as const;
+  const executor = thread("context-executor", {
+    role: "executor",
+    parentThreadId: ThreadId.make("context-lead"),
+    task: {
+      title: "Work",
+      repository: "b",
+      ownerThreadId: ThreadId.make("context-executor"),
+      dependencyThreadIds: [],
+      state: "queued",
+      revision: null,
+      reviewedRevision: null,
+      reviewerThreadId: null,
+      notes: null,
+    },
+  });
+  const reviewer = thread("context-reviewer", {
+    role: "reviewer",
+    parentThreadId: ThreadId.make("context-lead"),
+    reviewTaskThreadId: executor.id,
+  });
+  assert.equal(organizationTaskContext(executor, [executor, reviewer]).repository, "b");
+  assert.isNull(organizationTaskContext(reviewer, [executor, reviewer]).repository);
+});
 
 it("wire commands cannot provide server artifact verification or spoof an agent actor through the user endpoint", () => {
   const decoded = decodeCommand({

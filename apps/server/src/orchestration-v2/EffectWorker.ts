@@ -4,6 +4,7 @@ import * as Path from "effect/Path";
 import * as ChildProcessSpawner from "effect/unstable/process/ChildProcessSpawner";
 import * as ProcessRunner from "../processRunner.ts";
 import * as OrganizationWorkspace from "./OrganizationWorkspace.ts";
+import { organizationPreparationBlock } from "./OrganizationPolicy.ts";
 import * as ProjectStore from "./ProjectStore.ts";
 import * as ServerConfig from "../config.ts";
 import { CommandId } from "@t3tools/contracts";
@@ -196,11 +197,16 @@ export const executorLayer: Layer.Layer<
                 ),
               );
             });
-            // Fails the run and blocks the task so the parent and Chief hear the real cause.
+            // Fails the run and blocks work that was about to run, so the parent and Chief
+            // hear the real cause. Work awaiting review or accepted keeps its state.
             const failRun = (cause: unknown) =>
               Effect.gen(function* () {
                 const projection = yield* threads.getThreadProjection(effect.threadId);
                 const message = cause instanceof Error ? cause.message : String(cause);
+                const organization = projection.thread.organization;
+                const blocked = organization?.task
+                  ? organizationPreparationBlock(organization.task, message)
+                  : null;
                 yield* threads.dispatch({
                   type: "prepared-run.fail",
                   commandId: CommandId.make(`${effect.commandId}:organization-prepare-failed`),
@@ -213,19 +219,12 @@ export const executorLayer: Layer.Layer<
                     retryable: false,
                   },
                 });
-                if (projection.thread.organization?.task)
+                if (organization && blocked)
                   yield* threads.dispatch({
                     type: "thread.metadata.update",
                     commandId: CommandId.make(`${effect.commandId}:organization-blocked`),
                     threadId: effect.threadId,
-                    organization: {
-                      ...projection.thread.organization,
-                      task: {
-                        ...projection.thread.organization.task,
-                        state: "blocked",
-                        notes: `Workspace preparation failed: ${message.slice(0, 1_200)}\nFix the cause, then retry the run or delegate again.`,
-                      },
-                    },
+                    organization: { ...organization, task: blocked },
                   });
               });
             return prepare.pipe(

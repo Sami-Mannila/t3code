@@ -17,9 +17,18 @@ repositories, so worktrees are tied to tasks, not to the root.
 - Every organization child still goes through the `organization-workspace.prepare` effect, even
   when it gets no worktree. That effect ends in `prepared-run.release`, which is the admission and
   worker-capacity gate; skipping it for roles without a worktree would let them start unadmitted.
-- A Git exit during preparation is deterministic, so the effect worker fails the run and blocks the
-  task on the first attempt, with the command's stderr in the task notes that reach the parent and
-  the Chief. Spawn failures and timeouts are still retried. Retrying the failed run re-enqueues
-  the organization effect, not the generic worktree preparation, which would run in the root. It
-  also returns the blocked task to queued; admission would otherwise hold an executor's run until
-  a coordinator unblocked it.
+- A Git exit during preparation is usually deterministic, so the effect worker fails the run on the
+  first attempt, with the command's stderr in the task notes that reach the parent and the Chief.
+  Lock contention (`index.lock`, `could not lock`, `cannot lock ref`), typically from another
+  executor preparing in the same repository, clears on its own and is retried, as are spawn
+  failures and timeouts.
+- A failure blocks only work that was about to run (`queued`, `working`, `changes_requested`).
+  Follow-up messages to executors and reviewers go through preparation too, so a failure there
+  fails that run and leaves a task awaiting review or accepted as it was.
+- Retrying a delegated child's failed run (lead, executor or reviewer) re-enqueues the
+  organization effect, not the generic worktree preparation, which would run in the root. A
+  user-enrolled Chief or Advisor retries the generic preparation of its original launch. The
+  retry lifts only the block the preparation recorded, back to `changes_requested` for a
+  correction round with feedback on the current revision and to `queued` otherwise; admission
+  would otherwise hold an executor's run until a coordinator unblocked it. A block recorded by a
+  coordinator or worker stays.
