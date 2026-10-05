@@ -1,3 +1,4 @@
+import { OrganizationAdmissionDeferred } from "./OrganizationAdmission.ts";
 import { assert, it } from "@effect/vitest";
 import {
   CommandId,
@@ -799,4 +800,119 @@ it.effect("settles a delegated child once its restart continuation fails for goo
       assert.deepEqual(yield* Ref.get(recovered), [threadId]);
     }).pipe(Effect.provide(layer));
   }),
+);
+
+it.effect(
+  "organization admission deferral preserves the failure budget even after many waits",
+  () =>
+    Effect.gen(function* () {
+      const now = DateTime.formatIso(yield* DateTime.now);
+      const effect: EffectOutbox.OrchestrationEffectV2 = {
+        id: "organization-admission",
+        commandId: CommandId.make("organization-admission"),
+        threadId,
+        request: { type: "organization-workspace.prepare", runId },
+        status: "running",
+        attemptCount: 25,
+        availableAt: now,
+        leaseOwner: "admission-test",
+        leaseExpiresAt: now,
+        createdAt: now,
+        updatedAt: now,
+        completedAt: null,
+        lastError: null,
+      };
+      const retries = yield* Ref.make<ReadonlyArray<boolean>>([]);
+      const outbox = Layer.mock(EffectOutbox.EffectOutboxV2)({
+        claimNext: () => Effect.succeed(Option.some(effect)),
+        get: () => Effect.succeed(Option.some(effect)),
+        awaitCancellation: () => Effect.never,
+        clearCancellation: () => Effect.void,
+        retry: (input) =>
+          Ref.update(retries, (all) => [...all, input.preserveAttempt === true]).pipe(
+            Effect.as(true),
+          ),
+        fail: () => Effect.die("capacity waiting must not terminalize"),
+      });
+      const executor = Layer.succeed(
+        EffectWorker.OrchestrationEffectExecutorV2,
+        EffectWorker.OrchestrationEffectExecutorV2.of({
+          execute: () =>
+            Effect.fail(
+              new EffectWorker.OrchestrationEffectExecutionError({
+                effectId: effect.id,
+                effectType: effect.request.type,
+                cause: new OrganizationAdmissionDeferred({ reason: "Waiting for worker slot" }),
+              }),
+            ),
+        }),
+      );
+      yield* Effect.gen(function* () {
+        const worker = yield* EffectWorker.OrchestrationEffectWorkerV2;
+        for (let i = 0; i < 7; i++) yield* worker.runOnce;
+      }).pipe(
+        Effect.provide(
+          EffectWorker.layerWithOptions({ workerId: "admission-test", maxAttempts: 2 }).pipe(
+            Layer.provide(Layer.merge(outbox, executor)),
+          ),
+        ),
+      );
+      assert.deepEqual(yield* Ref.get(retries), Array(7).fill(true));
+    }),
+);
+
+it.effect(
+  "unavailable organization preparation terminalizes the run and records its blocker on the final attempt",
+  () =>
+    Effect.gen(function* () {
+      const events = yield* Ref.make<ReadonlyArray<string>>([]);
+      const now = yield* DateTime.now;
+      const base = restartEffect(now, {
+        type: "replace",
+        replacementProviderSessionId: replacementSessionId,
+      });
+      const effect: EffectOutbox.OrchestrationEffectV2 = {
+        ...base,
+        request: { type: "organization-workspace.prepare", runId },
+      };
+      const projection = {
+        thread: {
+          organization: {
+            role: "executor",
+            parentThreadId: ThreadId.make("lead"),
+            task: {
+              title: "Implementation",
+              ownerThreadId: threadId,
+              dependencyThreadIds: [],
+              state: "queued",
+              revision: null,
+              reviewedRevision: null,
+              reviewerThreadId: null,
+              notes: null,
+            },
+          },
+        },
+        runs: [],
+      } as unknown as import("@t3tools/contracts").OrchestrationV2ThreadProjection;
+      const layer = makeExecutorLayer({
+        events,
+        threads: {
+          getThreadProjection: () => Effect.succeed(projection),
+          dispatch: (command) =>
+            Ref.update(events, (all) => [
+              ...all,
+              command.type === "thread.metadata.update"
+                ? (command.organization?.task?.state ?? command.type)
+                : command.type,
+            ]).pipe(Effect.as({ sequence: 1, storedEvents: [] })),
+        },
+      });
+      const result = yield* EffectWorker.OrchestrationEffectExecutorV2.pipe(
+        Effect.flatMap((executor) => executor.execute(effect, { willRetry: false })),
+        Effect.provide(layer),
+        Effect.result,
+      );
+      assert.equal(result._tag, "Failure");
+      assert.deepEqual(yield* Ref.get(events), ["prepared-run.fail", "blocked"]);
+    }),
 );

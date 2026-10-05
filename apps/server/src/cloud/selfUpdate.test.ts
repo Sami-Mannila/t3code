@@ -1,3 +1,9 @@
+import { vi } from "vite-plus/test";
+// Retain upstream updater behavior coverage using an explicitly non-organization fixture.
+vi.mock("../organizationBuild.ts", () => ({
+  ORGANIZATION_BUILD: false,
+  ORGANIZATION_UPDATE_MESSAGE: "fork updates disabled",
+}));
 import * as NodeServices from "@effect/platform-node/NodeServices";
 import { expect, it } from "@effect/vitest";
 import { ServerSelfUpdateError, ThreadId } from "@t3tools/contracts";

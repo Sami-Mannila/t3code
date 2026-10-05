@@ -1,5 +1,6 @@
 import { remapComposerContextAttachments } from "@t3tools/shared/composerContextReferences";
 import {
+  type OrganizationThread,
   type ThreadLinkedPullRequest,
   CommandId,
   CheckpointId,
@@ -66,6 +67,7 @@ export interface DeleteProjectInput extends CommandMetadata {
 }
 
 export interface CreateThreadInput extends CommandMetadata {
+  readonly organization?: OrganizationThread;
   readonly threadId: ThreadId;
   readonly projectId: ProjectId;
   readonly title: string;
@@ -121,6 +123,7 @@ export interface VisitThreadInput extends ThreadCommandInput {
 export type MarkThreadUnreadInput = ThreadCommandInput;
 
 export interface UpdateThreadMetadataInput extends ThreadCommandInput {
+  readonly organization?: OrganizationThread | null;
   readonly limitRecovery?: import("@t3tools/contracts").OrchestrationV2LimitRecoveryUpdate | null;
   readonly title?: string;
   readonly modelSelection?: ModelSelection;
@@ -400,6 +403,7 @@ export const createThread = Effect.fn("EnvironmentCommands.createThread")(functi
     threadId: input.threadId,
     projectId: input.projectId,
     title: input.title,
+    ...(input.organization ? { organization: input.organization } : {}),
     modelSelection: input.modelSelection,
     runtimeMode: input.runtimeMode,
     interactionMode: input.interactionMode,
@@ -561,6 +565,7 @@ export const updateThreadMetadata = Effect.fn("EnvironmentCommands.updateThreadM
     const commandId = yield* allocateCommandId(input);
     let result = null;
     if (
+      input.organization !== undefined ||
       input.title !== undefined ||
       input.branch !== undefined ||
       input.worktreePath !== undefined ||
@@ -570,6 +575,7 @@ export const updateThreadMetadata = Effect.fn("EnvironmentCommands.updateThreadM
     ) {
       result = yield* dispatch({
         type: "thread.metadata.update",
+        ...(input.organization === undefined ? {} : { organization: input.organization }),
         ...(input.limitRecovery === undefined ? {} : { limitRecovery: input.limitRecovery }),
         commandId,
         threadId: input.threadId,

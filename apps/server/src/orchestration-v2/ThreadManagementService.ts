@@ -1,3 +1,7 @@
+import * as NodeCrypto from "node:crypto";
+import * as OrganizationArtifacts from "./OrganizationArtifacts.ts";
+import * as FileSystem from "effect/FileSystem";
+import * as Path from "effect/Path";
 import type {
   ProjectionRecordField,
   ProjectionRecordFilter,
@@ -49,6 +53,11 @@ export function withCreationProvenance(
   provenance: ThreadManagementProvenance,
 ): OrchestrationV2Command {
   switch (command.type) {
+    case "thread.metadata.update": {
+      if (provenance.createdBy !== "user") return command;
+      const { organizationActorThreadId: _actor, ...userCommand } = command;
+      return userCommand;
+    }
     case "thread.create":
     case "message.dispatch":
     case "thread.fork":
@@ -387,6 +396,8 @@ function latestSteerableRun(
 }
 
 const make = Effect.gen(function* () {
+  const organizationFs = yield* Effect.serviceOption(FileSystem.FileSystem);
+  const organizationPath = yield* Effect.serviceOption(Path.Path);
   const orchestrator = yield* Orchestrator.OrchestratorV2;
   const legacyImporter = yield* LegacyV1ThreadImporter.LegacyV1ThreadImporter;
 
@@ -456,7 +467,126 @@ const make = Effect.gen(function* () {
     );
 
   const dispatch: ThreadManagementServiceShape["dispatch"] = (command) =>
-    ensureCommandTranscripts(command).pipe(Effect.andThen(orchestrator.dispatch(command)));
+    Effect.gen(function* () {
+      yield* ensureCommandTranscripts(command);
+      if (
+        command.type === "thread.metadata.update" &&
+        command.organization?.task &&
+        (["awaiting_review", "accepted"].includes(command.organization.task.state) ||
+          command.organization.task.reviewedRevision !== null)
+      ) {
+        const current = yield* orchestrator.getThreadProjection(command.threadId);
+        const task = command.organization.task;
+        if (
+          !current.thread.worktreePath ||
+          Option.isNone(organizationFs) ||
+          Option.isNone(organizationPath)
+        )
+          return yield* new Orchestrator.OrchestratorDispatchError({
+            commandId: command.commandId,
+            commandType: command.type,
+            cause:
+              "Artifact verification requires this task's isolated worktree and filesystem services.",
+          });
+        const readArtifacts = (workspace: string, manifest: ReadonlyArray<string>) =>
+          OrganizationArtifacts.snapshot(workspace, manifest).pipe(
+            Effect.provideService(FileSystem.FileSystem, organizationFs.value),
+            Effect.provideService(Path.Path, organizationPath.value),
+            Effect.mapError(
+              (cause) =>
+                new Orchestrator.OrchestratorDispatchError({
+                  commandId: command.commandId,
+                  commandType: command.type,
+                  cause,
+                }),
+            ),
+          );
+        const dependencyThreadIds = [...task.dependencyThreadIds];
+        let evidence: {
+          revision: string;
+          files: Array<{ path: string; sha256: string; bytes: number }>;
+        };
+        if (command.organization.role === "lead") {
+          const shell = yield* orchestrator.getShellSnapshot();
+          const children = shell.threads
+            .filter(
+              (item) =>
+                item.organization?.parentThreadId === current.thread.id &&
+                item.organization.role === "executor" &&
+                item.organization.task,
+            )
+            .toSorted((a, b) => a.id.localeCompare(b.id));
+          if (
+            !children.length ||
+            children.some(
+              (child) => child.organization?.task?.state !== "accepted" || !child.worktreePath,
+            )
+          )
+            return yield* new Orchestrator.OrchestratorDispatchError({
+              commandId: command.commandId,
+              commandType: command.type,
+              cause:
+                "Outcome consolidation requires independently accepted implementation artifacts.",
+            });
+          const digest = NodeCrypto.createHash("sha256");
+          const files: Array<{ path: string; sha256: string; bytes: number }> = [];
+          dependencyThreadIds.splice(
+            0,
+            dependencyThreadIds.length,
+            ...children.map((child) => child.id),
+          );
+          for (const child of children) {
+            const checked = yield* readArtifacts(
+              child.worktreePath!,
+              child.organization!.task!.manifest ?? [],
+            );
+            if (
+              checked.revision !== child.organization!.task!.revision ||
+              checked.revision !== child.organization!.task!.reviewedRevision
+            )
+              return yield* new Orchestrator.OrchestratorDispatchError({
+                commandId: command.commandId,
+                commandType: command.type,
+                cause: "A reviewed child artifact changed; return it to its executor and reviewer.",
+              });
+            digest.update(child.id).update("\0").update(checked.revision).update("\0");
+            files.push(
+              ...checked.files.map((file) => ({ ...file, path: `${child.id}/${file.path}` })),
+            );
+          }
+          evidence = { revision: digest.digest("hex"), files };
+        } else evidence = yield* readArtifacts(current.thread.worktreePath, task.manifest ?? []);
+        const previous = current.thread.organization?.task;
+        const submission =
+          task.state === "awaiting_review" &&
+          task.reviewedRevision === null &&
+          command.organizationActorThreadId === command.threadId;
+        if (!submission && evidence.revision !== previous?.revision)
+          return yield* new Orchestrator.OrchestratorDispatchError({
+            commandId: command.commandId,
+            commandType: command.type,
+            cause:
+              "Artifacts changed after submission; the executor must submit a new revision for independent review.",
+          });
+        return yield* orchestrator.dispatch({
+          ...command,
+          organization: {
+            ...command.organization,
+            task: {
+              ...task,
+              dependencyThreadIds,
+              revision: evidence.revision,
+              files: evidence.files,
+            },
+          },
+          organizationVerification: {
+            revision: evidence.revision,
+            previousRevision: previous?.revision ?? null,
+          },
+        });
+      }
+      return yield* orchestrator.dispatch(command);
+    });
 
   const getProjectThread: ThreadManagementServiceShape["getProjectThread"] = (input) =>
     getThreadProjection(input.threadId).pipe(

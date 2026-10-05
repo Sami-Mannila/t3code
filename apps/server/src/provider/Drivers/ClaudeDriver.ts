@@ -1,3 +1,4 @@
+import { quotaReadsEnabled } from "../organizationRuntimePolicy.ts";
 /**
  * ClaudeDriver — `ProviderDriver` for the Claude Agent SDK runtime.
  *
@@ -174,7 +175,11 @@ export const ClaudeDriver: ProviderDriver<ClaudeSettings, ClaudeDriverEnv> = {
           enabled,
           config,
         },
-        { scopedLimitNames, onUsageLimits: (update) => snapshot.applyUsageLimits(update) },
+        {
+          scopedLimitNames,
+          onUsageLimits: (update) =>
+            quotaReadsEnabled() ? snapshot.applyUsageLimits(update) : Effect.undefined,
+        },
       ).pipe(
         Effect.mapError(
           (cause) =>
@@ -198,7 +203,7 @@ export const ClaudeDriver: ProviderDriver<ClaudeSettings, ClaudeDriverEnv> = {
         capacity: 1,
         timeToLive: CAPABILITIES_PROBE_TTL,
         lookup: () =>
-          probeClaudeCapabilities(effectiveConfig, processEnv, cwd).pipe(
+          probeClaudeCapabilities(effectiveConfig, processEnv, cwd, quotaReadsEnabled()).pipe(
             Effect.provideService(Path.Path, path),
           ),
       });
@@ -222,7 +227,10 @@ export const ClaudeDriver: ProviderDriver<ClaudeSettings, ClaudeDriverEnv> = {
                 resolveClaudeModelCatalog(manifest),
                 scopedLimitNames,
                 (version) =>
-                  ClaudeResetCredits.readClaudeResetCredits(configDir, version).pipe(
+                  (quotaReadsEnabled()
+                    ? ClaudeResetCredits.readClaudeResetCredits(configDir, version)
+                    : Effect.undefined
+                  ).pipe(
                     Effect.provideService(HttpClient.HttpClient, httpClient),
                     Effect.provideService(FileSystem.FileSystem, fileSystem),
                     Effect.provideService(Path.Path, path),

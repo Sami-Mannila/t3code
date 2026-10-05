@@ -1,3 +1,4 @@
+import { quotaReadsEnabled } from "../organizationRuntimePolicy.ts";
 import * as DateTime from "effect/DateTime";
 import * as Duration from "effect/Duration";
 import * as Effect from "effect/Effect";
@@ -615,7 +616,7 @@ export const checkCodexProviderStatus = Effect.fn("checkCodexProviderStatus")(fu
     cwd: process.cwd(),
     customModels: codexSettings.customModels,
     environment: resolvedEnvironment,
-    ...(managedAuth ? { skipNativeUsage: true } : {}),
+    ...(managedAuth || !quotaReadsEnabled() ? { skipNativeUsage: true } : {}),
   }).pipe(
     Effect.scoped,
     Effect.timeoutOption(Duration.millis(AUTH_PROBE_TIMEOUT_MS)),
@@ -703,7 +704,7 @@ export const checkCodexProviderStatus = Effect.fn("checkCodexProviderStatus")(fu
       status: accountStatus.status,
       auth: accountStatus.auth,
       ...(accountStatus.message ? { message: accountStatus.message } : {}),
-      ...(managedAuth ? {} : { usageLimits }),
+      ...(managedAuth || !quotaReadsEnabled() ? {} : { usageLimits }),
     },
   });
 });

@@ -1,3 +1,4 @@
+import { quotaReadsEnabled } from "../organizationRuntimePolicy.ts";
 /**
  * CursorDriver — `ProviderDriver` for the Cursor Agent SDK runtime.
  *
@@ -210,6 +211,7 @@ export const CursorDriver: ProviderDriver<CursorSettings, CursorDriverEnv> = {
             auth.usesApiKey ? "api-key" : "browser",
           ).pipe(
             Effect.flatMap((snapshot) =>
+              quotaReadsEnabled() &&
               effectiveConfig.enabled &&
               snapshot.installed &&
               snapshot.auth.status === "authenticated"

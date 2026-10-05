@@ -167,6 +167,8 @@ export type OrchestratorMcpTerminalDelegatedTaskStatus =
   typeof OrchestratorMcpTerminalDelegatedTaskStatus.Type;
 
 export const OrchestratorMcpDelegateTaskInput = Schema.Struct({
+  reviewTaskThreadId: Schema.optional(ThreadId),
+  dependencyThreadIds: Schema.optional(Schema.Array(ThreadId)),
   task: OrchestratorMcpPrompt.annotate({
     description: "Self-contained task for one delegated child agent/subagent.",
   }),

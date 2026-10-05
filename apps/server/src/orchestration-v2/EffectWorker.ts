@@ -1,3 +1,11 @@
+import { isOrganizationAdmissionDeferred } from "./OrganizationAdmission.ts";
+import * as FileSystem from "effect/FileSystem";
+import * as Path from "effect/Path";
+import * as ChildProcessSpawner from "effect/unstable/process/ChildProcessSpawner";
+import * as ProcessRunner from "../processRunner.ts";
+import * as OrganizationWorkspace from "./OrganizationWorkspace.ts";
+import * as ProjectStore from "./ProjectStore.ts";
+import * as ServerConfig from "../config.ts";
 import { CommandId } from "@t3tools/contracts";
 import * as Cause from "effect/Cause";
 import * as Context from "effect/Context";
@@ -99,6 +107,13 @@ export const executorLayer: Layer.Layer<
     const providerSessions = yield* ProviderSessionManager.ProviderSessionManagerV2;
     const providerTurnControl = yield* ProviderTurnControlService.ProviderTurnControlServiceV2;
     const providerTurnStart = yield* ProviderTurnStartService.ProviderTurnStartServiceV2;
+    const organizationProjects = yield* Effect.serviceOption(ProjectStore.ProjectStoreV2);
+    const organizationConfig = yield* Effect.serviceOption(ServerConfig.ServerConfig);
+    const organizationFs = yield* Effect.serviceOption(FileSystem.FileSystem);
+    const organizationPath = yield* Effect.serviceOption(Path.Path);
+    const organizationSpawner = yield* Effect.serviceOption(
+      ChildProcessSpawner.ChildProcessSpawner,
+    );
     const runtimeRequests = yield* RuntimeRequestService.RuntimeRequestServiceV2;
     const threadTitleRegeneration =
       yield* ThreadTitleRegenerationService.ThreadTitleRegenerationService;
@@ -149,6 +164,88 @@ export const executorLayer: Layer.Layer<
                     }),
                 ),
               );
+          case "organization-workspace.prepare": {
+            const request = effect.request;
+            const prepare = Effect.gen(function* () {
+              if (
+                Option.isNone(organizationProjects) ||
+                Option.isNone(organizationConfig) ||
+                Option.isNone(organizationFs) ||
+                Option.isNone(organizationPath) ||
+                Option.isNone(organizationSpawner)
+              )
+                return yield* new OrchestrationEffectExecutionError({
+                  effectId: effect.id,
+                  effectType: effect.request.type,
+                  cause: "Organization worktree preparation is unavailable.",
+                });
+              return yield* OrganizationWorkspace.prepare({
+                commandId: effect.commandId,
+                threadId: effect.threadId,
+                runId: request.runId,
+              }).pipe(
+                Effect.provideService(ThreadManagementService.ThreadManagementService, threads),
+                Effect.provideService(ProjectStore.ProjectStoreV2, organizationProjects.value),
+                Effect.provideService(ServerConfig.ServerConfig, organizationConfig.value),
+                Effect.provideService(FileSystem.FileSystem, organizationFs.value),
+                Effect.provideService(Path.Path, organizationPath.value),
+                Effect.provide(ProcessRunner.layer),
+                Effect.provideService(
+                  ChildProcessSpawner.ChildProcessSpawner,
+                  organizationSpawner.value,
+                ),
+              );
+            });
+            return prepare.pipe(
+              Effect.tapError((cause) =>
+                willRetry || isOrganizationAdmissionDeferred(cause)
+                  ? Effect.void
+                  : Effect.gen(function* () {
+                      const projection = yield* threads.getThreadProjection(effect.threadId);
+                      yield* threads.dispatch({
+                        type: "prepared-run.fail",
+                        commandId: CommandId.make(
+                          `${effect.commandId}:organization-prepare-failed`,
+                        ),
+                        threadId: effect.threadId,
+                        runId:
+                          effect.request.type === "organization-workspace.prepare"
+                            ? effect.request.runId
+                            : projection.runs[0]!.id,
+                        failure: {
+                          class: "unknown",
+                          message: String(cause).slice(0, 4096),
+                          code: "organization_workspace_failed",
+                          retryable: false,
+                        },
+                      });
+                      if (projection.thread.organization?.task)
+                        yield* threads.dispatch({
+                          type: "thread.metadata.update",
+                          commandId: CommandId.make(`${effect.commandId}:organization-blocked`),
+                          threadId: effect.threadId,
+                          organization: {
+                            ...projection.thread.organization,
+                            task: {
+                              ...projection.thread.organization.task,
+                              state: "blocked",
+                              notes:
+                                "Isolated worktree preparation failed; inspect the preparation error and retry explicitly.",
+                            },
+                          },
+                        });
+                    }),
+              ),
+              Effect.mapError(
+                (cause) =>
+                  new OrchestrationEffectExecutionError({
+                    effectId: effect.id,
+                    effectType: effect.request.type,
+                    cause,
+                  }),
+              ),
+            );
+          }
           case "provider-turn.start":
             return providerTurnStart
               .start({ threadId: effect.threadId, runId: effect.request.runId, willRetry })
@@ -677,6 +774,7 @@ export const layerWithOptions = (
             }).pipe(Effect.onError((cause) => recoverPostSuccessSettlement(effect, cause)));
           }
 
+          const deferred = isOrganizationAdmissionDeferred(Cause.squash(exit.cause));
           const error = Cause.pretty(exit.cause);
           const nonRetryable = isNonRetryableProviderTurnControlFailure(effect.request.type, error);
           yield* Effect.logWarning("Orchestration effect execution failed", {
@@ -692,7 +790,7 @@ export const layerWithOptions = (
             ? yield* outbox
                 .succeed({ effectId: effect.id, workerId })
                 .pipe(Effect.onError((cause) => terminalizeClaim(effect, cause)))
-            : effect.attemptCount >= maxAttempts
+            : effect.attemptCount >= maxAttempts && !deferred
               ? yield* outbox
                   .fail({ effectId: effect.id, workerId, error })
                   .pipe(Effect.onError((cause) => terminalizeClaim(effect, cause)))
@@ -701,7 +799,10 @@ export const layerWithOptions = (
                     effectId: effect.id,
                     workerId,
                     error,
-                    delayMs: Math.min(30_000, 100 * 2 ** Math.max(0, effect.attemptCount - 1)),
+                    preserveAttempt: deferred,
+                    delayMs: deferred
+                      ? 2_000
+                      : Math.min(30_000, 100 * 2 ** Math.max(0, effect.attemptCount - 1)),
                   })
                   .pipe(Effect.onError((cause) => requeueClaim(effect, cause)));
           if (!updated) {

@@ -1,4 +1,15 @@
 import {
+  OrganizationAdmissionDeferred,
+  isOrganizationAdmissionDeferred,
+} from "./OrganizationAdmission.ts";
+import { organizationWorkerCapacity } from "./OrganizationCapacity.ts";
+import * as Equal from "effect/Equal";
+import {
+  organizationProblem,
+  delegatedOrganization,
+  organizationExecutionProblem,
+} from "./OrganizationPolicy.ts";
+import {
   latestExecutedRun,
   latestRootProviderFailure,
   runRanAfter,
@@ -1238,6 +1249,18 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
       if (queuedRun === undefined) {
         return;
       }
+      if (projection.thread.organization) {
+        const shell = yield* projectionStore.getShellSnapshot();
+        if (organizationExecutionProblem(projection.thread, shell.threads)) return;
+        const workers = shell.threads.filter((item) =>
+          ["executor", "reviewer"].includes(item.organization?.role ?? ""),
+        );
+        const runs = (yield* Effect.forEach(workers, (item) =>
+          projectionStore.getThreadRecords(item.id, ["runs"]),
+        )).flatMap((item) => item.runs);
+        if (!organizationWorkerCapacity(workers, runs, threadId).canStart) return;
+      }
+
       // A provider that just failed will likely fail the next message too.
       // Hold the queue so the user decides when to resume it. Validation
       // failures (setup, unsupported handoff) belong to that message alone,
@@ -1819,7 +1842,10 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
     for (const threadId of threadIds) {
       const resumedThread = yield* Effect.gen(function* () {
         if (!(yield* projectionStore.canStartQueuedRun(threadId))) return false;
-        yield* threadDispatch.withLock(threadId, startNextQueuedRun(threadId));
+        yield* threadDispatch.withLock(
+          ThreadId.make("__organization_command_serialization__"),
+          threadDispatch.withLock(threadId, startNextQueuedRun(threadId)),
+        );
         return true;
       }).pipe(
         Effect.catch((cause) =>
@@ -2143,6 +2169,7 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
       id: command.threadId,
       projectId: command.projectId,
       title: command.title,
+      ...(command.organization === undefined ? {} : { organization: command.organization }),
       providerInstanceId: command.modelSelection.instanceId,
       modelSelection: command.modelSelection,
       runtimeMode: command.runtimeMode,
@@ -2167,6 +2194,26 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
       deletedAt: null,
     };
 
+    if (command.organization) {
+      const snapshot = yield* projectionStore.getShellSnapshot().pipe(mapDispatchError(command));
+      const problem = organizationProblem({
+        thread: { ...thread, organization: undefined },
+        next: command.organization,
+        threads: snapshot.threads,
+      });
+      if (
+        problem ||
+        command.organization.task?.state === "accepted" ||
+        command.createdBy !== "user"
+      )
+        return yield* new OrchestratorDispatchError({
+          commandId: command.commandId,
+          commandType: command.type,
+          cause:
+            problem ??
+            "Only the user can enroll an organization role; no accepted work can be imported.",
+        });
+    }
     yield* emitEvent({
       type: "thread.created",
       threadId: command.threadId,
@@ -2351,6 +2398,65 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
           }),
       ),
     );
+    if (command.type === "thread.metadata.update" && command.organization !== undefined) {
+      const snapshot = yield* projectionStore.getShellSnapshot().pipe(mapDispatchError(command));
+      const problem = organizationProblem({
+        thread,
+        next: command.organization,
+        threads: snapshot.threads,
+        ...(command.organizationActorThreadId
+          ? { actorThreadId: command.organizationActorThreadId }
+          : {}),
+        checkpointRefs:
+          command.organizationVerification &&
+          command.organizationVerification.previousRevision ===
+            (thread.organization?.task?.revision ?? null)
+            ? [command.organizationVerification.revision]
+            : [],
+      });
+      if (problem)
+        return yield* new OrchestratorDispatchError({
+          commandId: command.commandId,
+          commandType: command.type,
+          cause: problem,
+        });
+      if (
+        command.organization?.task?.reviewedRevision &&
+        command.organization.task.reviewedRevision !== thread.organization?.task?.reviewedRevision
+      ) {
+        const reviewerId = command.organizationActorThreadId;
+        if (!reviewerId)
+          return yield* new OrchestratorDispatchError({
+            commandId: command.commandId,
+            commandType: command.type,
+            cause: "Reviewer identity is missing.",
+          });
+        const submitter = yield* projectionStore
+          .getThreadRecords(thread.id, ["providerThreads"])
+          .pipe(mapDispatchError(command));
+        const reviewer = yield* projectionStore
+          .getThreadRecords(reviewerId, ["providerThreads"])
+          .pipe(mapDispatchError(command));
+        const identities = (items: typeof submitter.providerThreads) =>
+          items.flatMap((item) =>
+            item.nativeThreadRef?.nativeId
+              ? [`${item.nativeThreadRef.driver}:${item.nativeThreadRef.nativeId}`]
+              : [],
+          );
+        const original = identities(submitter.providerThreads);
+        const independent = identities(reviewer.providerThreads);
+        if (
+          !original.length ||
+          !independent.length ||
+          independent.some((id) => original.includes(id))
+        )
+          return yield* new OrchestratorDispatchError({
+            commandId: command.commandId,
+            commandType: command.type,
+            cause: "Independent review requires distinct recorded native provider conversations.",
+          });
+      }
+    }
     if (thread.deletedAt !== null) {
       return yield* new OrchestratorDispatchError({
         commandId: command.commandId,
@@ -2826,6 +2932,7 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
                     Date.parse(thread.limitRecovery.resetAt)
                 ? { snoozedUntil: null, snoozedAt: null }
                 : {}),
+            ...(command.organization === undefined ? {} : { organization: command.organization }),
             ...(command.branch === undefined ? {} : { branch: command.branch }),
             ...(command.worktreePath === undefined ? {} : { worktreePath: command.worktreePath }),
             ...(command.linkedPullRequest === undefined
@@ -3127,6 +3234,48 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
       occurredAt: now,
       payload: updatedThread,
     });
+
+    if (
+      command.type === "thread.metadata.update" &&
+      command.organization?.task &&
+      !Equal.equals(thread.organization?.task, command.organization.task)
+    ) {
+      const snapshot = yield* projectionStore.getShellSnapshot().pipe(mapDispatchError(command));
+      const chief = snapshot.threads.find(
+        (item) =>
+          item.projectId === thread.projectId &&
+          item.organization?.role === "chief" &&
+          item.archivedAt === null &&
+          item.deletedAt === null,
+      );
+      if (chief && chief.id !== thread.id) {
+        const task = command.organization.task;
+        const project = yield* projects.get(thread.projectId).pipe(mapDispatchError(command));
+        const projectTitle = Option.isSome(project) ? project.value.title : thread.projectId;
+        const summary = `${thread.title}: ${task.state.replaceAll("_", " ")}`;
+        yield* dispatchMessage(
+          {
+            type: "message.dispatch",
+            commandId: command.commandId,
+            threadId: chief.id,
+            messageId: MessageId.make(`organization:${command.commandId}`),
+            senderThreadId: thread.id,
+            text: `Organization update for project ${projectTitle}. ${summary}. ${task.notes ?? ""} This is coordinator evidence, not user approval. Explain the outcome and any decision options briefly in this Chief conversation.`,
+            notification: {
+              source: { kind: "background_task" },
+              outcome: task.state === "blocked" ? "failed" : "updated",
+              summary,
+            },
+            attachments: [],
+            dispatchMode: { type: "queue_after_active" },
+            createdBy: "agent",
+            creationSource: "server",
+          },
+          events,
+          effects,
+        );
+      }
+    }
 
     if (command.type === "thread.metadata.update" && command.regenerateTitle === true) {
       yield* Ref.update(effects, (existing) => [
@@ -4314,6 +4463,32 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
   ) =>
     Effect.gen(function* () {
       let projection = yield* getProjectionWithPendingEvents(command.threadId, events);
+      if (
+        projection.thread.organization &&
+        command.dispatchMode.type !== "queue_after_active" &&
+        command.dispatchMode.type !== "defer_start"
+      ) {
+        const shell = yield* projectionStore.getShellSnapshot().pipe(mapDispatchError(command));
+        const targetId = projection.thread.organization.reviewTaskThreadId;
+        const reviewTarget = targetId
+          ? (yield* getProjectionWithPendingEvents(targetId, events)).thread
+          : undefined;
+        const problem = organizationExecutionProblem(
+          projection.thread,
+          [
+            ...shell.threads.filter((t) => t.id !== projection.thread.id && t.id !== targetId),
+            projection.thread,
+            ...(reviewTarget ? [reviewTarget] : []),
+          ],
+          true,
+        );
+        if (problem)
+          return yield* new OrchestratorDispatchError({
+            commandId: command.commandId,
+            commandType: command.type,
+            cause: problem,
+          });
+      }
       if (command.manualContinuationOfRunId !== undefined) {
         const source = projection.runs.find((run) => run.id === command.manualContinuationOfRunId);
         const limited = latestRootProviderFailure(source ?? null, projection.turnItems);
@@ -4658,6 +4833,14 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
               payload: { ...sourcePlan, status: "completed" },
             });
 
+      if (
+        ["executor", "reviewer"].includes(projection.thread.organization?.role ?? "") &&
+        !["steer_active", "restart_active"].includes(dispatchMode.type)
+      )
+        dispatchMode = {
+          type: "defer_start",
+          workspaceStrategy: { type: "worktree", baseRef: projection.thread.branch ?? "HEAD" },
+        };
       if (dispatchMode.type === "steer_active" || dispatchMode.type === "restart_active") {
         yield* dispatchSteerIntoRun({
           command,
@@ -4693,6 +4876,25 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
       );
       const activeRun = projection.runs.find(isBlockingRun);
       const pendingMergeBackTransfers = pendingMergeBackTransfersForThread(projection);
+      if (
+        ["executor", "reviewer"].includes(projection.thread.organization?.role ?? "") &&
+        (modelSelection.instanceId !==
+          (activeProviderThread?.providerInstanceId ??
+            activeRun?.providerInstanceId ??
+            projection.thread.providerInstanceId) ||
+          projection.contextTransfers.some(
+            (transfer) =>
+              transfer.targetThreadId === projection.thread.id &&
+              transfer.status === "pending" &&
+              ["fork", "merge_back"].includes(transfer.type),
+          ))
+      )
+        return yield* new OrchestratorDispatchError({
+          commandId: command.commandId,
+          commandType: command.type,
+          cause:
+            "Organization workers retain their native provider identity; delegate a new worker for another provider or imported context.",
+        });
       const shouldQueue =
         activeRun !== undefined &&
         (dispatchMode.type === "defer_start" ||
@@ -5044,6 +5246,18 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
           .pipe(mapDispatchError(command))).transition.type === "restart_and_resume";
 
       if (
+        ["executor", "reviewer"].includes(projection.thread.organization?.role ?? "") &&
+        (pendingForkTransfer !== undefined ||
+          pendingMergeBackTransfer !== undefined ||
+          isProviderSwitch)
+      )
+        return yield* new OrchestratorDispatchError({
+          commandId: command.commandId,
+          commandType: command.type,
+          cause:
+            "Organization workers keep their pinned provider and worktree; delegate a new worker for a different provider or context transfer.",
+        });
+      if (
         pendingForkTransfer === undefined &&
         pendingMergeBackTransfer === undefined &&
         !isProviderSwitch
@@ -5373,6 +5587,16 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
         } satisfies PendingOrchestrationEffectV2;
         if (dispatchMode.type !== "defer_start") {
           yield* Ref.update(effects, (existing) => [...existing, pendingEffect]);
+        } else if (projection.thread.organization) {
+          yield* Ref.update(effects, (existing) => [
+            ...existing,
+            {
+              id: `effect:${command.commandId}:organization-workspace:${runId}`,
+              commandId: command.commandId,
+              threadId: command.threadId,
+              request: { type: "organization-workspace.prepare", runId },
+            } satisfies PendingOrchestrationEffectV2,
+          ]);
         }
         return;
       }
@@ -6340,6 +6564,15 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
               }),
           ),
         );
+      if (
+        parentProjection.thread.organization &&
+        !["chief", "lead"].includes(parentProjection.thread.organization.role)
+      )
+        return yield* new OrchestratorDispatchError({
+          commandId: command.commandId,
+          commandType: command.type,
+          cause: "Only Chief and outcome leads may delegate organization work.",
+        });
       const parentRun = parentProjection.runs.find(
         (candidate) => candidate.id === command.parentRunId,
       );
@@ -6365,6 +6598,28 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
         });
       }
 
+      const reviewTarget = command.organizationReviewTaskThreadId
+        ? yield* projectionStore
+            .getThread(command.organizationReviewTaskThreadId)
+            .pipe(mapDispatchError(command))
+        : null;
+      if (
+        parentProjection.thread.organization &&
+        command.organizationReview &&
+        (!reviewTarget ||
+          reviewTarget.projectId !== parentProjection.thread.projectId ||
+          reviewTarget.organization?.task?.state !== "awaiting_review" ||
+          !(
+            reviewTarget.organization.parentThreadId === parentProjection.thread.id ||
+            reviewTarget.id === parentProjection.thread.id
+          ))
+      )
+        return yield* new OrchestratorDispatchError({
+          commandId: command.commandId,
+          commandType: command.type,
+          cause:
+            "Review delegation requires an awaiting-review task owned by this lead or its outcome.",
+        });
       const targetAdapter = yield* providerAdapters.get(command.modelSelection.instanceId).pipe(
         Effect.mapError(
           (cause) =>
@@ -6395,6 +6650,22 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
         ...(command.title === undefined ? {} : { title: command.title }),
         ordinal: parentProjection.subagents.length + 1,
       });
+      const initialOrganization = delegatedOrganization(
+        parentProjection.thread,
+        childThreadId,
+        taskTitle,
+        command.organizationReview === true,
+      );
+      const childOrganization =
+        initialOrganization?.task && command.organizationDependencyThreadIds
+          ? {
+              ...initialOrganization,
+              task: {
+                ...initialOrganization.task,
+                dependencyThreadIds: command.organizationDependencyThreadIds,
+              },
+            }
+          : initialOrganization;
       const childThread: OrchestrationV2AppThread = {
         ...makeSubagentChildThread({
           parentThread: parentProjection.thread,
@@ -6408,9 +6679,34 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
           createdBy: command.createdBy,
           creationSource: command.creationSource,
         }),
+        ...(parentProjection.thread.organization
+          ? {
+              organization: {
+                ...childOrganization!,
+                ...(reviewTarget ? { reviewTaskThreadId: reviewTarget.id } : {}),
+              },
+              branch: null,
+              worktreePath: null,
+            }
+          : {}),
         runtimeMode: command.runtimeMode,
         interactionMode: command.interactionMode,
       };
+      if (childThread.organization) {
+        const shell = yield* projectionStore.getShellSnapshot().pipe(mapDispatchError(command));
+        const problem = organizationProblem({
+          thread: { ...childThread, organization: undefined },
+          next: childThread.organization,
+          threads: [...shell.threads, childThread],
+        });
+        if (problem)
+          return yield* new OrchestratorDispatchError({
+            commandId: command.commandId,
+            commandType: command.type,
+            cause: problem,
+          });
+      }
+
       const task: OrchestrationV2Subagent = {
         id: taskNodeId,
         threadId: command.parentThreadId,
@@ -6516,6 +6812,20 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
         payload: taskTurnItem,
       });
 
+      if (reviewTarget?.organization?.task)
+        yield* emitEvent({
+          type: "thread.metadata-updated",
+          threadId: reviewTarget.id,
+          occurredAt: now,
+          payload: {
+            ...reviewTarget,
+            organization: {
+              ...reviewTarget.organization,
+              task: { ...reviewTarget.organization.task, ownerThreadId: childThreadId },
+            },
+            updatedAt: now,
+          },
+        });
       const childMessageCommand = {
         type: "message.dispatch",
         createdBy: command.createdBy,
@@ -6527,7 +6837,15 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
         text: command.task,
         attachments: [],
         modelSelection: command.modelSelection,
-        dispatchMode: { type: "start_immediately" },
+        dispatchMode: parentProjection.thread.organization
+          ? {
+              type: "defer_start",
+              workspaceStrategy: {
+                type: "worktree",
+                baseRef: parentProjection.thread.branch ?? "HEAD",
+              },
+            }
+          : { type: "start_immediately" },
       } satisfies Extract<OrchestrationV2Command, { readonly type: "message.dispatch" }>;
       yield* dispatchMessage(childMessageCommand, events, effects);
 
@@ -7595,6 +7913,31 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
         { turnItemTypes: ["command_execution"], turnItemRunId: command.runId },
       );
       const state = preparedRunState(command, projection);
+      if (projection.thread.organization) {
+        const shell = yield* projectionStore.getShellSnapshot().pipe(mapDispatchError(command));
+        const problem = organizationExecutionProblem(projection.thread, shell.threads);
+        if (problem)
+          return yield* new OrchestratorDispatchError({
+            commandId: command.commandId,
+            commandType: command.type,
+            cause: new OrganizationAdmissionDeferred({ reason: problem }),
+          });
+        const workerThreads = shell.threads.filter((item) =>
+          ["executor", "reviewer"].includes(item.organization?.role ?? ""),
+        );
+        const runs = (yield* Effect.forEach(workerThreads, (item) =>
+          projectionStore.getThreadRecords(item.id, ["runs"]).pipe(mapDispatchError(command)),
+        )).flatMap((item) => item.runs);
+        if (!organizationWorkerCapacity(workerThreads, runs, projection.thread.id).canStart)
+          return yield* new OrchestratorDispatchError({
+            commandId: command.commandId,
+            commandType: command.type,
+            cause: new OrganizationAdmissionDeferred({
+              reason:
+                "Waiting for an organization worker slot (maximum 10 execution/review workers).",
+            }),
+          });
+      }
       if (state === null) {
         return yield* new OrchestratorDispatchError({
           commandId: command.commandId,
@@ -9765,6 +10108,7 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
       ),
       Effect.catch((cause) =>
         Effect.gen(function* () {
+          if (isOrganizationAdmissionDeferred(cause)) return yield* cause;
           const rejectedAt = yield* DateTime.now;
           const receipt = yield* eventSink
             .commitRejectedCommand({
@@ -9875,7 +10219,10 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
   });
 
   const dispatchWithReceipt = (command: OrchestrationV2ServerCommand) =>
-    threadDispatch.withLock(commandThreadId(command), dispatchWithReceiptEffect(command));
+    threadDispatch.withLock(
+      ThreadId.make("__organization_command_serialization__"),
+      threadDispatch.withLock(commandThreadId(command), dispatchWithReceiptEffect(command)),
+    );
 
   const handleTerminalRun = (stored: OrchestrationV2StoredEvent) =>
     Effect.gen(function* () {
@@ -9886,6 +10233,34 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
       // while holding the parent lock, so nesting the parent lock inside the
       // child lock here would invert that order, and the keyed executor's
       // semaphores are neither reentrant nor deadlock-aware.
+      if (stored.event.type === "run.updated" && stored.event.payload.status === "failed") {
+        const failed = yield* projectionStore.getThreadRecords(threadId, ["runs", "turnItems"]);
+        const org = failed.thread.organization;
+        const targetId =
+          org?.role === "reviewer" ? org.reviewTaskThreadId : org?.task ? threadId : undefined;
+        if (targetId) {
+          const target =
+            targetId === threadId ? failed.thread : yield* projectionStore.getThread(targetId);
+          if (target.organization?.task && target.organization.task.state !== "accepted") {
+            const failure = latestRootProviderFailure(stored.event.payload, failed.turnItems);
+            yield* dispatchWithReceipt({
+              type: "thread.metadata.update",
+              commandId: CommandId.make(`organization:failed:${stored.event.payload.id}`),
+              threadId: targetId,
+              organization: {
+                ...target.organization,
+                task: {
+                  ...target.organization.task,
+                  state: "blocked",
+                  notes:
+                    failure?.message ??
+                    "The native worker failed before finishing this task. Inspect its conversation and choose an explicit recovery.",
+                },
+              },
+            });
+          }
+        }
+      }
       const parentThreadId = yield* appOwnedSubagentParentThreadId(threadId);
       if (parentThreadId !== undefined) {
         yield* threadDispatch.withLock(parentThreadId, finalizeAppOwnedSubagent(threadId));
@@ -9897,13 +10272,25 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
         );
       }
       yield* threadDispatch.withLock(
-        threadId,
-        startNextQueuedRun(
-          threadId,
-          stored.event.type === "run.updated" && stored.event.payload.status === "failed"
-            ? { failedRunId: stored.event.payload.id }
-            : undefined,
-        ),
+        ThreadId.make("__organization_command_serialization__"),
+        Effect.gen(function* () {
+          yield* threadDispatch.withLock(
+            threadId,
+            startNextQueuedRun(
+              threadId,
+              stored.event.type === "run.updated" && stored.event.payload.status === "failed"
+                ? { failedRunId: stored.event.payload.id }
+                : undefined,
+            ),
+          );
+          const shell = yield* projectionStore.getShellSnapshot();
+          for (const item of shell.threads.filter(
+            (item) =>
+              item.id !== threadId &&
+              ["executor", "reviewer"].includes(item.organization?.role ?? ""),
+          ))
+            yield* threadDispatch.withLock(item.id, startNextQueuedRun(item.id));
+        }),
       );
     }).pipe(
       Effect.catchCause((cause) =>

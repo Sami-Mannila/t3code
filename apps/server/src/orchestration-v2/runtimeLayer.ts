@@ -278,6 +278,7 @@ const effectExecutorProvided = effectExecutorLayer.pipe(
       runtimeRequestServiceProvided,
       threadTitleRegenerationProvided,
       threadManagementProvided,
+      ProjectStore.layer,
     ),
   ),
 );

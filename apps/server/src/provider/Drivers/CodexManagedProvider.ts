@@ -1,3 +1,4 @@
+import { managedCodexQuotaSnapshot, applyManagedCodexQuota } from "./managedCodexQuota.ts";
 import { ProviderDriverKind, TextGenerationError, type CodexSettings } from "@t3tools/contracts";
 import * as Effect from "effect/Effect";
 import * as Stream from "effect/Stream";
@@ -133,7 +134,7 @@ export const makeManagedCodexProvider = Effect.fn("makeManagedCodexProvider")(fu
           ...draft,
           auth: managedAuth,
           version: draft.version ?? executable.value.version,
-          usageLimits,
+          ...managedCodexQuotaSnapshot(usageLimits),
           models: draft.models.map((model) => ({
             ...model,
             ...(model.capabilities
@@ -179,7 +180,7 @@ export const makeManagedCodexProvider = Effect.fn("makeManagedCodexProvider")(fu
                 : {}),
             },
             ...(Option.isSome(current) && current.value.scopes.includes("chatgpt.tokens.use.direct")
-              ? { usageLimits }
+              ? managedCodexQuotaSnapshot(usageLimits)
               : {}),
             message: "Could not check Codex right now. Retry, or reconnect in provider settings.",
           })),
@@ -218,7 +219,7 @@ export const makeManagedCodexProvider = Effect.fn("makeManagedCodexProvider")(fu
   // Launch settings resolve per session from the signed-in token. The registry
   // already wraps openSession in withAccess, so resolve without re-entering it.
   const orchestrationAdapter = yield* createCodexAdapterV2(input, {
-    onUsageLimits: (update) => snapshot.applyUsageLimits(update),
+    onUsageLimits: (update) => applyManagedCodexQuota(update, snapshot.applyUsageLimits),
     resolveRuntime: runtime.resolve,
   }).pipe(
     Effect.mapError(

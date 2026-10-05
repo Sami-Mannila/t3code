@@ -1,3 +1,4 @@
+import { quotaReadsEnabled } from "../provider/organizationRuntimePolicy.ts";
 /**
  * UsageLimitSources — quota from places this environment cannot run turns
  * on, today a CLIProxyAPI hub pooling several subscription accounts.
@@ -101,6 +102,7 @@ export const make = Effect.gen(function* () {
   // source. Callers queue behind the in-flight run and see current settings.
   const refreshLock = yield* Semaphore.make(1);
   const refresh = Effect.gen(function* () {
+    if (!quotaReadsEnabled()) return yield* publish([]);
     const settings = yield* settingsService.getSettings.pipe(
       Effect.orElseSucceed((): ServerSettings | null => null),
     );
@@ -118,6 +120,10 @@ export const make = Effect.gen(function* () {
   // Shares the refresh lock so a stale in-flight read cannot overwrite a redemption.
   const consumeResetCredit = (input: UsageLimitSourceConsumeResetCreditInput) =>
     Effect.gen(function* () {
+      if (!quotaReadsEnabled())
+        return yield* new UsageLimitSourceError({
+          detail: "Quota monitoring is disabled for this organization.",
+        });
       const settings = yield* settingsService.getSettings.pipe(
         Effect.mapError(
           () => new UsageLimitSourceError({ detail: "Could not read hub settings." }),

@@ -2601,8 +2601,14 @@ export function resolveDesktopUpdateChannel(version: string): "latest" | "nightl
 // the app ships without `app-update.yml`, so neither a stable nor a nightly
 // install can be pointed at one of these releases, and the build itself
 // reports that no update feed is configured instead of polling.
+function isOrganizationVersion(version: string): boolean {
+  return /^[^-+]+-preview\.org\d{8}(?:\.\d+)?$/.test(version);
+}
+
 export function isDesktopPreviewVersion(version: string): boolean {
-  return /-pr\./.test(version) || /-preview\.\d{8}\.\d+$/.test(version);
+  return (
+    isOrganizationVersion(version) || /-pr\./.test(version) || /-preview\.\d{8}\.\d+$/.test(version)
+  );
 }
 
 export function resolveDesktopWebAssetBrand(version: string): WebAssetBrand {
@@ -2643,6 +2649,7 @@ export function resolvePackageManagerUserAgent(packageManager: string): string {
 }
 
 export function resolveDesktopProductName(version: string): string {
+  if (isOrganizationVersion(version)) return "T3 Organization";
   return resolveDesktopUpdateChannel(version) === "nightly"
     ? "T3 Code (Nightly)"
     : (desktopPackageJson.productName ?? "T3 Code");
@@ -2668,7 +2675,7 @@ export const createBuildConfig = Effect.fn("createBuildConfig")(function* (
   arch?: typeof BuildArch.Type,
 ) {
   const buildConfig: Record<string, unknown> = {
-    appId: DESKTOP_APP_ID,
+    appId: isOrganizationVersion(version) ? "com.samimannila.t3organization" : DESKTOP_APP_ID,
     productName: resolveDesktopProductName(version),
     artifactName: "T3-Code-${version}-${arch}.${ext}",
     electronLanguages: [...DESKTOP_ELECTRON_LANGUAGES],

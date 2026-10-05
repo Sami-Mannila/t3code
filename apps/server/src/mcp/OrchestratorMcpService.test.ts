@@ -1136,4 +1136,109 @@ describe("OrchestratorMcpService provider resolution", () => {
         }
       }),
   );
+  it.effect(
+    "organization delegation pins role defaults and preserves atomic task dependencies",
+    () =>
+      Effect.gen(function* () {
+        const openCodeId = ProviderInstanceId.make("opencode-native");
+        const dependency = ThreadId.make("accepted-dependency");
+        for (const role of ["chief", "lead"] as const) {
+          const dispatched = yield* Ref.make<ReadonlyArray<unknown>>([]);
+          const task = {
+            id: taskId,
+            threadId: parentThreadId,
+            runId: parentRunId,
+            parentNodeId,
+            origin: "app_owned",
+            createdBy: "agent",
+            driver: role === "lead" ? "opencode" : "codex",
+            providerInstanceId: role === "lead" ? openCodeId : codexInstanceId,
+            providerThreadId: null,
+            childThreadId,
+            nativeTaskRef: null,
+            prompt: "Implement",
+            title: null,
+            model: "selected",
+            status: "running",
+            result: null,
+            startedAt: null,
+            completedAt: null,
+          };
+          const parent = parentProjection([task]);
+          const dependencies = Layer.mergeAll(
+            NodeServices.layer,
+            Layer.mock(ThreadManagementService.ThreadManagementService)({
+              getThreadRecords: (id) =>
+                Effect.succeed(
+                  id === parentThreadId
+                    ? {
+                        ...parent,
+                        thread: {
+                          ...parent.thread,
+                          organization: {
+                            role,
+                            parentThreadId: role === "chief" ? null : ThreadId.make("chief"),
+                          },
+                        },
+                      }
+                    : childProjection,
+                ),
+              dispatch: (command) =>
+                Ref.update(dispatched, (all) => [...all, command]).pipe(
+                  Effect.as({
+                    sequence: 1,
+                    storedEvents: [
+                      {
+                        sequence: 1,
+                        commandId: null,
+                        event: { type: "subagent.updated", payload: task },
+                      },
+                    ],
+                  } as never),
+                ),
+            }),
+            Layer.mock(ProviderRegistry.ProviderRegistry)({
+              getProviders: Effect.succeed([
+                providerSnapshot({
+                  instanceId: codexInstanceId,
+                  driver: ProviderDriverKind.make("codex"),
+                  model: "gpt-6.1-sol",
+                }),
+                providerSnapshot({
+                  instanceId: openCodeId,
+                  driver: ProviderDriverKind.make("opencode"),
+                  model: "fireworks-ai/accounts/fireworks/models/deepseek-v4p1-flash",
+                }),
+              ]),
+            }),
+            adapterRegistryLayer([codexInstanceId, openCodeId]),
+            Layer.mock(ScheduledTaskService.ScheduledTaskService)({}),
+          );
+          yield* Effect.gen(function* () {
+            const service = yield* OrchestratorMcpService.OrchestratorMcpService;
+            yield* service.delegateTask(scope, {
+              task: "Implement",
+              mode: "async",
+              clientRequestId: `organization-${role}`,
+              dependencyThreadIds: [dependency],
+            });
+            const command = (yield* Ref.get(dispatched))[0] as {
+              modelSelection: { instanceId: string; model: string };
+              organizationDependencyThreadIds: ReadonlyArray<string>;
+            };
+            assert.equal(
+              command.modelSelection.instanceId,
+              role === "lead" ? openCodeId : codexInstanceId,
+            );
+            assert.equal(
+              command.modelSelection.model,
+              role === "lead"
+                ? "fireworks-ai/accounts/fireworks/models/deepseek-v4p1-flash"
+                : "gpt-6.1-sol",
+            );
+            assert.deepEqual(command.organizationDependencyThreadIds, [dependency]);
+          }).pipe(Effect.provide(OrchestratorMcpService.layer.pipe(Layer.provide(dependencies))));
+        }
+      }),
+  );
 });

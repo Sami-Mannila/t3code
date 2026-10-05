@@ -1,3 +1,4 @@
+import { quotaReadsEnabled } from "../organizationRuntimePolicy.ts";
 import { GrokSettings, ProviderDriverKind } from "@t3tools/contracts";
 import * as Crypto from "effect/Crypto";
 import * as Effect from "effect/Effect";
@@ -148,7 +149,10 @@ export const GrokDriver: ProviderDriver<GrokSettings, GrokDriverEnv> = {
 
       const checkProvider = checkGrokProviderStatus(effectiveConfig, processEnv, cwd).pipe(
         Effect.flatMap((snapshot) =>
-          effectiveConfig.enabled && snapshot.installed && snapshot.auth.status === "authenticated"
+          quotaReadsEnabled() &&
+          effectiveConfig.enabled &&
+          snapshot.installed &&
+          snapshot.auth.status === "authenticated"
             ? readGrokAccount(processEnv).pipe(
                 Effect.map(({ email, usageLimits }) => ({
                   ...snapshot,

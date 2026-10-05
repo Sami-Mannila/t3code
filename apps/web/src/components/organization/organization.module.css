@@ -1,0 +1,147 @@
+.org-toolbar,
+.org-setup {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  flex-wrap: wrap;
+  padding: 12px 20px;
+  border-bottom: 1px solid var(--border);
+}
+.org-toolbar label,
+.org-setup label {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  font-size: 12px;
+}
+.org-toolbar select,
+.org-setup select {
+  border: 1px solid var(--border);
+  border-radius: 5px;
+  padding: 5px;
+  background: var(--background);
+  max-width: 320px;
+}
+.org-setup p {
+  width: 100%;
+  font-size: 12px;
+  color: var(--muted-foreground);
+}
+.org-viewport {
+  flex: 1;
+  min-height: 240px;
+  position: relative;
+  overflow: hidden;
+  touch-action: none;
+  background-image: radial-gradient(var(--border) 1px, transparent 1px);
+  background-size: 20px 20px;
+}
+.org-world {
+  position: absolute;
+  transform-origin: 0 0;
+}
+.org-edges {
+  position: absolute;
+  overflow: visible;
+  pointer-events: none;
+}
+.org-edge {
+  fill: none;
+  stroke: var(--muted-foreground);
+  stroke-width: 1.5;
+}
+.org-edge-command {
+  stroke-dasharray: 7 6;
+  opacity: 0.4;
+}
+.org-edge-review {
+  stroke: var(--primary);
+  stroke-dasharray: 2 4;
+}
+.org-node {
+  position: absolute;
+  border: 1px solid var(--border);
+  border-radius: 10px;
+  background: var(--background);
+  padding: 12px;
+  box-shadow: 0 2px 8px #0001;
+  overflow: hidden;
+}
+.org-node-role {
+  background: var(--muted);
+}
+.org-node-task {
+  border-left: 3px solid var(--primary);
+}
+.org-node a {
+  display: flex;
+  flex-direction: column;
+  gap: 5px;
+  height: 100%;
+}
+.org-node strong {
+  font-size: 13px;
+  line-height: 1.3;
+}
+.org-node span {
+  font-size: 12px;
+}
+.org-node small {
+  font-size: 10px;
+  color: var(--muted-foreground);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.org-node-boundary {
+  border-style: dashed;
+  font-size: 12px;
+}
+.org-legend,
+.org-notice {
+  padding: 8px 20px;
+  font-size: 11px;
+  color: var(--muted-foreground);
+}
+.org-empty {
+  position: absolute;
+  inset: 20%;
+  text-align: center;
+}
+.org-empty h2 {
+  font-size: 20px;
+}
+.org-empty p {
+  margin-top: 12px;
+  color: var(--muted-foreground);
+}
+
+.org-node-running {
+  border-color: #299b66;
+}
+.org-node-running strong::before {
+  content: "";
+  display: inline-block;
+  width: 7px;
+  height: 7px;
+  border-radius: 50%;
+  background: #299b66;
+  margin-right: 6px;
+}
+.org-node-blocked {
+  border-left-color: #d49a38;
+}
+.org-node strong {
+  display: -webkit-box;
+  -webkit-line-clamp: 2;
+  -webkit-box-orient: vertical;
+  overflow: hidden;
+}
+.org-node small {
+  flex-shrink: 0;
+}
+
+.org-node-task a {
+  height: auto;
+  margin-bottom: 8px;
+}

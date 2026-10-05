@@ -1,3 +1,4 @@
+import { OrganizationThread } from "./organization.ts";
 import { OrchestrationMessageContext } from "./composerContext.ts";
 import * as Effect from "effect/Effect";
 import * as Schema from "effect/Schema";
@@ -357,6 +358,7 @@ export const OrchestrationV2LimitRecoveryUpdate = Schema.Struct({
 export type OrchestrationV2LimitRecoveryUpdate = typeof OrchestrationV2LimitRecoveryUpdate.Type;
 
 export const OrchestrationV2AppThread = Schema.Struct({
+  organization: Schema.optional(Schema.NullOr(OrganizationThread)),
   ...OrchestrationV2CreationFields,
   id: ThreadId,
   projectId: ProjectId,
@@ -1715,6 +1717,7 @@ export type OrchestrationV2LatestVisibleMessageSummary =
   typeof OrchestrationV2LatestVisibleMessageSummary.Type;
 
 export const OrchestrationV2ThreadShell = Schema.Struct({
+  organization: Schema.optional(Schema.NullOr(OrganizationThread)),
   ...OrchestrationV2CreationFields,
   id: ThreadId,
   projectId: ProjectId,
@@ -2480,6 +2483,7 @@ export type OrchestrationV2StoredEventJson = typeof OrchestrationV2StoredEventJs
 export const OrchestrationV2Command = Schema.Union([
   Schema.Struct({
     type: Schema.Literal("thread.create"),
+    organization: Schema.optional(OrganizationThread),
     ...OrchestrationV2CreationFields,
     commandId: CommandId,
     threadId: ThreadId,
@@ -2607,6 +2611,9 @@ export const OrchestrationV2Command = Schema.Union([
   }),
   Schema.Struct({
     type: Schema.Literal("thread.metadata.update"),
+    organization: Schema.optional(Schema.NullOr(OrganizationThread)),
+    /** Bound by organization MCP tools; absent denotes a user-authored metadata operation. */
+    organizationActorThreadId: Schema.optional(ThreadId),
     commandId: CommandId,
     threadId: ThreadId,
     title: Schema.optional(TrimmedNonEmptyString),
@@ -2865,6 +2872,9 @@ export const OrchestrationV2Command = Schema.Union([
   }),
   Schema.Struct({
     type: Schema.Literal("delegated_task.request"),
+    organizationDependencyThreadIds: Schema.optional(Schema.Array(ThreadId)),
+    organizationReview: Schema.optional(Schema.Boolean),
+    organizationReviewTaskThreadId: Schema.optional(ThreadId),
     ...OrchestrationV2CreationFields,
     commandId: CommandId,
     parentThreadId: ThreadId,
@@ -2970,7 +2980,14 @@ const OrchestrationV2InternalCommand = Schema.Union([
 export type OrchestrationV2InternalCommand = typeof OrchestrationV2InternalCommand.Type;
 
 /** Everything the server's orchestrator accepts: client commands plus internal ones. */
-export type OrchestrationV2ServerCommand = OrchestrationV2Command | OrchestrationV2InternalCommand;
+export type OrchestrationV2ServerCommand =
+  | (OrchestrationV2Command & {
+      readonly organizationVerification?: {
+        readonly revision: string;
+        readonly previousRevision: string | null;
+      };
+    })
+  | OrchestrationV2InternalCommand;
 
 export const ORCHESTRATION_V2_WS_METHODS = {
   dispatchCommand: "orchestration.dispatchCommand",

@@ -1,5 +1,6 @@
 import {
   CommandId,
+  ProviderDriverKind,
   type RunId,
   isProviderAvailable,
   MessageId,
@@ -1384,9 +1385,23 @@ const make = Effect.gen(function* () {
           );
         }
         const providers = yield* loadProviders;
+        const organizationTarget =
+          parent.thread.organization && !input.target
+            ? {
+                driverKind: ProviderDriverKind.make(
+                  parent.thread.organization.role === "lead" && input.role !== "review"
+                    ? "opencode"
+                    : "codex",
+                ),
+                model:
+                  parent.thread.organization.role === "lead" && input.role !== "review"
+                    ? "fireworks-ai/accounts/fireworks/models/deepseek-v4p1-flash"
+                    : "gpt-6.1-sol",
+              }
+            : input.target;
         const target = yield* resolveTarget({
           parent,
-          target: input.target,
+          target: organizationTarget,
           providers,
         });
         const runtimeMode = yield* resolveRuntimeMode(parent.thread.runtimeMode, input.runtimeMode);
@@ -1403,6 +1418,17 @@ const make = Effect.gen(function* () {
         const result = yield* threadManagement
           .dispatch({
             type: "delegated_task.request",
+            ...(parent.thread.organization
+              ? {
+                  organizationReview: input.role === "review",
+                  ...(input.dependencyThreadIds
+                    ? { organizationDependencyThreadIds: input.dependencyThreadIds }
+                    : {}),
+                  ...(input.reviewTaskThreadId
+                    ? { organizationReviewTaskThreadId: input.reviewTaskThreadId }
+                    : {}),
+                }
+              : {}),
             createdBy: "agent",
             creationSource: "mcp",
             commandId,
@@ -1577,6 +1603,11 @@ const make = Effect.gen(function* () {
       Effect.gen(function* () {
         yield* requireCapability(scope);
         const parent = yield* loadProjection(scope.threadId);
+        if (parent.thread.organization)
+          return yield* failure(
+            "capability_denied",
+            "Organization agents create children through role-aware delegate_task, not generic thread creation.",
+          );
         const parentRun = ThreadManagementService.latestActiveRun(parent);
         if (
           parentRun === undefined ||

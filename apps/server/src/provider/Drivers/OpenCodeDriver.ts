@@ -1,3 +1,4 @@
+import { quotaReadsEnabled } from "../organizationRuntimePolicy.ts";
 /**
  * OpenCodeDriver — `ProviderDriver` for the OpenCode runtime.
  *
@@ -331,7 +332,7 @@ export const OpenCodeDriver: ProviderDriver<OpenCodeSettings, OpenCodeDriverEnv>
                   pending.delete(event.type) &&
                   pending.size === 0
                     ? Deferred.succeed(scanned, undefined)
-                    : Effect.void,
+                    : Effect.undefined,
                 ),
                 Effect.ignore,
                 Effect.forkScoped,
@@ -375,15 +376,20 @@ export const OpenCodeDriver: ProviderDriver<OpenCodeSettings, OpenCodeDriverEnv>
             runtimeProbe.refresh,
             loadOpenCode2Models,
           ),
-          usageLimits: readOpenCodeGoUsageLimits({
-            enabled: effectiveConfig.enabled,
-            serverUrl: effectiveConfig.serverUrl,
-            environment: processEnv,
-          }),
+          usageLimits: quotaReadsEnabled()
+            ? readOpenCodeGoUsageLimits({
+                enabled: effectiveConfig.enabled,
+                serverUrl: effectiveConfig.serverUrl,
+                environment: processEnv,
+              })
+            : Effect.undefined,
         },
         { concurrency: "unbounded" },
       ).pipe(
-        Effect.map(({ provider, usageLimits }) => ({ ...provider, usageLimits })),
+        Effect.map(({ provider, usageLimits }) => ({
+          ...provider,
+          ...(usageLimits === undefined ? {} : { usageLimits }),
+        })),
         Effect.map(stampIdentity),
         Effect.provideService(FileSystem.FileSystem, fileSystem),
         Effect.provideService(Path.Path, pathService),

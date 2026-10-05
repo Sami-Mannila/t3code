@@ -1,3 +1,6 @@
+import { organizationExecutionProblem, organizationInstructions } from "./OrganizationPolicy.ts";
+import * as OrganizationArtifacts from "./OrganizationArtifacts.ts";
+import * as Path from "effect/Path";
 import { modelSelectionsEqual } from "@t3tools/shared/model";
 import { projectComposerContextForProvider } from "@t3tools/shared/composerContextReferences";
 import {
@@ -368,6 +371,49 @@ export const layer: Layer.Layer<
           });
         },
       );
+      if (projection.thread.organization) {
+        const shell = yield* projectionStore.getShellSnapshot();
+        let problem = organizationExecutionProblem(projection.thread, shell.threads);
+        if (!problem && projection.thread.organization.role === "executor") {
+          for (const id of projection.thread.organization.task?.dependencyThreadIds ?? []) {
+            const dependency = shell.threads.find((item) => item.id === id);
+            const checked = dependency?.worktreePath
+              ? yield* OrganizationArtifacts.snapshot(
+                  dependency.worktreePath,
+                  dependency.organization?.task?.manifest ?? [],
+                ).pipe(
+                  Effect.provideService(FileSystem.FileSystem, fileSystem),
+                  Effect.provide(Path.layer),
+                  Effect.result,
+                )
+              : null;
+            if (
+              !checked ||
+              checked._tag === "Failure" ||
+              checked.success.revision !== dependency?.organization?.task?.reviewedRevision
+            ) {
+              problem =
+                "A dependency's accepted files changed; independent review is required again.";
+              break;
+            }
+          }
+        }
+        if (problem) {
+          yield* settleRunBeforeStart({
+            signal: "organization-gate",
+            status: "failed",
+            now: yield* DateTime.now,
+            providerInstanceId: run.providerInstanceId,
+            itemProviderThreadId: providerThread.id,
+            item: {
+              type: "error",
+              title: "Organization task cannot start",
+              failure: makeProviderFailure({ class: "validation_error", message: problem }),
+            },
+          });
+          return;
+        }
+      }
       if (message.attachments.length === 0 && message.text.trimStart().startsWith("/")) {
         const isEmptyCompaction =
           message.text.trim().toLowerCase() === "/compact" && !projection.hasConversation;
@@ -1164,7 +1210,11 @@ export const layer: Layer.Layer<
           });
           if (!(yield* isCurrentAttemptInStatus("running"))) return;
           const start = compact ? session.compactThread! : session.startTurn;
-          const context = [delivery.context, restartNote]
+          const context = [
+            delivery.context,
+            restartNote,
+            organizationInstructions(projection.thread),
+          ]
             .filter((part) => part !== "")
             .join("\n\n");
           // A note continuation has no turn to resume; its text is the prompt.
@@ -1203,7 +1253,8 @@ export const layer: Layer.Layer<
         effectiveHandoffs.length === 0 &&
         missedItems.length === 0 &&
         restartNote === "" &&
-        !noteContinuation
+        !noteContinuation &&
+        !projection.thread.organization
           ? session
           : makeDeliverySession(session, startWithHandoffs);
       yield* runExecution.startRootRun({

@@ -1,5 +1,5 @@
 import {
-  type CommandId,
+  CommandId,
   type RuntimeRequestId,
   ThreadId,
   type OrchestrationV2ThreadProjection,
@@ -76,6 +76,123 @@ const readQuestion = Effect.fn("mcp.readQuestion")(function* (
   return { ...context, request, item };
 });
 export const ThreadToolkitHandlersLive = ThreadToolkit.toLayer({
+  t3_organization_task: (input) =>
+    Effect.gen(function* () {
+      const { caller: source } = yield* readCaller();
+      let target = input.threadId ?? source.id;
+      if (source.organization?.role === "reviewer") {
+        const assigned = source.organization.reviewTaskThreadId;
+        if (!assigned)
+          return yield* new OrchestratorMcpFailure({
+            code: "invalid_request",
+            message:
+              "This reviewer has no explicitly assigned submission. Ask the outcome lead to delegate its review target.",
+          });
+        if (target === source.id) target = assigned;
+        if (target !== assigned)
+          return yield* new OrchestratorMcpFailure({
+            code: "capability_denied",
+            message: "A reviewer may access only its explicitly assigned task through this tool.",
+          });
+      }
+      const context = yield* input.action === "read"
+        ? readThread(target)
+        : readWritableThread(target);
+      const { projection, caller, threads } = context;
+      const organization = projection.thread.organization;
+      if (!organization?.task)
+        return yield* new OrchestratorMcpFailure({
+          code: "invalid_request",
+          message: "This conversation has no organization task.",
+        });
+      if (input.action === "read")
+        return {
+          threadId: projection.thread.id,
+          organization,
+          workspace: projection.thread.worktreePath,
+        };
+      const old = organization.task;
+      const task = {
+        ...old,
+        ...(input.notes ? { notes: input.notes } : {}),
+        ...(input.manifest ? { manifest: input.manifest } : {}),
+      };
+      switch (input.action) {
+        case "plan":
+          if (input.title) task.title = input.title;
+          if (input.dependencyThreadIds) task.dependencyThreadIds = input.dependencyThreadIds;
+          break;
+        case "claim":
+          task.state = "working";
+          task.ownerThreadId = projection.thread.id;
+          break;
+        case "block":
+          task.state = "blocked";
+          break;
+        case "submit":
+          task.state = "awaiting_review";
+          task.reviewedRevision = null;
+          task.reviewerThreadId = null;
+          break;
+        case "assign_review":
+          if (!input.reviewerThreadId)
+            return yield* new OrchestratorMcpFailure({
+              code: "invalid_request",
+              message: "Choose an explicit reviewer conversation.",
+            });
+          task.ownerThreadId = input.reviewerThreadId;
+          break;
+        case "accept_review":
+          task.state = organization.role === "lead" ? "awaiting_review" : "accepted";
+          task.reviewedRevision = old.revision;
+          task.reviewerThreadId = caller.id;
+          break;
+        case "request_changes":
+          if (caller.organization?.role === "reviewer" && old.revision)
+            task.lastReview = {
+              reviewerThreadId: caller.id,
+              revision: old.revision,
+              verdict: "changes_requested",
+              ...(input.notes ? { notes: input.notes } : {}),
+            };
+          task.state = "changes_requested";
+          task.ownerThreadId = projection.thread.id;
+          task.reviewedRevision = null;
+          task.reviewerThreadId = null;
+          break;
+      }
+      yield* threads
+        .dispatch({
+          type: "thread.metadata.update",
+          commandId: CommandId.make(`organization:${caller.id}:${input.clientRequestId}`),
+          threadId: projection.thread.id,
+          organizationActorThreadId: caller.id,
+          organization: { ...organization, task },
+        })
+        .pipe(
+          Effect.mapError(
+            (error) =>
+              new OrchestratorMcpFailure({
+                code: "orchestration_error",
+                message:
+                  "cause" in error && typeof error.cause === "string"
+                    ? error.cause
+                    : "cause" in error && error.cause instanceof Error
+                      ? error.cause.message
+                      : error.message,
+              }),
+          ),
+        );
+      const updated = yield* threads
+        .getThreadShell(projection.thread.id)
+        .pipe(Effect.mapError(unavailable));
+      return {
+        threadId: projection.thread.id,
+        organization: updated?.organization ?? null,
+        workspace: projection.thread.worktreePath,
+      };
+    }),
+
   run_scheduled_task_now: (input) =>
     Effect.gen(function* () {
       const { caller } = yield* readMutationCaller();

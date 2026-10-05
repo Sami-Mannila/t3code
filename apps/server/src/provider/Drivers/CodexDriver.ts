@@ -1,3 +1,4 @@
+import { quotaReadsEnabled } from "../organizationRuntimePolicy.ts";
 /**
  * CodexDriver — first concrete `ProviderDriver` in the new per-instance model.
  *
@@ -200,7 +201,10 @@ export const CodexDriver: ProviderDriver<CodexSettings, CodexDriverEnv> = {
           enabled,
           config,
         },
-        { onUsageLimits: (update) => snapshot.applyUsageLimits(update) },
+        {
+          onUsageLimits: (update) =>
+            quotaReadsEnabled() ? snapshot.applyUsageLimits(update) : Effect.void,
+        },
       ).pipe(
         Effect.mapError(
           (cause) =>

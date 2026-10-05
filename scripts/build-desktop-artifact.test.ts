@@ -359,6 +359,18 @@ it.layer(NodeServices.layer)("build-desktop-artifact", (it) => {
         undefined,
       );
 
+      const organization = yield* createBuildConfig(
+        "mac",
+        "zip",
+        "0.0.46-preview.org20261005.1",
+        false,
+        true,
+        3000,
+        undefined,
+      );
+      assert.notProperty(organization, "publish");
+      assert.equal(organization.productName, "T3 Organization");
+      assert.equal(organization.appId, "com.samimannila.t3organization");
       assert.notProperty(preview, "publish");
       assert.notProperty(previewChannel, "publish");
       assert.deepStrictEqual(release.publish, [

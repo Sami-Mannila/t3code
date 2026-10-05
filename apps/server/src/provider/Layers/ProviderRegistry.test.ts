@@ -404,6 +404,15 @@ it.layer(Layer.mergeAll(TestNodeServices, ServerSettingsModule.layerTest(), Test
   "ProviderRegistry",
   (it) => {
     describe("checkCodexProviderStatus", () => {
+      it.effect("omits quota metadata when the native quota probe is intentionally skipped", () =>
+        Effect.gen(function* () {
+          const status = yield* checkCodexProviderStatus(defaultCodexSettings, () =>
+            Effect.succeed(makeCodexProbeSnapshot({})),
+          );
+          assert.strictEqual(status.usageLimits, undefined);
+          assert.strictEqual(status.status, "ready");
+        }),
+      );
       it.effect("uses the app-server account and model list for provider status", () =>
         Effect.gen(function* () {
           const status = yield* checkCodexProviderStatus(defaultCodexSettings, () =>
@@ -455,13 +464,14 @@ it.layer(Layer.mergeAll(TestNodeServices, ServerSettingsModule.layerTest(), Test
         }),
       );
 
-      it.effect("passes configured launch args to the Codex provider probe", () =>
+      it.effect("keeps Codex readiness and launch args while disabling quota requests", () =>
         Effect.gen(function* () {
           let observedLaunchArgs: string | undefined;
           const settings = decodeCodexSettings({ launchArgs: "--strict-config --enable foo" });
 
           const status = yield* checkCodexProviderStatus(settings, (input) => {
             observedLaunchArgs = input.launchArgs;
+            assert.strictEqual(input.skipNativeUsage, true);
             return Effect.succeed(makeCodexProbeSnapshot());
           });
 

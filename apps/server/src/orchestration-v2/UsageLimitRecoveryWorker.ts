@@ -1,3 +1,4 @@
+import { automaticLimitRecoveryEnabled } from "../provider/organizationRuntimePolicy.ts";
 import { CommandId, MessageId, type OrchestrationV2Command } from "@t3tools/contracts";
 import * as DateTime from "effect/DateTime";
 import * as Effect from "effect/Effect";
@@ -108,6 +109,7 @@ const makeSweep = Effect.gen(function* () {
 // choices, so restarts need no timer restoration or connected client.
 export const workerLive = Layer.effectDiscard(
   Effect.gen(function* () {
+    if (!automaticLimitRecoveryEnabled()) return;
     const sweep = yield* makeSweep;
     const scheduler = yield* Scheduler.Scheduler;
     yield* scheduler.register("usage-limit-recovery", sweep());

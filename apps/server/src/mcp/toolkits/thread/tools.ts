@@ -1,5 +1,6 @@
 import {
   ScheduledTaskId,
+  OrganizationThread,
   ScheduledTask,
   OrchestrationSearchThreadsInput,
   OrchestrationSearchThreadsResult,
@@ -258,7 +259,38 @@ const ScheduledTaskRunTool = Tool.make("run_scheduled_task_now", {
   .annotate(Tool.Destructive, true)
   .annotate(Tool.OpenWorld, true);
 
+const OrganizationTaskTool = Tool.make("t3_organization_task", {
+  ...commandTool,
+  description:
+    "Read or update a canonical organization task. Actor identity is bound to this conversation. Omit threadId to use your task; reviewers automatically target their explicitly assigned submission (their own conversation ID is an alias for that target). Other reviewer targets are rejected. Submit hashes actual manifest files; reviewers accept only the exact submitted revision; lead outcomes require user acceptance. Keep user-facing updates in the Chief conversation.",
+  parameters: Schema.Struct({
+    threadId: Schema.optional(ThreadId),
+    action: Schema.Literals([
+      "read",
+      "plan",
+      "claim",
+      "block",
+      "submit",
+      "assign_review",
+      "accept_review",
+      "request_changes",
+    ]),
+    manifest: Schema.optional(Schema.Array(TrimmedNonEmptyString)),
+    title: Schema.optional(TrimmedNonEmptyString),
+    dependencyThreadIds: Schema.optional(Schema.Array(ThreadId)),
+    reviewerThreadId: Schema.optional(ThreadId),
+    notes: Schema.optional(TrimmedNonEmptyString),
+    clientRequestId: TrimmedNonEmptyString,
+  }),
+  success: Schema.Struct({
+    threadId: ThreadId,
+    organization: Schema.NullOr(OrganizationThread),
+    workspace: Schema.NullOr(Schema.String),
+  }),
+}).annotate(Tool.Destructive, true);
+
 export const ThreadToolkit = Toolkit.make(
+  OrganizationTaskTool,
   ScheduledTaskRunTool,
   ThreadSearchTool,
   ThreadForkTool,
