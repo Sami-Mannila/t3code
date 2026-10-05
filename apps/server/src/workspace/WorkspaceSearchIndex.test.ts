@@ -105,6 +105,23 @@ it.effect("keeps returned FileFinder creation diagnostics out of the cause chain
   }),
 );
 
+it.effect("leaves filesystem root and home directory scanning at fff's default", () =>
+  Effect.gen(function* () {
+    const finder = {
+      destroy: vi.fn(),
+      waitForIndexReady: vi.fn(async () => ({ ok: true as const, value: true })),
+    } as unknown as FileFinder;
+    const create = vi.spyOn(FileFinder, "create").mockReturnValueOnce({ ok: true, value: finder });
+
+    yield* Effect.scoped(WorkspaceSearchIndex.make("/workspace/project"));
+
+    const options = create.mock.calls[0]?.[0];
+    expect(options?.basePath).toBe("/workspace/project");
+    expect(options?.enableFsRootScanning).toBeUndefined();
+    expect(options?.enableHomeDirScanning).toBeUndefined();
+  }),
+);
+
 it.effect("waits for the full content index warmup before returning", () =>
   Effect.gen(function* () {
     const waitForIndexReady = vi.fn(async () => ({ ok: true as const, value: true }));

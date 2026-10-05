@@ -38,7 +38,8 @@ const WORKSPACE_INDEX_MAX_ENTRIES = 25_000;
 const WORKSPACE_INDEX_PAGE_SIZE = WORKSPACE_INDEX_MAX_ENTRIES + 2;
 const WORKSPACE_INDEX_SCAN_TIMEOUT = "15 seconds";
 const WORKSPACE_INDEX_SCAN_TIMEOUT_MS = 15_000;
-const WORKSPACE_INDEX_IDLE_TTL = "15 minutes";
+// Each live index keeps a native file watcher on its workspace; release idle ones promptly.
+const WORKSPACE_INDEX_IDLE_TTL = "5 minutes";
 const CONTENT_SEARCH_TIME_BUDGET_MS = 250;
 const CONTENT_SEARCH_MAX_MATCHES_PER_FILE = 100;
 
@@ -314,8 +315,8 @@ const createFinder = Effect.fn("WorkspaceSearchIndex.createFinder")(function* (
         // composer path search, file picker) keep the lightweight index.
         disableContentIndexing: variant !== "content",
         aiMode: false,
-        enableFsRootScanning: true,
-        enableHomeDirScanning: true,
+        // Root and home directory scanning stay at fff's default (off): a
+        // watcher over either floods the server with unrelated fs events.
       }),
     catch: (cause) =>
       new WorkspaceSearchIndexCreateFailed({
