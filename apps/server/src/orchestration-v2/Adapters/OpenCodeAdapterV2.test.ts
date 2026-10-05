@@ -902,6 +902,69 @@ describe("OpenCodeAdapterV2", () => {
     }).pipe(Effect.provide(IdAllocator.layer), Effect.scoped),
   );
 
+  it.effect("keeps a part's fallback start time stable across repeated snapshots", () =>
+    Effect.gen(function* () {
+      const nativeEvents = asyncEventStream();
+      const nativeSessionId = "native-opencode-reasoning";
+      const harness = yield* makeOpenCodeRuntimeHarness("reasoning-start", nativeSessionId, {
+        event: {
+          subscribe: async (_input: unknown, options: { signal?: AbortSignal }) => {
+            options.signal?.addEventListener("abort", () => nativeEvents.close(), { once: true });
+            return { stream: nativeEvents.stream };
+          },
+        },
+        session: {
+          create: async () => ({
+            data: { id: nativeSessionId, time: { created: 1, updated: 1 } },
+          }),
+          promptAsync: async () => ({ data: true }),
+        },
+      });
+      yield* harness.startTurn();
+      const received = yield* harness.runtime.events.pipe(
+        Stream.filter((event) => event.type === "node.updated" && event.node.kind === "reasoning"),
+        Stream.take(2),
+        Stream.runCollect,
+        Effect.forkScoped,
+      );
+      // OpenCode can send a reasoning part before it has a start time.
+      yield* Effect.promise(() =>
+        nativeEvents.push({
+          type: "message.part.updated",
+          properties: {
+            sessionID: nativeSessionId,
+            part: {
+              id: "part-reasoning",
+              sessionID: nativeSessionId,
+              messageID: "assistant-reasoning",
+              type: "reasoning",
+              text: "Thinking",
+            },
+          },
+        }),
+      );
+      yield* TestClock.adjust("1 second");
+      yield* Effect.promise(() =>
+        nativeEvents.push({
+          type: "message.part.delta",
+          properties: {
+            sessionID: nativeSessionId,
+            messageID: "assistant-reasoning",
+            partID: "part-reasoning",
+            field: "text",
+            delta: " more",
+          },
+        }),
+      );
+      const nodes = Array.from(yield* Fiber.join(received)).flatMap((event) =>
+        event.type === "node.updated" ? [event.node] : [],
+      );
+      assert.equal(nodes.length, 2);
+      assert.equal(nodes[0]?.status, "running");
+      assert.deepEqual(nodes[1], nodes[0]);
+    }).pipe(Effect.provide(IdAllocator.layer), Effect.scoped),
+  );
+
   it.effect("presents OpenCode MCP calls without treating remote tools as local edits", () =>
     Effect.gen(function* () {
       const nativeEvents = asyncEventStream();
