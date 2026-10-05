@@ -82,7 +82,7 @@
   flex-wrap: wrap;
 }
 .org-roots .org-card {
-  width: 340px;
+  width: 440px;
 }
 .org-connector {
   width: 0;
@@ -92,7 +92,7 @@
 }
 .org-leads {
   display: grid;
-  grid-template-columns: repeat(var(--org-columns, 1), 360px);
+  grid-template-columns: repeat(var(--org-columns, 1), 480px);
   gap: 20px;
   align-items: start;
 }
@@ -223,6 +223,9 @@
 }
 .org-sub-truncate {
   display: block;
+  /* Takes the rest of its line beside the activity dot instead of wrapping below it. */
+  flex: 1 1 0;
+  min-width: 0;
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
@@ -237,6 +240,20 @@
   text-align: left;
   font-size: 12px;
   color: var(--muted-foreground);
+}
+.org-review-who {
+  flex: 0 10 auto;
+  min-width: 2ch;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.org-review-verdict {
+  flex: 0 1 auto;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
 }
 .org-review:hover,
 .org-header:hover .org-title,

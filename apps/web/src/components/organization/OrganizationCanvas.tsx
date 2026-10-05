@@ -13,6 +13,7 @@ import type { EnvironmentId, OrganizationTask, ProjectId } from "@t3tools/contra
 
 import { cn } from "~/lib/utils";
 import { useThreadShellsForProjectRefs } from "~/state/entities";
+import { CheckIcon } from "lucide-react";
 import { Button } from "~/components/ui/button";
 import { Tooltip, TooltipPopup, TooltipTrigger } from "~/components/ui/tooltip";
 import {
@@ -122,10 +123,11 @@ function ReviewLine(props: {
   const content = (
     <>
       <Dot thread={reviewer} />
-      <span className={styles["org-sub-truncate"]}>
+      <span className={styles["org-review-who"]}>
         {props.label}
-        {reviewer ? ` · ${threadModelLabel(reviewer)}` : ""} · {verdict}
+        {reviewer ? ` · ${threadModelLabel(reviewer)}` : ""} ·
       </span>
+      <span className={styles["org-review-verdict"]}>{verdict}</span>
     </>
   );
   return reviewer ? (
@@ -219,7 +221,9 @@ function SubtaskRow(props: {
       data-org-thread={executor.id}
     >
       <div className={cn(styles["org-check"], CHECKS[subtask.task.state])}>
-        {subtask.task.state === "accepted" ? "✓" : null}
+        {subtask.task.state === "accepted" ? (
+          <CheckIcon className="size-3" strokeWidth={3} />
+        ) : null}
       </div>
       <div className="min-w-0">
         <button
@@ -403,7 +407,8 @@ export function OrganizationCanvas(props: {
   );
   const [accepting, setAccepting] = useState<OrganizationAcceptTarget | null>(null);
   const highlight = props.highlightThreadId ?? null;
-  const columns = Math.max(1, model.leads.length + (model.unassigned.length ? 1 : 0));
+  // Up to three lead cards per row; more wrap onto the next.
+  const columns = Math.min(3, Math.max(1, model.leads.length + (model.unassigned.length ? 1 : 0)));
 
   const cards = (
     <>
