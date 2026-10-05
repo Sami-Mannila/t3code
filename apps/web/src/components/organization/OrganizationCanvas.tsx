@@ -135,7 +135,6 @@ function ReviewLine(props: {
         styles["org-review"],
         reviewer.id === props.highlightThreadId && styles["org-current"],
       )}
-      aria-label={`Open the reviewer conversation: ${reviewer.title}`}
       onClick={() => props.onOpenThread(reviewer)}
     >
       {content}
@@ -193,11 +192,11 @@ function RoleCard(props: {
         className={styles["org-header"]}
         onClick={() => props.onOpenThread(thread)}
       >
-        <div className={styles["org-role"]}>
+        <span className={styles["org-role"]}>
           <Dot thread={thread} />
           {ROLE_LABELS[thread.source.organization!.role]}
-        </div>
-        <div className={styles["org-title"]}>{thread.title}</div>
+        </span>
+        <span className={styles["org-title"]}>{thread.title}</span>
         <Meta thread={thread} />
       </button>
     </article>
@@ -226,27 +225,26 @@ function SubtaskRow(props: {
         <button
           type="button"
           className={styles["org-item-main"]}
-          aria-label={`Open the executor conversation: ${executor.title}`}
           onClick={() => props.onOpenThread(executor)}
         >
-          <div className={styles["org-item-title"]}>
+          <span className={styles["org-item-title"]}>
             {subtask.number} · {subtask.task.title}
-          </div>
-          <div className={styles["org-sub"]}>
+          </span>
+          <span className={styles["org-sub"]}>
             <Dot thread={executor} />
             <Truncated
               className={styles["org-sub-truncate"]}
               text={`Executor · ${threadModelLabel(executor)} · ${threadActivity(executor)}`}
             />
-          </div>
-          <div className={styles["org-sub"]}>
+          </span>
+          <span className={styles["org-sub"]}>
             <Truncated
               className={styles["org-sub-truncate"]}
               text={`${subtask.repository} · ${subtask.branch ?? "worktree not prepared"}`}
             />
-          </div>
+          </span>
           {subtask.needs.length > 0 || subtask.inCycle ? (
-            <div className={styles["org-sub"]}>
+            <span className={styles["org-sub"]}>
               {subtask.needs.map((need) => (
                 <span
                   key={need.threadId}
@@ -258,7 +256,7 @@ function SubtaskRow(props: {
               {subtask.inCycle ? (
                 <span className={styles["org-dep-cycle"]}>dependency cycle</span>
               ) : null}
-            </div>
+            </span>
           ) : null}
         </button>
         {subtask.review ? (
@@ -296,14 +294,13 @@ function LeadCard(props: {
       <button
         type="button"
         className={styles["org-header"]}
-        aria-label={`Open the project lead conversation: ${lead.title}`}
         onClick={() => props.onOpenThread(lead)}
       >
-        <div className={styles["org-role"]}>
+        <span className={styles["org-role"]}>
           <Dot thread={lead} />
           Project lead
-        </div>
-        <div className={styles["org-title"]}>{lead.title}</div>
+        </span>
+        <span className={styles["org-title"]}>{lead.title}</span>
         <Meta thread={lead} />
       </button>
       {outcome ? (

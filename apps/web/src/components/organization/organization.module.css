@@ -116,7 +116,7 @@
   border-radius: 12px;
   background: var(--background);
   padding: 12px 14px;
-  box-shadow: 0 1px 2px #0000000d;
+  box-shadow: 0 1px 2px color-mix(in srgb, var(--foreground) 5%, transparent);
 }
 .org-current {
   outline: 2px solid var(--primary);
@@ -141,6 +141,7 @@
   color: var(--muted-foreground);
 }
 .org-title {
+  display: block;
   margin-top: 2px;
   font-size: 14px;
   font-weight: 600;
@@ -163,7 +164,7 @@
   background: var(--muted-foreground);
 }
 .org-dot-active {
-  background: #299b66;
+  background: var(--success);
 }
 .org-link {
   font-size: 12px;
@@ -199,16 +200,16 @@
   color: var(--primary);
 }
 .org-pill-review {
-  background: color-mix(in srgb, #b7791f 16%, transparent);
-  color: #b7791f;
+  background: color-mix(in srgb, var(--warning) 16%, transparent);
+  color: var(--warning-foreground);
 }
 .org-pill-accepted {
-  background: color-mix(in srgb, #299b66 16%, transparent);
-  color: #299b66;
+  background: color-mix(in srgb, var(--success) 16%, transparent);
+  color: var(--success-foreground);
 }
 .org-pill-blocked {
-  background: color-mix(in srgb, #c0392b 14%, transparent);
-  color: #c0392b;
+  background: color-mix(in srgb, var(--destructive) 14%, transparent);
+  color: var(--destructive-foreground);
 }
 .org-sub {
   display: flex;
@@ -243,11 +244,11 @@
   text-decoration: underline;
 }
 .org-review-accepted {
-  color: #299b66;
+  color: var(--success-foreground);
   font-weight: 600;
 }
 .org-review-rejected {
-  color: #c0392b;
+  color: var(--destructive-foreground);
   font-weight: 600;
 }
 .org-rounds {
@@ -265,7 +266,7 @@
   font-size: 11.5px;
 }
 .org-dep-cycle {
-  color: #c0392b;
+  color: var(--destructive-foreground);
 }
 .org-todo {
   margin-top: 10px;
@@ -290,6 +291,7 @@
   text-align: left;
 }
 .org-item-title {
+  display: block;
   font-size: 13.5px;
   font-weight: 600;
   line-height: 1.35;
@@ -307,15 +309,15 @@
   font-size: 11px;
 }
 .org-check-done {
-  border-color: #299b66;
-  background: #299b66;
-  color: #fff;
+  border-color: var(--success);
+  background: var(--success);
+  color: var(--background);
 }
 .org-check-wip {
   border-color: var(--primary);
 }
 .org-check-blocked {
-  border-color: #c0392b;
+  border-color: var(--destructive);
 }
 .org-empty-list {
   padding: 8px 6px;

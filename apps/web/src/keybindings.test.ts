@@ -240,6 +240,15 @@ describe("organization panel shortcut", () => {
         ),
         "organization.toggle",
       );
+    // macOS reports Option+O as "ø"; the physical key still names the shortcut.
+    assert.equal(
+      resolveShortcutCommand(
+        event({ key: "ø", code: "KeyO", altKey: true, metaKey: true }),
+        DEFAULT_RESOLVED_KEYBINDINGS,
+        { platform: "MacIntel", context: { terminalFocus: false } },
+      ),
+      "organization.toggle",
+    );
     assert.lengthOf(
       DEFAULT_RESOLVED_KEYBINDINGS.filter(
         (binding) =>
