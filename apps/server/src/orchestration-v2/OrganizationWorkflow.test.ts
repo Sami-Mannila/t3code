@@ -1,3 +1,4 @@
+import type { organizationTaskContext } from "./OrganizationTaskContext.ts";
 import { McpSchema, McpServer } from "effect/unstable/ai";
 import * as McpHttpServer from "../mcp/McpHttpServer.ts";
 import * as McpInvocationContext from "../mcp/McpInvocationContext.ts";
@@ -577,11 +578,11 @@ it.effect(
         });
       }
       const server = yield* McpServer.McpServer;
-      const invoke = (args: Record<string, unknown>) =>
+      const invoke = (args: Record<string, unknown>, actorId = reviewerId) =>
         server.callTool({ name: "t3_organization_task", arguments: args }).pipe(
           Effect.provideService(McpInvocationContext.McpInvocationContext, {
             environmentId: EnvironmentId.make("organization-test"),
-            threadId: reviewerId,
+            threadId: actorId,
             providerSessionId: "native-reviewer-session",
             providerInstanceId: modelSelection.instanceId,
             capabilities: new Set(["orchestration"] as const),
@@ -600,8 +601,18 @@ it.effect(
           threadId: string;
           workspace: string;
           organization: OrganizationThread;
-        };
+        } & ReturnType<typeof organizationTaskContext>;
         assert.equal(content.threadId, executorId);
+        assert.equal(content.currentOwner?.threadId, reviewerId);
+        assert.equal(content.currentOwner?.role, "reviewer");
+        assert.equal(content.reviewAssignment?.reviewerThreadId, reviewerId);
+        assert.equal(content.reviewAssignment?.taskThreadId, executorId);
+        assert.equal(content.reviewAssignment?.revision, content.organization.task?.revision);
+        assert.equal(content.organization.task?.reviewerThreadId, null);
+        assert.equal(content.organization.task?.reviewedRevision, null);
+        assert.equal(content.reviewAttestation, null);
+        assert.equal(content.artifactSources[0]?.workspace, readyExecutor.thread.worktreePath);
+
         assert.equal(content.workspace, readyExecutor.thread.worktreePath);
         assert.equal(content.organization.task?.files?.[0]?.path, "result.txt");
         assert.equal(content.organization.task?.files?.[0]?.bytes, 19);
@@ -616,8 +627,17 @@ it.effect(
         clientRequestId: "foreign-target-denied",
       });
       assert.equal((unrelated.structuredContent as { code: string }).code, "capability_denied");
+      const inspectedRevision = (yield* threads.getThreadProjection(executorId)).thread
+        .organization!.task!.revision!;
+      const staleReview = yield* invoke({
+        action: "accept_review",
+        clientRequestId: "stale-review-denied",
+        revision: "not-the-inspected-revision",
+      });
+      assert.equal((staleReview.structuredContent as { code: string }).code, "invalid_request");
       const accepted = yield* invoke({
         action: "accept_review",
+        revision: inspectedRevision,
         clientRequestId: "native-review-accept",
         notes: "Inspected the exact 19-byte manifest file independently.",
       });
@@ -626,6 +646,50 @@ it.effect(
       assert.equal(
         (yield* threads.getThreadProjection(executorId)).thread.organization?.task?.state,
         "accepted",
+      );
+      const approved = accepted.structuredContent as ReturnType<typeof organizationTaskContext>;
+      assert.equal(approved.reviewAttestation?.reviewerThreadId, reviewerId);
+      assert.equal(approved.reviewAssignment, null);
+      const outcome = (yield* threads.getThreadProjection(child.thread.id)).thread.organization!;
+      yield* threads.dispatch({
+        type: "thread.metadata.update",
+        commandId: CommandId.make("native-outcome-submit"),
+        threadId: child.thread.id,
+        organizationActorThreadId: child.thread.id,
+        organization: { ...outcome, task: { ...outcome.task!, state: "awaiting_review" } },
+      });
+      const finalReview = yield* orchestrator.dispatch({
+        ...reviewCommand,
+        commandId: CommandId.make("native-final-review"),
+        organizationReviewTaskThreadId: child.thread.id,
+        task: "Review the consolidated outcome",
+        title: "Outcome review",
+      });
+      const finalReviewerId = finalReview.storedEvents.find(
+        (event) => event.event.type === "thread.created",
+      )!.event.threadId;
+      const aggregateRead = yield* invoke(
+        { action: "read", clientRequestId: "aggregate-read" },
+        finalReviewerId,
+      );
+      const aggregate = aggregateRead.structuredContent as {
+        threadId: string;
+        organization: OrganizationThread;
+      } & ReturnType<typeof organizationTaskContext>;
+      assert.equal(aggregate.threadId, child.thread.id);
+      assert.equal(aggregate.reviewAssignment?.reviewerThreadId, finalReviewerId);
+      assert.equal(aggregate.artifactSources.length, 1);
+      assert.equal(aggregate.artifactSources[0]?.taskThreadId, executorId);
+      assert.deepEqual(aggregate.artifactSources[0]?.manifest, ["result.txt"]);
+      assert.equal(
+        yield* fs.readFileString(
+          `${aggregate.artifactSources[0]!.workspace}/${aggregate.artifactSources[0]!.manifest[0]}`,
+        ),
+        "organization proof\n",
+      );
+      assert.equal(
+        aggregate.artifactSources[0]?.acceptedRevision,
+        approved.reviewAttestation?.revision,
       );
     }).pipe(
       Effect.provide(

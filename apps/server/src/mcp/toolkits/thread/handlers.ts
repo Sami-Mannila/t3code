@@ -1,3 +1,4 @@
+import { organizationTaskContext } from "../../../orchestration-v2/OrganizationTaskContext.ts";
 import {
   CommandId,
   type RuntimeRequestId,
@@ -105,13 +106,26 @@ export const ThreadToolkitHandlersLive = ThreadToolkit.toLayer({
           code: "invalid_request",
           message: "This conversation has no organization task.",
         });
-      if (input.action === "read")
+      if (input.action === "read") {
+        const snapshot = yield* threads.getShellSnapshot().pipe(Effect.mapError(unavailable));
         return {
           threadId: projection.thread.id,
           organization,
           workspace: projection.thread.worktreePath,
+          ...organizationTaskContext(projection.thread, snapshot.threads),
         };
+      }
       const old = organization.task;
+      if (
+        (input.action === "accept_review" ||
+          (input.action === "request_changes" && source.organization?.role === "reviewer")) &&
+        (!input.revision || input.revision !== old.revision)
+      )
+        return yield* new OrchestratorMcpFailure({
+          code: "invalid_request",
+          message:
+            "Supply the exact submitted revision you inspected from t3_organization_task read. The submission may have changed; read and inspect it again before reviewing.",
+        });
       const task = {
         ...old,
         ...(input.notes ? { notes: input.notes } : {}),
@@ -186,7 +200,9 @@ export const ThreadToolkitHandlersLive = ThreadToolkit.toLayer({
       const updated = yield* threads
         .getThreadShell(projection.thread.id)
         .pipe(Effect.mapError(unavailable));
+      const snapshot = yield* threads.getShellSnapshot().pipe(Effect.mapError(unavailable));
       return {
+        ...organizationTaskContext(updated ?? projection.thread, snapshot.threads),
         threadId: projection.thread.id,
         organization: updated?.organization ?? null,
         workspace: projection.thread.worktreePath,

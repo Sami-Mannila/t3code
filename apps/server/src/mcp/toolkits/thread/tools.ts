@@ -1,6 +1,7 @@
 import {
   ScheduledTaskId,
   OrganizationThread,
+  OrganizationRole,
   ScheduledTask,
   OrchestrationSearchThreadsInput,
   OrchestrationSearchThreadsResult,
@@ -262,7 +263,7 @@ const ScheduledTaskRunTool = Tool.make("run_scheduled_task_now", {
 const OrganizationTaskTool = Tool.make("t3_organization_task", {
   ...commandTool,
   description:
-    "Read or update a canonical organization task. Actor identity is bound to this conversation. Omit threadId to use your task; reviewers automatically target their explicitly assigned submission (their own conversation ID is an alias for that target). Other reviewer targets are rejected. Submit hashes actual manifest files; reviewers accept only the exact submitted revision; lead outcomes require user acceptance. Keep user-facing updates in the Chief conversation.",
+    "Read or update a canonical organization task. Actor identity is bound to this conversation. Omit threadId to use your task; reviewers automatically target their explicitly assigned submission (their own conversation ID is an alias for that target). Other reviewer targets are rejected. Submit hashes actual manifest files; reviewers must supply the exact revision returned by read when calling accept_review or request_changes; mismatched revisions are rejected; lead outcomes require user acceptance. Read results distinguish reviewAssignment (current assigned reviewer) from reviewAttestation (completed review); null task.reviewerThreadId is normal before acceptance. artifactSources gives physical worktree locations, including child sources for a consolidated outcome. Keep user-facing updates in the Chief conversation.",
   parameters: Schema.Struct({
     threadId: Schema.optional(ThreadId),
     action: Schema.Literals([
@@ -275,6 +276,7 @@ const OrganizationTaskTool = Tool.make("t3_organization_task", {
       "accept_review",
       "request_changes",
     ]),
+    revision: Schema.optional(TrimmedNonEmptyString),
     manifest: Schema.optional(Schema.Array(TrimmedNonEmptyString)),
     title: Schema.optional(TrimmedNonEmptyString),
     dependencyThreadIds: Schema.optional(Schema.Array(ThreadId)),
@@ -286,6 +288,36 @@ const OrganizationTaskTool = Tool.make("t3_organization_task", {
     threadId: ThreadId,
     organization: Schema.NullOr(OrganizationThread),
     workspace: Schema.NullOr(Schema.String),
+    currentOwner: Schema.NullOr(
+      Schema.Struct({
+        threadId: ThreadId,
+        title: Schema.String,
+        role: Schema.NullOr(OrganizationRole),
+      }),
+    ),
+    reviewAssignment: Schema.NullOr(
+      Schema.Struct({
+        reviewerThreadId: ThreadId,
+        taskThreadId: ThreadId,
+        revision: Schema.String,
+      }),
+    ),
+    reviewAttestation: Schema.NullOr(
+      Schema.Struct({ reviewerThreadId: ThreadId, revision: Schema.String }),
+    ),
+    protocol: Schema.String,
+    artifactSources: Schema.Array(
+      Schema.Struct({
+        taskThreadId: ThreadId,
+        workspace: Schema.NullOr(Schema.String),
+        manifest: Schema.Array(Schema.String),
+        submittedRevision: Schema.NullOr(Schema.String),
+        acceptedRevision: Schema.NullOr(Schema.String),
+        files: Schema.Array(
+          Schema.Struct({ path: Schema.String, sha256: Schema.String, bytes: Schema.Number }),
+        ),
+      }),
+    ),
   }),
 }).annotate(Tool.Destructive, true);
 

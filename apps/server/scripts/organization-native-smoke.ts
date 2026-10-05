@@ -1,4 +1,9 @@
 // @effect-diagnostics globalFetch:off globalConsole:off globalConsoleInEffect:off - Host-side pilot uses sanitized CLI output and an in-memory OAuth exchange before native Effect RPC.
+import {
+  pilotFailureReceipt,
+  hasNewPilotFailure,
+  type PilotFailureReceipt,
+} from "./organizationPilotObservation.ts";
 import * as NodeCrypto from "@effect/platform-node/NodeCrypto";
 /** Disposable native-RPC pilot. Does not start a server and refuses model work without --authorized-run.
  * Run from the fork root with its private T3_PILOT_BOOTSTRAP_TOKEN already in the environment.
@@ -34,11 +39,17 @@ const origin = "http://127.0.0.1:3783";
 const workspaceRoot = `${process.cwd()}/.t3-pilot/project`;
 const token = process.env.T3_PILOT_BOOTSTRAP_TOKEN?.trim();
 const probeOnly = process.argv.includes("--probe-only");
+const observeIndex = process.argv.indexOf("--observe-chief");
+const observeChief = observeIndex >= 0 ? process.argv[observeIndex + 1]?.trim() : undefined;
+if (observeIndex >= 0 && (!observeChief || observeChief.startsWith("--")))
+  throw new Error("--observe-chief requires an exact existing Chief thread ID.");
 const resumeIndex = process.argv.indexOf("--resume-chief");
 const resumeChief = resumeIndex >= 0 ? process.argv[resumeIndex + 1]?.trim() : undefined;
 if (resumeIndex >= 0 && (!resumeChief || resumeChief.startsWith("--")))
   throw new Error("--resume-chief requires an exact existing Chief thread ID.");
-if (!process.argv.includes("--authorized-run") && !probeOnly) {
+if (resumeChief && observeChief) throw new Error("Choose recovery or observation, not both.");
+const existingChief = resumeChief ?? observeChief;
+if (!process.argv.includes("--authorized-run") && !probeOnly && !observeChief) {
   console.log(
     "Prepared only: isolated native pilot, loopback 3783, no server or model calls. Root readiness approval is required before --authorized-run.",
   );
@@ -140,20 +151,19 @@ const program = Effect.gen(function* () {
       mark("read-only provider probe complete; no mutations or model calls");
       return;
     }
-    return yield* Effect.die(
-      "Required pilot provider/model is unavailable; no fallback or model call performed.",
-    );
+    if (!observeChief)
+      return yield* Effect.die(
+        "Required pilot provider/model is unavailable; no fallback or model call performed.",
+      );
   }
   let projectId: ProjectId;
   let threadId: ThreadId;
   let queueBehindActive = false;
-  const priorFailures = new Map<string, string>();
-  const failureReceipt = (thread: OrchestrationV2ThreadShell) =>
-    `${thread.latestRunId}:${thread.status}:${thread.organization?.task?.state}:${thread.organization?.task?.revision}:${thread.pendingRuntimeRequest?.id ?? ""}`;
-  if (resumeChief) {
+  const priorFailures = new Map<string, PilotFailureReceipt>();
+  if (existingChief) {
     mark("validate existing isolated Chief");
     const existing = yield* client[ORCHESTRATION_V2_WS_METHODS.getThreadProjection]({
-      threadId: ThreadId.make(resumeChief),
+      threadId: ThreadId.make(existingChief),
     });
     const snapshots = yield* client[ORCHESTRATION_V2_WS_METHODS.subscribeShell]({}).pipe(
       Stream.filter((item) => item.kind === "snapshot"),
@@ -177,12 +187,12 @@ const program = Effect.gen(function* () {
       (thread) => thread.id === threadId && thread.activeRunId !== null,
     );
     for (const thread of snapshot!.threads)
-      if (thread.projectId === projectId) priorFailures.set(thread.id, failureReceipt(thread));
+      if (thread.projectId === projectId) priorFailures.set(thread.id, pilotFailureReceipt(thread));
     mark("validated existing Chief; no project or role creation");
   } else {
     projectId = ProjectId.make(yield* uuid());
     threadId = ThreadId.make(yield* uuid());
-    const modelSelection = { instanceId: chiefProvider.instanceId, model: "gpt-6.1-sol" };
+    const modelSelection = { instanceId: chiefProvider!.instanceId, model: "gpt-6.1-sol" };
     mark("native project create RPC");
     yield* client[WS_METHODS.projectsMutate]({
       type: "project.create",
@@ -210,31 +220,35 @@ const program = Effect.gen(function* () {
     });
     console.log("Native pilot Chief created; task submission is confined to the isolated project.");
   }
-  mark("native user task dispatch RPC");
-  yield* client[ORCHESTRATION_V2_WS_METHODS.dispatchCommand]({
-    type: "message.dispatch",
-    commandId: CommandId.make(yield* uuid()),
-    createdBy: "user",
-    creationSource: "web",
-    threadId,
-    messageId: MessageId.make(yield* uuid()),
-    text: resumeChief
-      ? "The organization review lookup defect has been repaired and independently reviewed. Recover this existing isolated smoke workstream: ask the same project lead to resume its same assigned reviewer on the existing smoke-test.txt artifact. Do not create another Chief, outcome or executor task. Do not redo executor work unless independent review establishes a real artifact correction is necessary. Use the existing native task IDs and review assignment; no orgctl or duplicate coordinator. Finish the existing reviewed lead outcome awaiting my final acceptance, never accept it on my behalf. The only permitted artifact remains smoke-test.txt with exactly organization works followed by a newline, 19 bytes and SHA256 a74f3d39459e0245fe64e6360b24c033930204d115611ad5f5083c4fcb600707. No assets/research/credentials/production."
-      : "Run the isolated organization smoke described in AGENTS.md. Coordinate through a project lead, an executor and an independent reviewer using native T3 tools. Change only smoke-test.txt to exactly organization works followed by one newline (19 UTF-8 bytes; SHA256 a74f3d39459e0245fe64e6360b24c033930204d115611ad5f5083c4fcb600707). Use Codex gpt-6.1-sol for coordination/review and OpenCode fireworks-ai/accounts/fireworks/models/deepseek-v4p1-flash for execution. No research, installation, external source access, or other files. Finish at reviewed final outcome awaiting my acceptance, do not accept on my behalf.",
-    attachments: [],
-    dispatchMode: { type: queueBehindActive ? "queue_after_active" : "start_immediately" },
-  });
-  mark("native task observation");
+  if (!observeChief) {
+    mark("native user task dispatch RPC");
+    yield* client[ORCHESTRATION_V2_WS_METHODS.dispatchCommand]({
+      type: "message.dispatch",
+      commandId: CommandId.make(yield* uuid()),
+      createdBy: "user",
+      creationSource: "web",
+      threadId,
+      messageId: MessageId.make(yield* uuid()),
+      text: resumeChief
+        ? "The organization review lookup defect has been repaired and independently reviewed. Recover this existing isolated smoke workstream: ask the same project lead to resume its same assigned reviewer on the existing smoke-test.txt artifact. Do not create another Chief, outcome or executor task. Do not redo executor work unless independent review establishes a real artifact correction is necessary. Use the existing native task IDs and review assignment; no orgctl or duplicate coordinator. Finish the existing reviewed lead outcome awaiting my final acceptance, never accept it on my behalf. The only permitted artifact remains smoke-test.txt with exactly organization works followed by a newline, 19 bytes and SHA256 a74f3d39459e0245fe64e6360b24c033930204d115611ad5f5083c4fcb600707. No assets/research/credentials/production."
+        : "Run the isolated organization smoke described in AGENTS.md. Coordinate through a project lead, an executor and an independent reviewer using native T3 tools. Change only smoke-test.txt to exactly organization works followed by one newline (19 UTF-8 bytes; SHA256 a74f3d39459e0245fe64e6360b24c033930204d115611ad5f5083c4fcb600707). Use Codex gpt-6.1-sol for coordination/review and OpenCode fireworks-ai/accounts/fireworks/models/deepseek-v4p1-flash for execution. No research, installation, external source access, or other files. Finish at reviewed final outcome awaiting my acceptance, do not accept on my behalf.",
+      attachments: [],
+      dispatchMode: { type: queueBehindActive ? "queue_after_active" : "start_immediately" },
+    });
+  }
+  mark(
+    observeChief ? "read-only existing Chief observation; no dispatch" : "native task observation",
+  );
   let reviewedOutcome = false;
   let failedThreadId: string | null = null;
   const show = (thread: OrchestrationV2ThreadShell) => {
     if (thread.projectId !== projectId || !thread.organization) return;
     const task = thread.organization.task;
     if (
-      (task?.state === "blocked" ||
-        ["failed", "interrupted", "cancelled"].includes(thread.status) ||
-        thread.pendingRuntimeRequest) &&
-      (!resumeChief || priorFailures.get(thread.id) !== failureReceipt(thread))
+      hasNewPilotFailure(
+        pilotFailureReceipt(thread),
+        existingChief ? priorFailures.get(thread.id) : undefined,
+      )
     ) {
       failedThreadId = thread.id;
       console.log(
