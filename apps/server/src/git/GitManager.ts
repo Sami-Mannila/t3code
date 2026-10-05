@@ -156,6 +156,11 @@ const PR_LOOKUP_NO_OPEN_PR_CACHE_TTL = Duration.minutes(5);
 const PR_LOOKUP_FAILURE_BASE_TTL = Duration.seconds(20);
 const PR_LOOKUP_FAILURE_MAX_TTL = Duration.minutes(15);
 const PR_LOOKUP_CACHE_CAPACITY = 2_048;
+// Background sweeps ask about the same branches every minute, and reading a
+// branch's remotes, upstream and default branch spawns several git processes
+// before the PR cache is even consulted. That layout changes only through
+// pushes and git actions, which refresh or bump the PR-lookup epoch.
+const BRANCH_LOOKUP_CONTEXT_TTL = Duration.seconds(60);
 const isSourceControlProviderError = Schema.is(SourceControlProviderError);
 
 /**
@@ -2143,10 +2148,11 @@ export const make = Effect.gen(function* () {
     });
     return mergeGitStatusParts(local, remote);
   });
-  const branchPullRequest: GitManager["Service"]["branchPullRequest"] = Effect.fn(
-    "branchPullRequest",
-  )(function* ({ cwd, branch }, options) {
-    const cacheCwd = yield* normalizeStatusCacheKey(cwd);
+  /** Remotes, upstream and default branch that select a branch's PR lookup; null without remotes. */
+  const readBranchLookupLayout = Effect.fn("readBranchLookupLayout")(function* (
+    cacheCwd: string,
+    branch: string,
+  ) {
     const remotes = yield* gitCore.execute({
       operation: "GitManager.branchPullRequest.remotes",
       cwd: cacheCwd,
@@ -2218,6 +2224,27 @@ export const make = Effect.gen(function* () {
     const defaultBranch = yield* gitCore
       .resolveDefaultBranchName(cacheCwd, defaultRemoteName)
       .pipe(Effect.orElseSucceed(() => null));
+    return { upstreamRef, remoteName, localBranchExists, defaultBranch };
+  });
+  const branchLookupLayoutCache = yield* Cache.makeWith(
+    (key: string) => {
+      const [cacheCwd = "", branch = ""] = key.split("\u0000");
+      return readBranchLookupLayout(cacheCwd, branch);
+    },
+    {
+      capacity: PR_LOOKUP_CACHE_CAPACITY,
+      timeToLive: (exit) => (Exit.isSuccess(exit) ? BRANCH_LOOKUP_CONTEXT_TTL : Duration.zero),
+    },
+  );
+  const branchPullRequest: GitManager["Service"]["branchPullRequest"] = Effect.fn(
+    "branchPullRequest",
+  )(function* ({ cwd, branch }, options) {
+    const cacheCwd = yield* normalizeStatusCacheKey(cwd);
+    const layoutKey = [cacheCwd, branch, String(prLookupEpoch(cacheCwd))].join("\u0000");
+    if (options?.refresh) yield* Cache.invalidate(branchLookupLayoutCache, layoutKey);
+    const layout = yield* detachStackFrame(Cache.get(branchLookupLayoutCache, layoutKey));
+    if (layout === null) return null;
+    const { upstreamRef, remoteName, localBranchExists, defaultBranch } = layout;
     const cacheKey = prLookupCacheKey(cacheCwd, {
       branch,
       upstreamRef,

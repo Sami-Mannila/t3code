@@ -319,4 +319,105 @@ describe("ThreadPullRequestServiceV2 reads", () => {
       }),
     ),
   );
+
+  it.effect(
+    "skips organization executor branches and reuses cached answers after checkpoints",
+    () =>
+      Effect.scoped(
+        Effect.gen(function* () {
+          const executor = {
+            ...threadShell("executor-thread"),
+            branch: "t3/organization/aaaaaaaaaaaaaaaaaaaaaaaa",
+            organization: { role: "executor" as const, parentThreadId: ThreadId.make("lead") },
+          };
+          // The same prefix outside an organization is an ordinary user branch.
+          const plain = { ...threadShell("plain-thread"), branch: "t3/organization/user-branch" };
+          const activation = yield* Deferred.make<void>();
+          const events = yield* PubSub.unbounded<OrchestrationV2DomainEvent>();
+          const lookups = yield* Queue.unbounded<{
+            readonly branch: string;
+            readonly refresh: boolean | undefined;
+          }>();
+          const project: OrchestrationProjectShell = {
+            id: ProjectId.make("project-1"),
+            title: "Project",
+            workspaceRoot: "/workspace/project",
+            defaultModelSelection: null,
+            scripts: [],
+            repositoryIdentity: null,
+            createdAt: "2026-08-01T00:00:00.000Z",
+            updatedAt: "2026-08-01T00:00:00.000Z",
+          };
+          const dependencies = Layer.mergeAll(
+            Layer.mock(Orchestrator.OrchestratorV2)({
+              streamDomainEvents: Stream.fromPubSub(events),
+              getShellSnapshot: () =>
+                Effect.succeed({
+                  schemaVersion: 2,
+                  snapshotSequence: 1,
+                  threads: [executor, plain],
+                  archivedThreads: [],
+                }),
+              getThreadEventSequence: () => Effect.succeed(1),
+              getThreadShell: (threadId) =>
+                Effect.succeed([executor, plain].find((thread) => thread.id === threadId) ?? null),
+            }),
+            Layer.mock(ProjectStore.ProjectStoreV2)({
+              listShells: () => Effect.succeed([project]),
+            }),
+            Layer.mock(GitManager.GitManager)({
+              branchPullRequest: ({ branch }, options) =>
+                Queue.offer(lookups, { branch, refresh: options?.refresh }).pipe(Effect.as(null)),
+            }),
+            Layer.mock(PullRequestService.PullRequestService)({}),
+            Layer.mock(RepositoryIdentityResolver.RepositoryIdentityResolver)({
+              resolve: () =>
+                Effect.succeed({
+                  canonicalKey: "github.com/pingdotgg/t3code",
+                  locator: {
+                    source: "git-remote" as const,
+                    remoteName: "origin",
+                    remoteUrl: "git@github.com:pingdotgg/t3code.git",
+                  },
+                  provider: "github" as const,
+                  displayName: "pingdotgg/t3code",
+                  owner: "pingdotgg",
+                  name: "t3code",
+                }),
+            }),
+            Layer.succeed(ServerActivation.ServerActivation, Deferred.await(activation)),
+            Layer.succeed(
+              Crypto.Crypto,
+              Crypto.make({
+                randomBytes: (size) => new Uint8Array(size).fill(1),
+                digest: (_algorithm, data) => Effect.succeed(data),
+              }),
+            ),
+            FileSystem.layerNoop({}),
+          );
+
+          yield* Effect.gen(function* () {
+            const service = yield* ThreadPullRequestService.make;
+            yield* service.start();
+            yield* Deferred.succeed(activation, undefined);
+            yield* service.drain;
+            expect(yield* Queue.takeAll(lookups)).toEqual([
+              { branch: plain.branch, refresh: false },
+            ]);
+
+            for (const thread of [executor, plain]) {
+              yield* PubSub.publish(events, {
+                type: "checkpoint.captured",
+                id: EventId.make(`event:checkpoint:${thread.id}`),
+                threadId: thread.id,
+                occurredAt: NOW,
+              } as unknown as OrchestrationV2DomainEvent);
+            }
+            expect(yield* Queue.take(lookups)).toEqual({ branch: plain.branch, refresh: false });
+            yield* service.drain;
+            expect(yield* Queue.size(lookups)).toBe(0);
+          }).pipe(Effect.provide(dependencies));
+        }),
+      ),
+  );
 });

@@ -165,6 +165,7 @@ export type ProjectionThreadPullRequests = Pick<
  */
 export type ProjectionSettlementCandidate = Pick<
   OrchestrationV2ThreadShell,
+  | "organization"
   | "id"
   | "projectId"
   | "branch"

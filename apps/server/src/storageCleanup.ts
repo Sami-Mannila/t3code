@@ -28,7 +28,10 @@ import * as Stream from "effect/Stream";
 
 import * as ServerConfig from "./config.ts";
 import * as GitManager from "./git/GitManager.ts";
-import { organizationRepositoryRoot } from "./orchestration-v2/OrganizationPolicy.ts";
+import {
+  isOrganizationExecutorBranch,
+  organizationRepositoryRoot,
+} from "./orchestration-v2/OrganizationPolicy.ts";
 import * as ProjectStore from "./orchestration-v2/ProjectStore.ts";
 import * as Orchestrator from "./orchestration-v2/Orchestrator.ts";
 import * as ProjectionStore from "./orchestration-v2/ProjectionStore.ts";
@@ -284,7 +287,12 @@ export const make = Effect.gen(function* () {
           });
           if (ancestor.exitCode !== 0) return;
           eligible = settings.worktreeUnchanged;
-          if (!eligible && settings.worktreeOnMerge && thread.branch !== null) {
+          if (
+            !eligible &&
+            settings.worktreeOnMerge &&
+            thread.branch !== null &&
+            !isOrganizationExecutorBranch(thread)
+          ) {
             const pullRequest = yield* gitManager.branchPullRequest(
               { cwd: worktreePath, branch: thread.branch },
               { refresh: true },
