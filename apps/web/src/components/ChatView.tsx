@@ -687,6 +687,7 @@ const DevicePanel = lazy(() =>
   import("./device/DevicePanel").then((module) => ({ default: module.DevicePanel })),
 );
 const FilePreviewPanel = lazy(() => import("./files/FilePreviewPanel"));
+const OrganizationPanel = lazy(() => import("./organization/OrganizationPanel"));
 const EMPTY_PENDING_FILE_SURFACE_IDS: ReadonlySet<string> = new Set();
 const TYPE_TO_FOCUS_EDITABLE_SELECTOR = [
   "input",
@@ -5271,6 +5272,12 @@ export default function ChatView(props: ChatViewProps) {
     if (!activeThreadRef || !pullRequestsSurfaceAvailable) return;
     useRightPanelStore.getState().open(activeThreadRef, "pull-requests");
   }, [activeThreadRef, pullRequestsSurfaceAvailable]);
+  const organizationSurfaceAvailable =
+    activeProject !== null && serverConfig?.environment.capabilities.organizationV1 === true;
+  const addOrganizationSurface = useCallback(() => {
+    if (!activeThreadRef || !organizationSurfaceAvailable) return;
+    useRightPanelStore.getState().open(activeThreadRef, "organization");
+  }, [activeThreadRef, organizationSurfaceAvailable]);
   const { state: deviceState, loaded: deviceStateLoaded } = useDeviceState(
     activeThreadRef?.environmentId ?? null,
   );
@@ -7760,6 +7767,14 @@ export default function ChatView(props: ChatViewProps) {
         return;
       }
 
+      if (command === "organization.toggle") {
+        if (!activeThreadRef || !organizationSurfaceAvailable) return;
+        event.preventDefault();
+        event.stopPropagation();
+        useRightPanelStore.getState().toggle(activeThreadRef, "organization");
+        return;
+      }
+
       if (command === "modelPicker.toggle") {
         event.preventDefault();
         event.stopPropagation();
@@ -7872,6 +7887,7 @@ export default function ChatView(props: ChatViewProps) {
     isServerThread,
     onInterrupt,
     onToggleDiff,
+    organizationSurfaceAvailable,
     pinThread,
     settleThread,
     supportsPinning,
@@ -10613,6 +10629,10 @@ export default function ChatView(props: ChatViewProps) {
       />
     ) : renderedRightPanelSurface?.kind === "pull-requests" && activeThreadRef ? (
       <ThreadPullRequestsPanel threadRef={activeThreadRef} />
+    ) : renderedRightPanelSurface?.kind === "organization" && activeThreadRef ? (
+      <Suspense fallback={null}>
+        <OrganizationPanel threadRef={activeThreadRef} />
+      </Suspense>
     ) : renderedRightPanelSurface?.kind === "device" ? (
       <Suspense fallback={null}>
         <DevicePanel
@@ -11493,6 +11513,7 @@ export default function ChatView(props: ChatViewProps) {
           onAddPullRequest={addPullRequestSurface}
           onAddPullRequests={addPullRequestsSurface}
           onAddDevice={addDeviceSurface}
+          onAddOrganization={addOrganizationSurface}
           browserAvailable={isPreviewSupportedInRuntime()}
           terminalAvailable={activeProject !== null}
           diffAvailable={isServerThread && isGitRepo}
@@ -11500,6 +11521,7 @@ export default function ChatView(props: ChatViewProps) {
           pullRequestAvailable={pullRequestSurfaceAvailable}
           pullRequestsAvailable={pullRequestsSurfaceAvailable}
           deviceAvailable={activeThreadRef !== null}
+          organizationAvailable={organizationSurfaceAvailable}
         >
           {rightPanelContent}
         </RightPanelTabs>
@@ -11548,6 +11570,7 @@ export default function ChatView(props: ChatViewProps) {
             onAddPullRequest={addPullRequestSurface}
             onAddPullRequests={addPullRequestsSurface}
             onAddDevice={addDeviceSurface}
+            onAddOrganization={addOrganizationSurface}
             browserAvailable={isPreviewSupportedInRuntime()}
             terminalAvailable={activeProject !== null}
             diffAvailable={isServerThread && isGitRepo}
@@ -11555,6 +11578,7 @@ export default function ChatView(props: ChatViewProps) {
             pullRequestAvailable={pullRequestSurfaceAvailable}
             pullRequestsAvailable={pullRequestsSurfaceAvailable}
             deviceAvailable={activeThreadRef !== null}
+            organizationAvailable={organizationSurfaceAvailable}
           >
             {rightPanelContent}
           </RightPanelTabs>

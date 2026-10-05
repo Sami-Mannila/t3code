@@ -525,6 +525,29 @@ describe("rightPanelStore", () => {
     });
   });
 
+  it("keeps the organization as a singleton surface that toggles closed and back", () => {
+    const store = useRightPanelStore.getState();
+    store.open(refA, "files");
+    store.open(refA, "organization");
+    store.open(refA, "organization");
+    const opened = selectThreadRightPanelState(useRightPanelStore.getState().byThreadKey, refA);
+    expect(opened.surfaces).toEqual([
+      { id: "files", kind: "files" },
+      { id: "organization", kind: "organization" },
+    ]);
+    expect(opened.activeSurfaceId).toBe("organization");
+    store.toggle(refA, "organization");
+    expect(
+      selectThreadRightPanelState(useRightPanelStore.getState().byThreadKey, refA).isOpen,
+    ).toBe(false);
+    store.toggle(refA, "organization");
+    const reopened = selectThreadRightPanelState(useRightPanelStore.getState().byThreadKey, refA);
+    expect(reopened.isOpen).toBe(true);
+    expect(reopened.surfaces.filter((surface) => surface.kind === "organization")).toHaveLength(1);
+    // Another thread's panel is its own.
+    expect(selectActiveRightPanel(useRightPanelStore.getState().byThreadKey, refB)).toBeNull();
+  });
+
   it("keeps files as a singleton surface", () => {
     useRightPanelStore.getState().open(refA, "files");
     useRightPanelStore.getState().open(refA, "files");

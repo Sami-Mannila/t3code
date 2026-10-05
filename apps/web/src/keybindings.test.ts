@@ -226,6 +226,30 @@ describe("settle thread shortcut", () => {
   });
 });
 
+describe("organization panel shortcut", () => {
+  it("toggles the organization with mod+alt+o, which no other default claims", () => {
+    for (const [platform, modifier] of [
+      ["MacIntel", { metaKey: true }],
+      ["Linux", { ctrlKey: true }],
+    ] as const)
+      assert.equal(
+        resolveShortcutCommand(
+          event({ key: "o", altKey: true, ...modifier }),
+          DEFAULT_RESOLVED_KEYBINDINGS,
+          { platform, context: { terminalFocus: false } },
+        ),
+        "organization.toggle",
+      );
+    assert.lengthOf(
+      DEFAULT_RESOLVED_KEYBINDINGS.filter(
+        (binding) =>
+          binding.shortcut.key === "o" && binding.shortcut.altKey && binding.shortcut.modKey,
+      ),
+      1,
+    );
+  });
+});
+
 describe("thread undo shortcut", () => {
   it("resolves mod+z with nothing editable focused", () => {
     assert.equal(

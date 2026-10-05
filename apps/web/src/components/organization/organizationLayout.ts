@@ -3,6 +3,7 @@ import type {
   EnvironmentId,
   ProjectId,
   OrganizationRole,
+  OrganizationTask,
   OrganizationThread,
 } from "@t3tools/contracts";
 
@@ -13,30 +14,91 @@ export const ROLE_LABELS: Record<OrganizationRole, string> = {
   executor: "Executor",
   reviewer: "Reviewer",
 };
-export type OrganizationNode = {
-  id: string;
-  kind: "role" | "task" | "boundary";
-  x: number;
-  y: number;
-  width: number;
-  height: number;
-  thread?: EnvironmentThreadShell;
-  label: string;
-  owner?: EnvironmentThreadShell | undefined;
-};
-export type OrganizationEdge = {
-  from: string;
-  to: string;
-  kind: "command" | "dependency" | "review";
-};
-/** Scope before indexing: thread IDs from another environment can never acquire local authority. */
-export function organizationLayout(
-  all: readonly EnvironmentThreadShell[],
+
+type Shell = EnvironmentThreadShell;
+
+/** Where a review of the current submission stands; null when nothing is under review. */
+export type OrganizationReviewState =
+  | "awaiting_reviewer"
+  | "inspecting"
+  | "accepted"
+  | "changes_requested";
+
+export interface OrganizationReview {
+  readonly state: OrganizationReviewState;
+  /** The reviewer conversation, when it is in view. */
+  readonly reviewer: Shell | undefined;
+  readonly revision: string | null;
+  readonly notes: string | null;
+}
+
+/**
+ * An earlier review round: a reviewer conversation that targeted this task before the current
+ * one. Only the most recent "changes requested" verdict is recorded on the task, so older rounds
+ * show their reviewer without a verdict.
+ */
+export interface OrganizationReviewRound {
+  readonly round: number;
+  readonly reviewer: Shell;
+  readonly verdict: "changes_requested" | null;
+  readonly notes: string | null;
+}
+
+export interface OrganizationSubtask {
+  readonly thread: Shell;
+  readonly task: OrganizationTask;
+  /** 1-based position in dependency order among its siblings. */
+  readonly number: number;
+  readonly repository: string;
+  readonly branch: string | null;
+  /** "needs n" for a sibling, otherwise the prerequisite's title or that it is out of view. */
+  readonly needs: ReadonlyArray<{ readonly threadId: string; readonly label: string }>;
+  readonly review: OrganizationReview | null;
+  readonly earlierRounds: ReadonlyArray<OrganizationReviewRound>;
+  readonly inCycle: boolean;
+}
+
+export interface OrganizationLeadCard {
+  readonly lead: Shell;
+  readonly outcome: OrganizationTask | undefined;
+  readonly outcomeReview: OrganizationReview | null;
+  readonly outcomeEarlierRounds: ReadonlyArray<OrganizationReviewRound>;
+  readonly subtasks: ReadonlyArray<OrganizationSubtask>;
+  readonly canAccept: boolean;
+}
+
+export interface OrganizationModel {
+  /** Chief and Advisor conversations. */
+  readonly roots: ReadonlyArray<Shell>;
+  readonly leads: ReadonlyArray<OrganizationLeadCard>;
+  /** Executor tasks whose lead is not in view. */
+  readonly unassigned: ReadonlyArray<OrganizationSubtask>;
+  readonly warnings: ReadonlyArray<string>;
+  readonly empty: boolean;
+}
+
+const createdOrder = (a: Shell, b: Shell) =>
+  a.createdAt.localeCompare(b.createdAt) || a.id.localeCompare(b.id);
+
+/** "running", "idle", …: the conversation's live activity. */
+export const threadActivity = (thread: Shell) => thread.runtime?.status ?? "idle";
+export const threadIsActive = (thread: Shell) => thread.runtime?.activeRunId != null;
+export const threadModelLabel = (thread: Shell) =>
+  `${thread.modelSelection.instanceId} · ${thread.modelSelection.model}`;
+
+/**
+ * The organization of one project as cards: Chief and Advisor, then one card per project lead
+ * with its outcome and its executors' tasks as an ordered checklist. Reviewers appear as review
+ * lines under the task they review. Scoped before indexing, so a thread ID from another
+ * environment never acquires a place here.
+ */
+export function organizationModel(
+  all: readonly Shell[],
   environmentId: EnvironmentId,
   projectId: ProjectId,
   workstream = "",
-) {
-  const projectThreads = all.filter(
+): OrganizationModel {
+  const threads = all.filter(
     (t) =>
       t.environmentId === environmentId &&
       t.projectId === projectId &&
@@ -44,226 +106,163 @@ export function organizationLayout(
       !t.archivedAt &&
       t.source.organization,
   );
-  const projectById = new Map<string, EnvironmentThreadShell>(projectThreads.map((t) => [t.id, t]));
-  const threads = workstream
-    ? projectThreads.filter((t) => {
-        if (["chief", "advisor"].includes(t.source.organization!.role)) return true;
-        let cursor: EnvironmentThreadShell | undefined = t;
-        const visited = new Set<string>();
-        while (cursor && !visited.has(cursor.id)) {
-          if (cursor.id === workstream) return true;
-          visited.add(cursor.id);
-          cursor = projectById.get(cursor.source.organization!.parentThreadId ?? "");
-        }
-        return false;
-      })
-    : projectThreads;
-  const byId = new Map<string, EnvironmentThreadShell>(threads.map((t) => [t.id, t]));
-  const tasks = threads.filter((t) => t.source.organization?.task);
-  const needed = new Set(
-    tasks.flatMap((t) => [
-      t.source.organization!.task!.ownerThreadId,
-      ...(byId.get(t.source.organization!.task!.ownerThreadId)?.source.organization?.role ===
-      "reviewer"
-        ? [t.id]
-        : []),
-      ...(t.source.organization!.task!.state === "changes_requested" &&
-      t.source.organization!.task!.lastReview?.revision === t.source.organization!.task!.revision
-        ? [t.source.organization!.task!.lastReview!.reviewerThreadId]
-        : []),
-      ...(["awaiting_review", "changes_requested"].includes(t.source.organization!.task!.state) &&
-      t.source.organization!.task!.reviewerThreadId
-        ? [t.source.organization!.task!.reviewerThreadId!]
-        : []),
-    ]),
-  );
-  const roles = threads.filter(
-    (t) =>
-      ["advisor", "chief", "lead"].includes(t.source.organization!.role) ||
-      needed.has(t.id) ||
-      t.runtime?.activeRunId != null,
-  );
-  const nodes: OrganizationNode[] = [];
-  const edges: OrganizationEdge[] = [];
-  const warnings: string[] = [];
-  const rank = new Map<string, number>();
-  const visiting = new Set<string>();
-  function depth(id: string): number {
-    if (rank.has(id)) return rank.get(id)!;
-    if (visiting.has(id)) {
-      warnings.push("Dependency cycle: inspect the linked conversations.");
-      return 0;
-    }
-    visiting.add(id);
-    const t = tasks.find((t) => t.id === id);
-    const deps = t?.source.organization?.task?.dependencyThreadIds ?? [];
-    const value = deps.length ? 1 + Math.max(...deps.map((d) => (byId.has(d) ? depth(d) : 0))) : 0;
-    visiting.delete(id);
-    rank.set(id, value);
-    return value;
+  const byId = new Map<string, Shell>(threads.map((t) => [t.id, t]));
+  const role = (t: Shell | undefined) => t?.source.organization?.role;
+  const reviewersByTarget = new Map<string, Shell[]>();
+  for (const t of threads) {
+    const target = t.source.organization!.reviewTaskThreadId;
+    if (role(t) !== "reviewer" || !target) continue;
+    const list = reviewersByTarget.get(target) ?? [];
+    list.push(t);
+    reviewersByTarget.set(target, list);
   }
-  tasks.forEach((t) => depth(t.id));
-  const leadOwned = tasks.filter((t) =>
-    ["chief", "lead", "advisor"].includes(
-      byId.get(t.source.organization!.task!.ownerThreadId)?.source.organization?.role ?? "",
-    ),
-  );
-  const maxRank = Math.max(0, ...leadOwned.map((t) => rank.get(t.id) ?? 0));
-  const leadX = (maxRank + 1) * 280 + 80;
-  let top = 50;
-  for (const role of roles.filter((t) =>
-    ["chief", "advisor"].includes(t.source.organization!.role),
-  )) {
-    nodes.push({
-      id: `role:${role.id}`,
-      kind: "role",
-      x: leadX,
-      y: top,
-      width: 220,
-      height: 116,
-      thread: role,
-      label: ROLE_LABELS[role.source.organization!.role],
-    });
-    top += 145;
-  }
-  const leads = roles.filter((t) => t.source.organization!.role === "lead");
-  const groupFor = (t: EnvironmentThreadShell): string => {
-    let cursor: EnvironmentThreadShell | undefined = t;
-    const seen = new Set<string>();
-    while (cursor && !seen.has(cursor.id)) {
-      seen.add(cursor.id);
-      if (cursor.source.organization?.role === "lead") return cursor.id;
-      cursor = byId.get(cursor.source.organization?.parentThreadId ?? "");
+  for (const list of reviewersByTarget.values()) list.sort(createdOrder);
+  const warnings = new Set<string>();
+
+  const reviewOf = (
+    target: Shell,
+  ): { review: OrganizationReview | null; earlier: OrganizationReviewRound[] } => {
+    const task = target.source.organization?.task;
+    if (!task) return { review: null, earlier: [] };
+    const attested =
+      task.reviewerThreadId !== null &&
+      task.reviewedRevision !== null &&
+      task.reviewedRevision === task.revision;
+    let review: OrganizationReview | null = null;
+    let reviewerId: string | null = null;
+    if ((task.state === "awaiting_review" || task.state === "accepted") && attested) {
+      reviewerId = task.reviewerThreadId;
+      review = {
+        state: "accepted",
+        reviewer: byId.get(reviewerId!),
+        revision: task.reviewedRevision,
+        notes: null,
+      };
+    } else if (task.state === "awaiting_review") {
+      const owner = byId.get(task.ownerThreadId);
+      reviewerId = role(owner) === "reviewer" ? owner!.id : null;
+      review = {
+        state: reviewerId ? "inspecting" : "awaiting_reviewer",
+        reviewer: reviewerId ? owner : undefined,
+        revision: task.revision,
+        notes: null,
+      };
+    } else if (
+      task.state === "changes_requested" &&
+      task.lastReview &&
+      task.lastReview.revision === task.revision
+    ) {
+      reviewerId = task.lastReview.reviewerThreadId;
+      review = {
+        state: "changes_requested",
+        reviewer: byId.get(reviewerId),
+        revision: task.lastReview.revision,
+        notes: task.lastReview.notes ?? null,
+      };
     }
-    return "unassigned";
+    const rounds = reviewersByTarget.get(target.id) ?? [];
+    const earlier = rounds
+      .map((reviewer, index) => ({ reviewer, round: index + 1 }))
+      .filter(({ reviewer }) => reviewer.id !== reviewerId)
+      .map(({ reviewer, round }) => {
+        const rejected = task.lastReview?.reviewerThreadId === reviewer.id;
+        return {
+          round,
+          reviewer,
+          verdict: rejected ? ("changes_requested" as const) : null,
+          notes: rejected ? (task.lastReview!.notes ?? null) : null,
+        };
+      });
+    return { review, earlier };
   };
-  const groups = [...leads.map((t) => t.id as string), "unassigned"];
-  for (const group of groups) {
-    const groupTasks = tasks.filter((t) => groupFor(t) === group);
-    const lead = byId.get(group);
-    if (!lead && !groupTasks.length) continue;
-    const y = top;
-    let backlog = 0;
-    let row = 0;
-    if (lead)
-      nodes.push({
-        id: `role:${lead.id}`,
-        kind: "role",
-        x: leadX,
-        y,
-        width: 220,
-        height: 116,
-        thread: lead,
-        label: "Project lead",
-      });
-    const placed = new Set<string>();
-    for (const task of groupTasks) {
-      const meta = task.source.organization!.task!;
-      const owner = byId.get(meta.ownerThreadId);
-      const management =
-        !owner || ["chief", "advisor", "lead"].includes(owner.source.organization!.role);
-      let tx: number, ty: number;
-      if (management) {
-        tx = (rank.get(task.id) ?? 0) * 280;
-        ty = y + backlog++ * 148;
-      } else {
-        ty = y + row++ * 180;
-        tx = leadX + 520;
-        const executor =
-          task.source.organization!.role === "executor"
-            ? task
-            : owner.source.organization!.role === "executor"
-              ? owner
-              : undefined;
-        const reviewer =
-          meta.state === "changes_requested" && meta.lastReview?.revision === meta.revision
-            ? byId.get(meta.lastReview!.reviewerThreadId)
-            : meta.reviewerThreadId && meta.reviewedRevision === meta.revision
-              ? byId.get(meta.reviewerThreadId)
-              : owner.source.organization!.role === "reviewer"
-                ? owner
-                : undefined;
-        for (const [person, rx] of [
-          [executor, leadX + 270],
-          [reviewer, leadX + 790],
-          [!executor && !reviewer ? owner : undefined, leadX + 270],
-        ] as const) {
-          if (person && !placed.has(person.id)) {
-            placed.add(person.id);
-            nodes.push({
-              id: `role:${person.id}`,
-              kind: "role",
-              x: rx,
-              y: ty,
-              width: 220,
-              height: 116,
-              thread: person,
-              label: ROLE_LABELS[person.source.organization!.role],
-            });
-          }
-        }
-        if (executor && reviewer)
-          edges.push({ from: `role:${reviewer.id}`, to: `role:${executor.id}`, kind: "review" });
-      }
-      nodes.push({
-        id: `task:${task.id}`,
-        kind: "task",
-        x: tx,
-        y: ty,
-        width: 240,
-        height: canAcceptOrganizationOutcome(task) ? 160 : 116,
-        thread: task,
-        owner,
-        label: meta.title,
-      });
+
+  /** Dependency order among siblings; members of a cycle keep creation order at the end. */
+  const checklist = (executors: Shell[]): OrganizationSubtask[] => {
+    const siblings = new Set(executors.map((t) => t.id as string));
+    const pending = new Map(
+      executors.map((t) => [
+        t.id as string,
+        new Set(
+          t.source.organization!.task!.dependencyThreadIds.filter(
+            (id) => siblings.has(id) && id !== t.id,
+          ),
+        ),
+      ]),
+    );
+    const ordered: Shell[] = [];
+    const remaining = [...executors].sort(createdOrder);
+    while (remaining.length) {
+      const index = remaining.findIndex((t) => pending.get(t.id)!.size === 0);
+      if (index === -1) break;
+      const [next] = remaining.splice(index, 1);
+      ordered.push(next!);
+      for (const deps of pending.values()) deps.delete(next!.id);
     }
-    top += Math.max(1, backlog, row) * 180 + 80;
+    const cyclic = new Set(remaining.map((t) => t.id as string));
+    if (cyclic.size) warnings.add("Dependency cycle: inspect the linked conversations.");
+    ordered.push(...remaining);
+    const numbers = new Map(ordered.map((t, index) => [t.id as string, index + 1]));
+    return ordered.map((thread, index) => {
+      const task = thread.source.organization!.task!;
+      const { review, earlier } = reviewOf(thread);
+      return {
+        thread,
+        task,
+        number: index + 1,
+        repository: task.repository ?? ".",
+        branch: thread.branch,
+        needs: [...new Set(task.dependencyThreadIds)].map((id) => ({
+          threadId: id,
+          label: numbers.has(id)
+            ? String(numbers.get(id))
+            : (byId.get(id)?.source.organization?.task?.title ??
+              byId.get(id)?.title ??
+              "a task outside this view"),
+        })),
+        review,
+        earlierRounds: earlier,
+        inCycle: cyclic.has(thread.id),
+      };
+    });
+  };
+
+  const executorsByLead = new Map<string, Shell[]>();
+  const orphans: Shell[] = [];
+  for (const t of threads) {
+    if (role(t) !== "executor" || !t.source.organization!.task) continue;
+    const parent = byId.get(t.source.organization!.parentThreadId ?? "");
+    if (role(parent) !== "lead") {
+      orphans.push(t);
+      continue;
+    }
+    const list = executorsByLead.get(parent!.id) ?? [];
+    list.push(t);
+    executorsByLead.set(parent!.id, list);
   }
-  // Native role conversations without tasks remain addressable, without inventing workers.
-  for (const role of roles)
-    if (!nodes.some((n) => n.id === `role:${role.id}`)) {
-      nodes.push({
-        id: `role:${role.id}`,
-        kind: "role",
-        x: leadX + 270,
-        y: top,
-        width: 220,
-        height: 116,
-        thread: role,
-        label: ROLE_LABELS[role.source.organization!.role],
-      });
-      top += 145;
-    }
-  for (const task of tasks)
-    for (const dependency of new Set(task.source.organization!.task!.dependencyThreadIds)) {
-      const from = `task:${dependency}`;
-      if (!nodes.some((n) => n.id === from)) {
-        nodes.push({
-          id: from,
-          kind: "boundary",
-          x: 0,
-          y: top,
-          width: 240,
-          height: 70,
-          label: "Prerequisite outside this view",
-        });
-        top += 95;
-      }
-      edges.push({ from, to: `task:${task.id}`, kind: "dependency" });
-    }
-  for (const role of roles) {
-    const parent = role.source.organization!.parentThreadId;
-    if (parent && nodes.some((n) => n.id === `role:${parent}`))
-      edges.push({ from: `role:${parent}`, to: `role:${role.id}`, kind: "command" });
-  }
+  const leads = threads
+    .filter((t) => role(t) === "lead" && (!workstream || t.id === workstream))
+    .sort(createdOrder)
+    .map((lead) => {
+      const { review, earlier } = reviewOf(lead);
+      return {
+        lead,
+        outcome: lead.source.organization!.task,
+        outcomeReview: review,
+        outcomeEarlierRounds: earlier,
+        subtasks: checklist(executorsByLead.get(lead.id) ?? []),
+        canAccept: canAcceptOrganizationOutcome(lead),
+      };
+    });
+  const roots = threads
+    .filter((t) => role(t) === "chief" || role(t) === "advisor")
+    .sort((a, b) => (role(a) === role(b) ? createdOrder(a, b) : role(a) === "chief" ? -1 : 1));
+  const unassigned = workstream ? [] : checklist(orphans);
   return {
-    nodes,
-    edges: [
-      ...new Map(edges.map((edge) => [`${edge.kind}:${edge.from}:${edge.to}`, edge])).values(),
-    ],
-    warnings: [...new Set(warnings)],
-    width: Math.max(1000, ...nodes.map((n) => n.x + n.width)) + 80,
-    height: Math.max(400, ...nodes.map((n) => n.y + n.height)) + 80,
+    roots,
+    leads,
+    unassigned,
+    warnings: [...warnings],
+    empty: roots.length === 0 && leads.length === 0 && unassigned.length === 0,
   };
 }
 

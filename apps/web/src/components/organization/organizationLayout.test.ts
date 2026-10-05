@@ -1,13 +1,20 @@
 import { describe, expect, it } from "vite-plus/test";
-import { EnvironmentId, ProjectId, ThreadId, type OrganizationThread } from "@t3tools/contracts";
+import {
+  EnvironmentId,
+  ProjectId,
+  ThreadId,
+  type OrganizationTask,
+  type OrganizationThread,
+} from "@t3tools/contracts";
 import type { EnvironmentThreadShell } from "@t3tools/client-runtime/state/models";
 import {
   canAcceptOrganizationOutcome,
-  organizationLayout,
+  organizationModel,
   outcomeFileGroups,
 } from "./organizationLayout";
 const env = EnvironmentId.make("remote"),
   project = ProjectId.make("project");
+let created = 0;
 function role(
   id: string,
   organization: OrganizationThread,
@@ -18,9 +25,12 @@ function role(
     environmentId,
     projectId: project,
     title: id,
+    createdAt: `2026-01-01T00:00:${String(created++ % 60).padStart(2, "0")}.000Z`,
     deletedAt: null,
     archivedAt: null,
+    branch: null,
     runtime: null,
+    modelSelection: { instanceId: "codex", model: "gpt-6.1-sol" },
     source: { organization },
   } as unknown as EnvironmentThreadShell;
 }
@@ -29,12 +39,13 @@ function task(
   owner: string,
   deps: string[] = [],
   state: "queued" | "awaiting_review" = "queued",
+  parent = "lead",
 ) {
   return role(id, {
     role: "executor",
-    parentThreadId: ThreadId.make("lead"),
+    parentThreadId: ThreadId.make(parent),
     task: {
-      title: id,
+      title: `${id} work`,
       ownerThreadId: ThreadId.make(owner),
       dependencyThreadIds: deps.map((id) => ThreadId.make(id)),
       state,
@@ -45,102 +56,192 @@ function task(
     },
   });
 }
-const chief = role("chief", { role: "chief", parentThreadId: null });
-const lead = role("lead", { role: "lead", parentThreadId: chief.id });
-describe("native organization projection", () => {
-  it("scopes role authority and routes to the selected environment", () => {
-    const result = organizationLayout(
-      [
-        chief,
-        lead,
-        task("work", "lead"),
-        role("lead", { role: "reviewer", parentThreadId: null }, EnvironmentId.make("other")),
-      ],
-      env,
-      project,
-    );
-    expect(result.nodes.find((n) => n.id === "task:work")?.owner?.source.organization?.role).toBe(
-      "lead",
-    );
-    expect(result.nodes.every((n) => !n.thread || n.thread.environmentId === env)).toBe(true);
+/** The same shell with its task changed. */
+function withTask(thread: EnvironmentThreadShell, patch: Partial<OrganizationTask>) {
+  const organization = thread.source.organization!;
+  return {
+    ...thread,
+    source: {
+      ...thread.source,
+      organization: { ...organization, task: { ...organization.task!, ...patch } },
+    },
+  } as EnvironmentThreadShell;
+}
+const reviewerOf = (id: string, target: string, parent = "lead") =>
+  role(id, {
+    role: "reviewer",
+    parentThreadId: ThreadId.make(parent),
+    reviewTaskThreadId: ThreadId.make(target),
   });
-  it("places each ticket once, beside its reviewer, retaining its exact executor origin", () => {
-    const reviewer = role("reviewer", { role: "reviewer", parentThreadId: lead.id });
-    const result = organizationLayout(
-      [chief, lead, reviewer, task("submitted", "reviewer", [], "awaiting_review")],
-      env,
-      project,
-    );
-    expect(result.nodes.filter((n) => n.id === "task:submitted")).toHaveLength(1);
-    const ticket = result.nodes.find((n) => n.id === "task:submitted")!;
-    expect(ticket.owner?.id).toBe("reviewer");
-    expect(result.nodes.find((n) => n.id === "role:submitted")!.x).toBeLessThan(ticket.x);
-    expect(result.nodes.find((n) => n.id === "role:reviewer")!.x).toBeGreaterThan(ticket.x);
-    expect(result.edges).toContainEqual({
-      from: "role:reviewer",
-      to: "role:submitted",
-      kind: "review",
+const chief = role("chief", { role: "chief", parentThreadId: null });
+const advisor = role("advisor", { role: "advisor", parentThreadId: null });
+const lead = role("lead", { role: "lead", parentThreadId: chief.id });
+const model = (threads: EnvironmentThreadShell[], workstream = "") =>
+  organizationModel(threads, env, project, workstream);
+
+describe("organization cards", () => {
+  it("puts Chief before Advisor and scopes every card to the selected environment", () => {
+    const result = model([
+      advisor,
+      chief,
+      lead,
+      task("work", "work"),
+      role("lead", { role: "lead", parentThreadId: null }, EnvironmentId.make("other")),
+    ]);
+    expect(result.roots.map((t) => t.id)).toEqual(["chief", "advisor"]);
+    expect(result.leads).toHaveLength(1);
+    expect(result.leads[0]!.subtasks.map((s) => s.thread.id)).toEqual(["work"]);
+    expect(result.empty).toBe(false);
+  });
+
+  it("orders a lead's subtasks by dependency and labels what each needs", () => {
+    const result = model([
+      chief,
+      lead,
+      task("c", "c", ["b", "a"]),
+      task("b", "b", ["a"]),
+      task("a", "a"),
+      task("d", "d", ["external"]),
+    ]);
+    const subtasks = result.leads[0]!.subtasks;
+    expect(subtasks.map((s) => `${s.number}:${s.thread.id}`)).toEqual(["1:a", "2:b", "3:c", "4:d"]);
+    expect(subtasks[2]!.needs.map((need) => need.label)).toEqual(["2", "1"]);
+    expect(subtasks[3]!.needs.map((need) => need.label)).toEqual(["a task outside this view"]);
+    expect(result.warnings).toEqual([]);
+  });
+
+  it("flags a dependency cycle without losing its tasks", () => {
+    const result = model([
+      chief,
+      lead,
+      task("a", "a", ["b"]),
+      task("b", "b", ["a"]),
+      task("c", "c"),
+    ]);
+    const subtasks = result.leads[0]!.subtasks;
+    expect(subtasks.map((s) => s.thread.id)).toEqual(["c", "a", "b"]);
+    expect(subtasks.filter((s) => s.inCycle).map((s) => s.thread.id)).toEqual(["a", "b"]);
+    expect(result.warnings).toHaveLength(1);
+  });
+
+  it("shows executors whose lead is not in view as unassigned, and hides them in a workstream", () => {
+    const orphan = task("orphan", "orphan", [], "queued", "gone-lead");
+    expect(model([chief, lead, orphan]).unassigned.map((s) => s.thread.id)).toEqual(["orphan"]);
+    const other = role("other-lead", { role: "lead", parentThreadId: chief.id });
+    const scoped = model([chief, lead, other, orphan, task("local", "local")], "lead");
+    expect(scoped.leads.map((card) => card.lead.id)).toEqual(["lead"]);
+    expect(scoped.unassigned).toEqual([]);
+    expect(scoped.roots.map((t) => t.id)).toEqual(["chief"]);
+  });
+
+  it("leaves archived conversations and idle executors without tasks out", () => {
+    const idle = role("historical", { role: "executor", parentThreadId: lead.id });
+    const result = model([chief, lead, idle, { ...task("old", "old"), archivedAt: "2026-01-01" }]);
+    expect(result.leads[0]!.subtasks).toEqual([]);
+    expect(result.unassigned).toEqual([]);
+  });
+
+  it("reports an empty organization", () => {
+    expect(model([]).empty).toBe(true);
+  });
+});
+
+describe("review lines", () => {
+  it("follows a submission from awaiting a reviewer through inspection to acceptance", () => {
+    const submitted = withTask(task("work", "work"), {
+      state: "awaiting_review",
+      revision: "abcdef",
+    });
+    expect(model([chief, lead, submitted]).leads[0]!.subtasks[0]!.review).toMatchObject({
+      state: "awaiting_reviewer",
+      reviewer: undefined,
+      revision: "abcdef",
+    });
+    const reviewer = reviewerOf("reviewer", "work");
+    const inspecting = withTask(submitted, { ownerThreadId: reviewer.id });
+    expect(model([chief, lead, reviewer, inspecting]).leads[0]!.subtasks[0]!.review).toMatchObject({
+      state: "inspecting",
+      reviewer: { id: "reviewer" },
+    });
+    const accepted = withTask(inspecting, {
+      state: "accepted",
+      reviewedRevision: "abcdef",
+      reviewerThreadId: reviewer.id,
+    });
+    expect(model([chief, lead, reviewer, accepted]).leads[0]!.subtasks[0]!.review).toMatchObject({
+      state: "accepted",
+      reviewer: { id: "reviewer" },
+      revision: "abcdef",
     });
   });
-  it("preserves all shared-root and chain links with vertically spread backlog", () => {
-    const tasks = Array.from({ length: 7 }, (_, i) =>
-      task(`t${i}`, "lead", i === 0 ? [] : i === 1 ? ["t0"] : ["t0", `t${i - 1}`]),
-    );
-    const result = organizationLayout([chief, lead, ...tasks], env, project);
-    expect(result.edges.filter((e) => e.kind === "dependency")).toHaveLength(11);
-    expect(new Set(result.nodes.filter((n) => n.kind === "task").map((n) => n.y)).size).toBe(7);
-    expect(
-      result.nodes
-        .filter((n) => n.kind === "task")
-        .every((n) => n.x < result.nodes.find((n) => n.id === "role:lead")!.x),
-    ).toBe(true);
-  });
-  it("contains cyclic data and represents missing prerequisites without inventing owners", () => {
-    const result = organizationLayout(
-      [chief, lead, task("a", "lead", ["b", "external", "external"]), task("b", "lead", ["a"])],
-      env,
-      project,
-    );
-    expect(result.warnings).toHaveLength(1);
-    expect(result.nodes.filter((n) => n.kind === "boundary")).toHaveLength(1);
-    expect(result.edges.filter((e) => e.kind === "dependency")).toHaveLength(3);
-    expect(result.nodes.every((n) => Number.isFinite(n.x) && Number.isFinite(n.y))).toBe(true);
-  });
-  it("filters a lead workstream but keeps cross-workstream dependencies as boundaries", () => {
-    const other = role("other-lead", { role: "lead", parentThreadId: chief.id });
-    const external = {
-      ...task("external", "other-lead"),
-      source: {
-        ...task("external", "other-lead").source,
-        organization: {
-          ...task("external", "other-lead").source.organization!,
-          parentThreadId: other.id,
-        },
+
+  it("shows changes requested on the current revision and collapses earlier rounds", () => {
+    const first = reviewerOf("first", "work");
+    const second = reviewerOf("second", "work");
+    const rejected = withTask(task("work", "work"), {
+      state: "changes_requested",
+      revision: "r1",
+      lastReview: {
+        reviewerThreadId: second.id,
+        revision: "r1",
+        verdict: "changes_requested",
+        notes: "manifest missing pilot.json",
       },
-    };
-    const result = organizationLayout(
-      [chief, lead, other, external, task("local", "lead", ["external"])],
-      env,
-      project,
-      "lead",
-    );
-    expect(result.nodes.some((n) => n.id === "role:other-lead")).toBe(false);
-    expect(result.nodes.find((n) => n.id === "task:external")?.kind).toBe("boundary");
-    expect(result.edges.filter((e) => e.kind === "dependency")).toHaveLength(1);
+    });
+    const subtask = model([chief, lead, first, second, rejected]).leads[0]!.subtasks[0]!;
+    expect(subtask.review).toMatchObject({
+      state: "changes_requested",
+      reviewer: { id: "second" },
+      notes: "manifest missing pilot.json",
+    });
+    expect(
+      subtask.earlierRounds.map((round) => [round.round, round.reviewer.id, round.verdict]),
+    ).toEqual([[1, "first", null]]);
+    // Resubmitted: the rejection becomes an earlier round with its recorded feedback.
+    const third = reviewerOf("third", "work");
+    const resubmitted = withTask(rejected, {
+      state: "awaiting_review",
+      revision: "r2",
+      ownerThreadId: third.id,
+    });
+    const again = model([chief, lead, first, second, third, resubmitted]).leads[0]!.subtasks[0]!;
+    expect(again.review).toMatchObject({ state: "inspecting", reviewer: { id: "third" } });
+    expect(
+      again.earlierRounds.map((round) => [
+        round.round,
+        round.reviewer.id,
+        round.verdict,
+        round.notes,
+      ]),
+    ).toEqual([
+      [1, "first", null, null],
+      [2, "second", "changes_requested", "manifest missing pilot.json"],
+    ]);
   });
-  it("does not display an executor for a task still owned by the lead", () => {
-    const result = organizationLayout([chief, lead, task("queued", "lead")], env, project);
-    expect(result.nodes.some((n) => n.id === "role:queued")).toBe(false);
-    expect(result.nodes.find((n) => n.id === "task:queued")?.owner?.id).toBe("lead");
-  });
-  it("excludes archived and unrelated idle workers", () => {
-    const idle = role("historical", { role: "executor", parentThreadId: lead.id });
-    const result = organizationLayout(
-      [chief, lead, idle, { ...task("old", "lead"), archivedAt: "2026-01-01" }],
-      env,
-      project,
-    );
-    expect(result.nodes.map((n) => n.id)).toEqual(["role:chief", "role:lead"]);
+
+  it("puts the outcome review on the lead card and offers acceptance once it is reviewed", () => {
+    const outcomeReviewer = reviewerOf("outcome-reviewer", "lead");
+    const reviewed = role("lead", {
+      role: "lead",
+      parentThreadId: chief.id,
+      task: {
+        title: "Outcome",
+        ownerThreadId: ThreadId.make("lead"),
+        dependencyThreadIds: [],
+        state: "awaiting_review",
+        revision: "04dc99",
+        reviewedRevision: "04dc99",
+        reviewerThreadId: outcomeReviewer.id,
+        notes: null,
+        files: [{ path: "work/file.ts", sha256: "abc", bytes: 1 }],
+      },
+    });
+    const card = model([chief, reviewed, outcomeReviewer]).leads[0]!;
+    expect(card.outcomeReview).toMatchObject({
+      state: "accepted",
+      reviewer: { id: "outcome-reviewer" },
+    });
+    expect(card.canAccept).toBe(true);
   });
 });
 
@@ -172,52 +273,6 @@ describe("final outcome approval eligibility", () => {
       ).toBe(false);
     }
   });
-});
-
-it("retains rejected submission reviewer only for matching correction revision, without approval eligibility", () => {
-  const reviewer = role("reviewer", { role: "reviewer", parentThreadId: lead.id });
-  const correcting = task("correction", "correction");
-  const meta = correcting.source.organization!.task!;
-  const changed = {
-    ...correcting,
-    source: {
-      ...correcting.source,
-      organization: {
-        ...correcting.source.organization!,
-        task: {
-          ...meta,
-          state: "changes_requested" as const,
-          lastReview: {
-            reviewerThreadId: reviewer.id,
-            revision: meta.revision!,
-            verdict: "changes_requested" as const,
-          },
-        },
-      },
-    },
-  };
-  const result = organizationLayout([chief, lead, reviewer, changed], env, project);
-  expect(result.edges).toContainEqual({
-    from: "role:reviewer",
-    to: "role:correction",
-    kind: "review",
-  });
-  expect(canAcceptOrganizationOutcome(changed)).toBe(false);
-  const revised = {
-    ...changed,
-    source: {
-      ...changed.source,
-      organization: {
-        ...changed.source.organization,
-        task: { ...changed.source.organization.task, revision: "new" },
-      },
-    },
-  };
-  expect(
-    organizationLayout([chief, lead, reviewer, revised], env, project).nodes.some(
-      (n) => n.id === "role:reviewer",
-    ),
-  ).toBe(false);
 });
 
 it("groups a lead outcome's files by the executor whose branch the user merges", () => {

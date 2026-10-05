@@ -7,6 +7,7 @@ import {
   RightPanelTabs,
   resolvePullRequestTabLink,
   shouldOpenDefaultBrowserProfileFromMenuClick,
+  surfaceLauncherActions,
   surfaceShortcutActionForKey,
   surfaceShortcutTargetsTypingContext,
   tabMuteMenuItem,
@@ -123,6 +124,7 @@ function renderTabs(
       onAddDiff={() => undefined}
       onAddFiles={() => undefined}
       onAddDevice={() => undefined}
+      onAddOrganization={() => undefined}
       browserAvailable
       terminalAvailable={false}
       diffAvailable={false}
@@ -130,6 +132,7 @@ function renderTabs(
       pullRequestAvailable={false}
       pullRequestsAvailable={false}
       deviceAvailable={false}
+      organizationAvailable={false}
     >
       <div>content</div>
     </RightPanelTabs>,
@@ -323,5 +326,61 @@ describe("pull request tab snapshots", () => {
         link,
       ),
     ).toBe(newer);
+  });
+});
+
+describe("organization launcher", () => {
+  const launcher = (organizationAvailable: boolean) => {
+    const opened: string[] = [];
+    const none = () => undefined;
+    const actions = surfaceLauncherActions(
+      {
+        onAddBrowser: none,
+        onAddTerminal: none,
+        onAddFiles: none,
+        onAddDiff: none,
+        onAddPullRequest: none,
+        onAddPullRequests: none,
+        onAddDevice: none,
+        onAddOrganization: () => {
+          opened.push("organization");
+        },
+        browserAvailable: false,
+        terminalAvailable: false,
+        filesAvailable: false,
+        diffAvailable: false,
+        pullRequestAvailable: false,
+        pullRequestsAvailable: false,
+        deviceAvailable: false,
+        organizationAvailable,
+      },
+      {
+        browser: "",
+        terminal: "",
+        files: "",
+        diff: "",
+        pullRequest: "",
+        pullRequests: "",
+        device: "",
+        organization: "Not here.",
+      },
+    );
+    return { actions, opened };
+  };
+
+  it("opens the organization with O only where organizations are available", () => {
+    const available = launcher(true);
+    surfaceShortcutActionForKey(available.actions, shortcutEvent("o"))?.onClick();
+    expect(available.opened).toEqual(["organization"]);
+    const unavailable = launcher(false);
+    expect(surfaceShortcutActionForKey(unavailable.actions, shortcutEvent("o"))).toBeNull();
+    expect(unavailable.actions.find((action) => action.shortcut === "O")?.disabledReason).toBe(
+      "Not here.",
+    );
+  });
+
+  it("keeps every launcher letter unique", () => {
+    const shortcuts = launcher(true).actions.map((action) => action.shortcut);
+    expect(new Set(shortcuts).size).toBe(shortcuts.length);
   });
 });

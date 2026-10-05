@@ -1,42 +1,24 @@
 import * as Effect from "effect/Effect";
 import * as Crypto from "effect/Crypto";
 import { deriveProviderInstanceEntries, isProviderInstancePickerReady } from "~/providerInstances";
-import { useEffect, useEffectEvent, useMemo, useRef, useState } from "react";
-import { Link } from "@tanstack/react-router";
+import { useMemo, useState } from "react";
+import { Link, useNavigate, useSearch } from "@tanstack/react-router";
 import { DEFAULT_SERVER_SETTINGS, ThreadId, type OrganizationRole } from "@t3tools/contracts";
+import { scopeProjectRef } from "@t3tools/client-runtime/environment";
 import { resolveOrganizationRoleModelSelection } from "@t3tools/shared/serverSettings";
-import { roleModelLabel, roleModelProvider, roleModelSlug } from "./organizationRoleModels";
-import {
-  createThread,
-  updateThreadMetadata,
-  type UpdateThreadMetadataInput,
-  type CreateThreadInput,
-} from "@t3tools/client-runtime/operations";
+import { createThread, type CreateThreadInput } from "@t3tools/client-runtime/operations";
 import { createEnvironmentCommand } from "@t3tools/client-runtime/state/runtime";
 import { useEnvironments } from "~/state/environments";
-import { useProjects, useThreadShells } from "~/state/entities";
+import { useProjects, useThreadShellsForProjectRefs } from "~/state/entities";
 import { useAtomCommand } from "~/state/use-atom-command";
 import { connectionAtomRuntime } from "~/connection/runtime";
-import {
-  AlertDialog,
-  AlertDialogPopup,
-  AlertDialogHeader,
-  AlertDialogTitle,
-  AlertDialogDescription,
-  AlertDialogFooter,
-  AlertDialogClose,
-} from "~/components/ui/alert-dialog";
 import { Button } from "~/components/ui/button";
 import { SidebarInset } from "~/components/ui/sidebar";
 import { WorkspacePageHeader } from "~/components/WorkspacePageHeader";
 import { isElectron } from "~/env";
-import { fitOrganization, resizeOrganization, zoomOrganization } from "./organizationCamera";
-import {
-  organizationLayout,
-  ROLE_LABELS,
-  canAcceptOrganizationOutcome,
-  outcomeFileGroups,
-} from "./organizationLayout";
+import { OrganizationCanvas } from "./OrganizationCanvas";
+import { ROLE_LABELS } from "./organizationLayout";
+import { roleModelLabel, roleModelProvider, roleModelSlug } from "./organizationRoleModels";
 import styles from "./organization.module.css";
 
 const createRole = createEnvironmentCommand(connectionAtomRuntime, {
@@ -51,19 +33,16 @@ const createRole = createEnvironmentCommand(connectionAtomRuntime, {
     }),
 });
 
-const acceptOutcome = createEnvironmentCommand(connectionAtomRuntime, {
-  label: "organization:accept-outcome",
-  execute: (input: UpdateThreadMetadataInput) => updateThreadMetadata(input),
-});
-
 export function OrganizationPage() {
   const { environments } = useEnvironments();
   const projects = useProjects();
-  const threads = useThreadShells();
-  const [projectKey, setProjectKey] = useState("");
-  const project = projectKey
-    ? projects.find((p) => `${p.environmentId}:${p.id}` === projectKey)
-    : projects[0];
+  const navigate = useNavigate();
+  // "Open full view" from the panel names the project; the picker can change it.
+  const search = useSearch({ strict: false }) as { project?: string };
+  const [projectKey, setProjectKey] = useState(search.project ?? "");
+  const project =
+    (projectKey ? projects.find((p) => `${p.environmentId}:${p.id}` === projectKey) : undefined) ??
+    projects[0];
   const environment = environments.find((e) => e.environmentId === project?.environmentId);
   const supported = environment?.serverConfig?.environment.capabilities.organizationV1 === true;
   const connected = environment?.connection.phase === "connected";
@@ -73,12 +52,13 @@ export function OrganizationPage() {
   const [parent, setParent] = useState("");
   const [provider, setProvider] = useState("");
   const [model, setModel] = useState("");
-  const [accepting, setAccepting] = useState<{ id: string; revision: string } | null>(null);
-  const [acceptError, setAcceptError] = useState("");
-  const [acceptPending, setAcceptPending] = useState(false);
-  const runAccept = useAtomCommand(acceptOutcome, { reportFailure: false });
   const [error, setError] = useState("");
   const [pending, setPending] = useState(false);
+  const refs = useMemo(
+    () => (project ? [scopeProjectRef(project.environmentId, project.id)] : []),
+    [project],
+  );
+  const scoped = useThreadShellsForProjectRefs(refs).filter((t) => !t.deletedAt && !t.archivedAt);
   const providers = deriveProviderInstanceEntries(environment?.serverConfig?.providers ?? [])
     .filter(isProviderInstancePickerReady)
     .map((p) => p.snapshot);
@@ -100,126 +80,12 @@ export function OrganizationPage() {
     selectedModel === roleModel.selection.model
       ? roleModel.selection.options
       : undefined;
-  const scoped = threads.filter(
-    (t) =>
-      t.environmentId === project?.environmentId &&
-      t.projectId === project?.id &&
-      !t.deletedAt &&
-      !t.archivedAt,
-  );
   const parentRole =
     role === "lead" ? "chief" : role === "executor" || role === "reviewer" ? "lead" : null;
   const parents = scoped.filter((t) => t.source.organization?.role === parentRole);
   const selectedParent = parent ? parents.find((t) => t.id === parent) : parents[0];
-  const acceptedThread = scoped.find((t) => t.id === accepting?.id);
-  const acceptedTask = acceptedThread?.source.organization?.task;
-  // Computed once per render rather than in the dialog markup; React Compiler memoizes it on
-  // these inputs, and a manual useMemo here would make the compiler skip this component.
-  const acceptedFileGroups = outcomeFileGroups(acceptedTask?.files ?? [], scoped);
-  const chief = scoped.find(
-    (t) =>
-      t.id === acceptedThread?.source.organization?.parentThreadId &&
-      t.source.organization?.role === "chief",
-  );
-  async function confirmOutcome() {
-    if (
-      !supported ||
-      !connected ||
-      !acceptedThread ||
-      !canAcceptOrganizationOutcome(acceptedThread) ||
-      acceptedTask?.revision !== accepting?.revision
-    )
-      return;
-    setAcceptPending(true);
-    setAcceptError("");
-    try {
-      const result = await runAccept({
-        environmentId: acceptedThread.environmentId,
-        input: {
-          threadId: acceptedThread.id,
-          organization: {
-            ...acceptedThread.source.organization!,
-            task: { ...acceptedTask!, state: "accepted" },
-          },
-        },
-      });
-      if (result._tag === "Success") setAccepting(null);
-      else
-        setAcceptError(
-          "The server could not accept this exact outcome. Its review or files may have changed; inspect the conversation before retrying.",
-        );
-    } catch {
-      setAcceptError("Acceptance failed. Check the selected server connection.");
-    } finally {
-      setAcceptPending(false);
-    }
-  }
   const runCreate = useAtomCommand(createRole, { reportFailure: false });
-  const layout = useMemo(
-    () =>
-      project
-        ? organizationLayout(threads, project.environmentId, project.id, workstream)
-        : { nodes: [], edges: [], warnings: [], width: 1000, height: 600 },
-    [threads, project, workstream],
-  );
-  const viewport = useRef<HTMLDivElement>(null);
-  const [camera, setCamera] = useState({ x: 30, y: 30, scale: 0.75 });
-  const drag = useRef<{ x: number; y: number } | null>(null);
-  function fit() {
-    const rect = viewport.current?.getBoundingClientRect();
-    if (rect) setCamera(fitOrganization(rect, layout));
-  }
-  const onViewportResize = useEffectEvent(
-    (before: { width: number; height: number } | null, rect: DOMRect) => {
-      setCamera((camera) =>
-        before ? resizeOrganization(camera, before, rect) : fitOrganization(rect, layout),
-      );
-    },
-  );
-  const cameraScope = `${project?.environmentId ?? ""}:${project?.id ?? ""}:${workstream}`;
-  const measuredViewport = useRef<{
-    scope: string;
-    size: { width: number; height: number };
-  } | null>(null);
-  useEffect(() => {
-    const element = viewport.current;
-    if (!element) return;
-    let before =
-      measuredViewport.current?.scope === cameraScope ? measuredViewport.current.size : null;
-    const observer = new ResizeObserver(() => {
-      const rect = element.getBoundingClientRect();
-      onViewportResize(before, rect);
-      before = { width: rect.width, height: rect.height };
-      measuredViewport.current = { scope: cameraScope, size: before };
-    });
-    observer.observe(element);
-    return () => observer.disconnect();
-  }, [cameraScope]);
-  useEffect(() => {
-    const element = viewport.current;
-    if (!element) return;
-    const onWheel = (event: WheelEvent) => {
-      event.preventDefault();
-      const rect = element.getBoundingClientRect();
-      if (event.ctrlKey || event.metaKey)
-        setCamera((camera) =>
-          zoomOrganization(
-            camera,
-            event.clientX - rect.left,
-            event.clientY - rect.top,
-            event.deltaY,
-          ),
-        );
-      else
-        setCamera((camera) => ({
-          ...camera,
-          x: camera.x - event.deltaX,
-          y: camera.y - event.deltaY,
-        }));
-    };
-    element.addEventListener("wheel", onWheel, { passive: false });
-    return () => element.removeEventListener("wheel", onWheel);
-  }, []);
+
   async function bootstrap() {
     if (
       !supported ||
@@ -301,23 +167,6 @@ export function OrganizationPage() {
           </select>
         </label>
         <span>{environment?.connection.phase ?? "No server"}</span>
-        <Button variant="outline" size="sm" onClick={fit}>
-          Fit
-        </Button>
-        <Button
-          variant="outline"
-          size="sm"
-          onClick={() => setCamera((c) => ({ ...c, scale: Math.min(1.5, c.scale * 1.2) }))}
-        >
-          +
-        </Button>
-        <Button
-          variant="outline"
-          size="sm"
-          onClick={() => setCamera((c) => ({ ...c, scale: Math.max(0.15, c.scale / 1.2) }))}
-        >
-          −
-        </Button>
         <Button size="sm" disabled={!supported || !connected} onClick={() => setSetup((s) => !s)}>
           Add role
         </Button>
@@ -418,240 +267,23 @@ export function OrganizationPage() {
           {error && <p role="alert">{error}</p>}
         </form>
       )}
-      {layout.warnings.map((w) => (
-        <p className={styles["org-notice"]} key={w}>
-          {w}
-        </p>
-      ))}
-      <div
-        className={styles["org-viewport"]}
-        ref={viewport}
-        onPointerDown={(e) => {
-          if ((e.target as HTMLElement).closest("a,button")) return;
-          drag.current = { x: e.clientX, y: e.clientY };
-          e.currentTarget.setPointerCapture(e.pointerId);
-        }}
-        onPointerMove={(e) => {
-          if (!drag.current) return;
-          const dx = e.clientX - drag.current.x,
-            dy = e.clientY - drag.current.y;
-          drag.current = { x: e.clientX, y: e.clientY };
-          setCamera((c) => ({ ...c, x: c.x + dx, y: c.y + dy }));
-        }}
-        onPointerUp={() => {
-          drag.current = null;
-        }}
-        onPointerCancel={() => {
-          drag.current = null;
-        }}
-      >
-        {!layout.nodes.length && (
-          <div className={styles["org-empty"]}>
-            <h2>Start with your Chief of staff</h2>
-            <p>
-              Add a role, choose its provider and model, then open its conversation. Delegated tasks
-              appear here as native threads update.
-            </p>
-          </div>
-        )}
-        <div
-          className={styles["org-world"]}
-          style={{
-            width: layout.width,
-            height: layout.height,
-            transform: `translate(${camera.x}px,${camera.y}px) scale(${camera.scale})`,
+      {project ? (
+        <OrganizationCanvas
+          environmentId={project.environmentId}
+          projectId={project.id}
+          workstream={workstream}
+          acceptDisabled={!supported || !connected}
+          onOpenThread={(thread) => {
+            void navigate({
+              to: "/$environmentId/$threadId",
+              params: { environmentId: thread.environmentId, threadId: thread.id },
+            });
           }}
-        >
-          <svg
-            width={layout.width}
-            height={layout.height}
-            className={styles["org-edges"]}
-            aria-label="Dependency and reporting relationships"
-          >
-            <defs>
-              <marker
-                id="org-arrow"
-                viewBox="0 0 10 10"
-                refX="9"
-                refY="5"
-                markerWidth="6"
-                markerHeight="6"
-                orient="auto-start-reverse"
-              >
-                <path d="M 0 0 L 10 5 L 0 10 z" fill="currentColor" />
-              </marker>
-            </defs>
-            {layout.edges.map((edge) => {
-              const a = layout.nodes.find((n) => n.id === edge.from),
-                b = layout.nodes.find((n) => n.id === edge.to);
-              if (!a || !b) return null;
-              const x = a.x + a.width,
-                y = a.y + a.height / 2,
-                bx = b.x,
-                by = b.y + b.height / 2;
-              return (
-                <path
-                  key={`${edge.kind}:${edge.from}:${edge.to}`}
-                  className={`${styles["org-edge"]} ${styles[`org-edge-${edge.kind}`]}`}
-                  markerEnd="url(#org-arrow)"
-                  d={`M${x},${y} C${x + 45},${y} ${bx - 45},${by} ${bx},${by}`}
-                >
-                  <title>
-                    {edge.kind}: {a.label} → {b.label}
-                  </title>
-                </path>
-              );
-            })}
-          </svg>
-          {layout.nodes.map((node) => (
-            <article
-              key={node.id}
-              className={`${styles["org-node"]} ${styles[`org-node-${node.kind}`]} ${node.thread?.runtime?.status === "running" && node.thread.runtime.activeRunId ? styles["org-node-running"] : ""} ${node.thread?.source.organization?.task?.state === "blocked" ? styles["org-node-blocked"] : ""}`}
-              style={{ left: node.x, top: node.y, width: node.width, height: node.height }}
-            >
-              {node.thread ? (
-                <Link
-                  to="/$environmentId/$threadId"
-                  params={{ environmentId: node.thread.environmentId, threadId: node.thread.id }}
-                >
-                  <strong>{node.label}</strong>
-                  <span>
-                    {node.kind === "role"
-                      ? node.thread.title
-                      : node.thread.source.organization?.task?.state.replaceAll("_", " ")}
-                  </span>
-                  {node.kind === "role" ? (
-                    <>
-                      <small>
-                        {node.thread.modelSelection.instanceId} · {node.thread.modelSelection.model}
-                      </small>
-                      <small>{node.thread.runtime?.status ?? "idle"} · Open conversation</small>
-                    </>
-                  ) : (
-                    <>
-                      <small>
-                        Owner:{" "}
-                        {node.owner
-                          ? `${ROLE_LABELS[node.owner.source.organization!.role]} · ${node.owner.title}`
-                          : "Unavailable in this view"}
-                      </small>
-                      {node.thread.source.organization?.role === "executor" && (
-                        <small>
-                          {node.thread.source.organization.task?.repository ?? "."} ·{" "}
-                          {node.thread.branch ?? "Worktree not prepared"}
-                        </small>
-                      )}
-                    </>
-                  )}
-                </Link>
-              ) : (
-                <strong>{node.label}</strong>
-              )}
-              {node.kind === "task" && node.thread && canAcceptOrganizationOutcome(node.thread) && (
-                <Button
-                  size="sm"
-                  variant="outline"
-                  disabled={!supported || !connected}
-                  onClick={() => {
-                    setAccepting({
-                      id: node.thread!.id,
-                      revision: node.thread!.source.organization!.task!.revision!,
-                    });
-                    setAcceptError("");
-                  }}
-                >
-                  Accept reviewed outcome
-                </Button>
-              )}
-            </article>
-          ))}
-        </div>
-      </div>
-      <AlertDialog
-        open={accepting !== null}
-        onOpenChange={(open) => {
-          if (!open && !acceptPending) setAccepting(null);
-        }}
-      >
-        <AlertDialogPopup>
-          <AlertDialogHeader>
-            <AlertDialogTitle>Accept reviewed outcome?</AlertDialogTitle>
-            <AlertDialogDescription>
-              Approve the current reviewed result. The server verifies these artifacts and their
-              child reviews again before accepting.
-            </AlertDialogDescription>
-          </AlertDialogHeader>
-          <div className="space-y-3 p-4 text-sm">
-            <p>{acceptedTask?.title}</p>
-            <p className="break-all">Reviewed revision: {accepting?.revision ?? "Unavailable"}</p>
-            <div className="max-h-64 space-y-3 overflow-auto">
-              {acceptedFileGroups.map((group) => (
-                <section key={group.child?.id ?? ""} className="space-y-1">
-                  <p className="break-all font-medium">
-                    {group.child?.title ?? "Other files"}
-                    {group.child && (
-                      <>
-                        {" "}
-                        · {group.repository} · {group.branch ?? "No branch"}
-                      </>
-                    )}
-                  </p>
-                  {group.worktreePath && (
-                    <p className="break-all text-xs text-muted-foreground">{group.worktreePath}</p>
-                  )}
-                  <ul>
-                    {group.files.map((file) => (
-                      <li key={file.path} className="break-all">
-                        {file.path} · {file.bytes} bytes
-                        <br />
-                        <span className="text-xs text-muted-foreground">{file.sha256}</span>
-                      </li>
-                    ))}
-                  </ul>
-                </section>
-              ))}
-            </div>
-            <p>You merge each branch in its repository.</p>
-            {chief && (
-              <Link
-                to="/$environmentId/$threadId"
-                params={{ environmentId: chief.environmentId, threadId: chief.id }}
-              >
-                Open Chief of staff conversation
-              </Link>
-            )}
-            {acceptedTask?.revision !== accepting?.revision && (
-              <p role="alert">
-                This outcome changed after the confirmation opened. Close it and inspect the new
-                review.
-              </p>
-            )}
-            {acceptError && <p role="alert">{acceptError}</p>}
-          </div>
-          <AlertDialogFooter>
-            <AlertDialogClose render={<Button variant="outline" disabled={acceptPending} />}>
-              Cancel
-            </AlertDialogClose>
-            <Button
-              disabled={
-                acceptPending ||
-                !acceptedThread ||
-                !canAcceptOrganizationOutcome(acceptedThread) ||
-                acceptedTask?.revision !== accepting?.revision ||
-                !connected
-              }
-              onClick={() => {
-                void confirmOutcome();
-              }}
-            >
-              Accept this reviewed revision
-            </Button>
-          </AlertDialogFooter>
-        </AlertDialogPopup>
-      </AlertDialog>
+        />
+      ) : null}
       <p className={styles["org-legend"]}>
-        Drag to pan · Ctrl/⌘ + scroll to zoom · Solid: prerequisites · Dashed: reporting · Dotted:
-        review feedback. Click a card to open its native conversation.
+        Drag to pan · Ctrl/⌘ + scroll to zoom · Click a card, subtask or review line to open its
+        conversation.
       </p>
     </SidebarInset>
   );

@@ -55,6 +55,7 @@ import {
   FolderPlusIcon,
   MessageSquareDashedIcon,
   LinkIcon,
+  NetworkIcon,
   MessageSquareIcon,
   MonitorIcon,
   MoonIcon,
@@ -1974,6 +1975,35 @@ function OpenCommandPaletteDialog(props: {
       });
     }
   }
+
+  if (
+    activeThread !== null &&
+    activeThreadServerConfig?.environment.capabilities.organizationV1 === true
+  ) {
+    const threadRef = scopeThreadRef(activeThread.environmentId, activeThread.id);
+    actionItems.push({
+      kind: "action",
+      value: "action:show-organization-panel",
+      searchTerms: ["organization", "org", "chief", "lead", "executor", "reviewer", "panel"],
+      title: "Show organization panel",
+      icon: <NetworkIcon className={ITEM_ICON_CLASS} />,
+      shortcutCommand: "organization.toggle",
+      run: async () => {
+        useRightPanelStore.getState().open(threadRef, "organization");
+      },
+    });
+  }
+
+  actionItems.push({
+    kind: "action",
+    value: "action:organization",
+    searchTerms: ["organization", "org", "chief", "leads", "canvas", "agents"],
+    title: "Open organization",
+    icon: <NetworkIcon className={ITEM_ICON_CLASS} />,
+    run: async () => {
+      await navigate({ to: "/organization" });
+    },
+  });
 
   if (activeThread !== null) {
     const thread = activeThread;
