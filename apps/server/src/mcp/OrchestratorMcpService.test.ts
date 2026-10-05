@@ -13,10 +13,14 @@ import {
 } from "@t3tools/contracts";
 import * as DateTime from "effect/DateTime";
 import * as Effect from "effect/Effect";
+import * as FileSystem from "effect/FileSystem";
 import * as Layer from "effect/Layer";
+import * as Option from "effect/Option";
 import * as Ref from "effect/Ref";
 
 import { OrchestratorProjectionError } from "../orchestration-v2/Orchestrator.ts";
+import * as ProjectStore from "../orchestration-v2/ProjectStore.ts";
+import * as ProcessRunner from "../processRunner.ts";
 import type { ProviderAdapterV2Shape } from "../orchestration-v2/ProviderAdapter.ts";
 import * as ProviderAdapterRegistry from "../orchestration-v2/ProviderAdapterRegistry.ts";
 import * as ThreadManagementService from "../orchestration-v2/ThreadManagementService.ts";
@@ -1136,10 +1140,41 @@ describe("OrchestratorMcpService provider resolution", () => {
         }
       }),
   );
+  /** A temporary project root; "." makes the root itself a repository. */
+  const repositoryRoot = (repositories: ReadonlyArray<string>) =>
+    Effect.gen(function* () {
+      const fs = yield* FileSystem.FileSystem;
+      const runner = yield* ProcessRunner.ProcessRunner;
+      const root = yield* fs.realPath(yield* fs.makeTempDirectoryScoped());
+      for (const name of repositories) {
+        const cwd = `${root}/${name}`;
+        yield* fs.makeDirectory(cwd, { recursive: true });
+        for (const args of [["init"], ["commit", "--allow-empty", "-m", name]])
+          yield* runner.run({
+            command: "git",
+            args: ["-c", "user.name=Test", "-c", "user.email=test@example.test", ...args],
+            cwd,
+            timeout: "10 seconds",
+          });
+      }
+      return root;
+    });
+
+  const withRepositories = <A, E, R>(effect: Effect.Effect<A, E, R>) =>
+    Effect.scoped(effect).pipe(
+      Effect.provide(ProcessRunner.layer.pipe(Layer.provideMerge(NodeServices.layer))),
+    );
+
+  const projectsLayer = (workspaceRoot: string) =>
+    Layer.mock(ProjectStore.ProjectStoreV2)({
+      get: () => Effect.succeed(Option.some({ workspaceRoot } as never)),
+    });
+
   it.effect(
     "organization delegation pins role defaults and preserves atomic task dependencies",
     () =>
       Effect.gen(function* () {
+        const workspaceRoot = yield* repositoryRoot(["."]);
         const openCodeId = ProviderInstanceId.make("opencode-native");
         const dependency = ThreadId.make("accepted-dependency");
         for (const role of ["chief", "lead"] as const) {
@@ -1213,6 +1248,7 @@ describe("OrchestratorMcpService provider resolution", () => {
             }),
             adapterRegistryLayer([codexInstanceId, openCodeId]),
             Layer.mock(ScheduledTaskService.ScheduledTaskService)({}),
+            projectsLayer(workspaceRoot),
           );
           yield* Effect.gen(function* () {
             const service = yield* OrchestratorMcpService.OrchestratorMcpService;
@@ -1239,6 +1275,199 @@ describe("OrchestratorMcpService provider resolution", () => {
             assert.deepEqual(command.organizationDependencyThreadIds, [dependency]);
           }).pipe(Effect.provide(OrchestratorMcpService.layer.pipe(Layer.provide(dependencies))));
         }
+      }).pipe(withRepositories),
+  );
+
+  /** Delegates from an organization parent and returns the outcome and the dispatched command. */
+  const delegateFromOrganization = (input: {
+    readonly organization: NonNullable<OrchestrationV2ThreadProjection["thread"]["organization"]>;
+    readonly delegate: Partial<
+      Parameters<OrchestratorMcpService.OrchestratorMcpService["Service"]["delegateTask"]>[1]
+    >;
+    readonly workspaceRoot?: string;
+  }) =>
+    Effect.gen(function* () {
+      const dispatched = yield* Ref.make<ReadonlyArray<unknown>>([]);
+      const task = {
+        id: taskId,
+        threadId: parentThreadId,
+        runId: parentRunId,
+        parentNodeId,
+        origin: "app_owned",
+        createdBy: "agent",
+        driver: "codex",
+        providerInstanceId: codexInstanceId,
+        providerThreadId: null,
+        childThreadId,
+        nativeTaskRef: null,
+        prompt: "Implement",
+        title: null,
+        model: "gpt-5.4",
+        status: "running",
+        result: null,
+        startedAt: null,
+        completedAt: null,
+      };
+      const parent = parentProjection([task]);
+      const dependencies = Layer.mergeAll(
+        NodeServices.layer,
+        Layer.mock(ThreadManagementService.ThreadManagementService)({
+          getThreadRecords: (id) =>
+            Effect.succeed(
+              id === parentThreadId
+                ? { ...parent, thread: { ...parent.thread, organization: input.organization } }
+                : childProjection,
+            ),
+          dispatch: (command) =>
+            Ref.update(dispatched, (all) => [...all, command]).pipe(
+              Effect.as({
+                sequence: 1,
+                storedEvents: [
+                  {
+                    sequence: 1,
+                    commandId: null,
+                    event: { type: "subagent.updated", payload: task },
+                  },
+                ],
+              } as never),
+            ),
+        }),
+        Layer.mock(ProviderRegistry.ProviderRegistry)({
+          getProviders: Effect.succeed([
+            providerSnapshot({
+              instanceId: codexInstanceId,
+              driver: ProviderDriverKind.make("codex"),
+              model: "gpt-5.4",
+            }),
+          ]),
+        }),
+        adapterRegistryLayer([codexInstanceId]),
+        Layer.mock(ScheduledTaskService.ScheduledTaskService)({}),
+        input.workspaceRoot === undefined ? Layer.empty : projectsLayer(input.workspaceRoot),
+      );
+      const result = yield* Effect.gen(function* () {
+        const service = yield* OrchestratorMcpService.OrchestratorMcpService;
+        return yield* service.delegateTask(scope, {
+          task: "Implement",
+          mode: "async",
+          clientRequestId: "organization-repository",
+          target: { providerInstanceId: codexInstanceId, model: "gpt-5.4" },
+          ...input.delegate,
+        });
+      }).pipe(
+        Effect.provide(OrchestratorMcpService.layer.pipe(Layer.provide(dependencies))),
+        Effect.result,
+      );
+      const command = (yield* Ref.get(dispatched))[0] as
+        | { readonly organizationRepository?: string }
+        | undefined;
+      return { result, command };
+    });
+
+  const lead = (repository?: string) => ({
+    role: "lead" as const,
+    parentThreadId: ThreadId.make("chief"),
+    task: {
+      title: "Outcome",
+      ...(repository === undefined ? {} : { repository }),
+      ownerThreadId: parentThreadId,
+      dependencyThreadIds: [],
+      state: "working" as const,
+      revision: null,
+      reviewedRevision: null,
+      reviewerThreadId: null,
+      notes: null,
+    },
+  });
+  const failureCode = (result: { readonly _tag: string; readonly failure?: unknown }) =>
+    result._tag === "Failure" ? (result.failure as { readonly code?: string }).code : undefined;
+
+  it.effect("an executor's repository must be a Git repository under the project root", () =>
+    withRepositories(
+      Effect.gen(function* () {
+        const workspaceRoot = yield* repositoryRoot(["a", "b"]);
+        const missing = yield* delegateFromOrganization({
+          organization: lead(),
+          delegate: { repository: "c" },
+          workspaceRoot,
+        });
+        assert.equal(failureCode(missing.result), "repository_unavailable");
+        assert.include(
+          missing.result._tag === "Failure" ? missing.result.failure.message : "",
+          '"a", "b"',
+        );
+        assert.isUndefined(missing.command);
+        // Omitted, the executor works in the root, which here is a plain folder.
+        const root = yield* delegateFromOrganization({
+          organization: lead(),
+          delegate: {},
+          workspaceRoot,
+        });
+        assert.equal(failureCode(root.result), "repository_unavailable");
+        const named = yield* delegateFromOrganization({
+          organization: lead(),
+          delegate: { repository: "b" },
+          workspaceRoot,
+        });
+        assert.equal(named.result._tag, "Success");
+        assert.equal(named.command?.organizationRepository, "b");
       }),
+    ),
+  );
+
+  it.effect("an executor inherits its lead's repository", () =>
+    withRepositories(
+      Effect.gen(function* () {
+        const workspaceRoot = yield* repositoryRoot(["a", "b"]);
+        const { result, command } = yield* delegateFromOrganization({
+          organization: lead("a"),
+          delegate: {},
+          workspaceRoot,
+        });
+        assert.equal(result._tag, "Success");
+        assert.equal(command?.organizationRepository, "a");
+      }),
+    ),
+  );
+
+  it.effect("a review cannot name a repository and a lead's repository is optional", () =>
+    withRepositories(
+      Effect.gen(function* () {
+        const workspaceRoot = yield* repositoryRoot(["a"]);
+        const review = yield* delegateFromOrganization({
+          organization: lead(),
+          delegate: { role: "review", repository: "a", reviewTaskThreadId: childThreadId },
+          workspaceRoot,
+        });
+        assert.equal(failureCode(review.result), "invalid_request");
+        const chief = { role: "chief" as const, parentThreadId: null };
+        const outcome = yield* delegateFromOrganization({
+          organization: chief,
+          delegate: {},
+          workspaceRoot,
+        });
+        assert.equal(outcome.result._tag, "Success");
+        assert.isUndefined(outcome.command?.organizationRepository);
+        const named = yield* delegateFromOrganization({
+          organization: chief,
+          delegate: { repository: "missing" },
+          workspaceRoot,
+        });
+        assert.equal(failureCode(named.result), "repository_unavailable");
+      }),
+    ),
+  );
+
+  it.effect("organization delegation fails without the services that validate repositories", () =>
+    withRepositories(
+      Effect.gen(function* () {
+        const { result, command } = yield* delegateFromOrganization({
+          organization: lead(),
+          delegate: {},
+        });
+        assert.equal(failureCode(result), "orchestration_error");
+        assert.isUndefined(command);
+      }),
+    ),
   );
 });

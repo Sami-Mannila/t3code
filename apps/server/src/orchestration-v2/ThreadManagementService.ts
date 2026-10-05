@@ -477,8 +477,9 @@ const make = Effect.gen(function* () {
       ) {
         const current = yield* orchestrator.getThreadProjection(command.threadId);
         const task = command.organization.task;
+        // A lead outcome aggregates its executors' worktrees; leads have none of their own.
         if (
-          !current.thread.worktreePath ||
+          (command.organization.role !== "lead" && !current.thread.worktreePath) ||
           Option.isNone(organizationFs) ||
           Option.isNone(organizationPath)
         )
@@ -555,7 +556,7 @@ const make = Effect.gen(function* () {
             );
           }
           evidence = { revision: digest.digest("hex"), files };
-        } else evidence = yield* readArtifacts(current.thread.worktreePath, task.manifest ?? []);
+        } else evidence = yield* readArtifacts(current.thread.worktreePath!, task.manifest ?? []);
         const previous = current.thread.organization?.task;
         const submission =
           task.state === "awaiting_review" &&

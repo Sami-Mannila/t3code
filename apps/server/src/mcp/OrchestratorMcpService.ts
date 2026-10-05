@@ -62,7 +62,13 @@ import * as Effect from "effect/Effect";
 import * as Layer from "effect/Layer";
 import * as Option from "effect/Option";
 import * as Schema from "effect/Schema";
+import * as FileSystem from "effect/FileSystem";
+import * as Path from "effect/Path";
+import * as ChildProcessSpawner from "effect/unstable/process/ChildProcessSpawner";
 
+import * as ProcessRunner from "../processRunner.ts";
+import * as OrganizationWorkspace from "../orchestration-v2/OrganizationWorkspace.ts";
+import * as ProjectStore from "../orchestration-v2/ProjectStore.ts";
 import * as ProviderAdapterRegistry from "../orchestration-v2/ProviderAdapterRegistry.ts";
 import {
   subagentResultForRun,
@@ -761,6 +767,61 @@ const make = Effect.gen(function* () {
   const providerRegistry = yield* ProviderRegistry.ProviderRegistry;
   const providerAdapters = yield* ProviderAdapterRegistry.ProviderAdapterRegistryV2;
   const scheduledTasks = yield* ScheduledTaskService.ScheduledTaskService;
+  // Only organization delegations need these, to validate a task's repository.
+  const projects = yield* Effect.serviceOption(ProjectStore.ProjectStoreV2);
+  const fileSystem = yield* Effect.serviceOption(FileSystem.FileSystem);
+  const paths = yield* Effect.serviceOption(Path.Path);
+  const spawner = yield* Effect.serviceOption(ChildProcessSpawner.ChildProcessSpawner);
+
+  /** Fails with repository_unavailable unless the repository is a Git repository root with a commit. */
+  const validateOrganizationRepository = (
+    projectId: OrchestrationV2ThreadProjection["thread"]["projectId"],
+    repository: string,
+  ) =>
+    Effect.gen(function* () {
+      if (
+        Option.isNone(projects) ||
+        Option.isNone(fileSystem) ||
+        Option.isNone(paths) ||
+        Option.isNone(spawner)
+      )
+        return yield* failure(
+          "orchestration_error",
+          "Organization delegation is unavailable: the server cannot validate task repositories.",
+        );
+      const project = yield* projects.value
+        .get(projectId)
+        .pipe(
+          Effect.mapError((error) =>
+            failure("orchestration_error", `Unable to read the project: ${errorMessage(error)}`),
+          ),
+        );
+      if (Option.isNone(project))
+        return yield* failure(
+          "repository_unavailable",
+          "This conversation's project no longer exists.",
+        );
+      yield* OrganizationWorkspace.resolveRepository({
+        workspaceRoot: project.value.workspaceRoot,
+        repository,
+      }).pipe(
+        Effect.provideService(FileSystem.FileSystem, fileSystem.value),
+        Effect.provideService(Path.Path, paths.value),
+        Effect.provide(ProcessRunner.layer),
+        Effect.provideService(ChildProcessSpawner.ChildProcessSpawner, spawner.value),
+        Effect.mapError((error) =>
+          error._tag === "OrganizationRepositoryError"
+            ? failure(
+                "repository_unavailable",
+                `${error.message} Pass repository as a Git repository directory relative to the project root (${project.value.workspaceRoot}).`,
+              )
+            : failure(
+                "orchestration_error",
+                `Unable to check repository "${repository}": ${errorMessage(error)}`,
+              ),
+        ),
+      );
+    });
 
   const requireCapability = (scope: McpInvocationScope) =>
     scope.capabilities.has("orchestration")
@@ -1384,6 +1445,31 @@ const make = Effect.gen(function* () {
             "Delegated tasks require an active run owned by this MCP provider session.",
           );
         }
+        const organization = parent.thread.organization;
+        const childRole =
+          organization?.role === "chief"
+            ? "lead"
+            : organization?.role === "lead"
+              ? input.role === "review"
+                ? "reviewer"
+                : "executor"
+              : null;
+        if (input.repository !== undefined && (!organization || childRole === "reviewer"))
+          return yield* failure(
+            "invalid_request",
+            organization
+              ? "Reviewers inspect the submission in place at artifactSources[].workspace; omit repository for reviews."
+              : "repository applies only to organization delegations.",
+          );
+        // Executors always work in a validated repository; a lead's is optional.
+        const repository =
+          childRole === "executor"
+            ? (input.repository ?? organization?.task?.repository ?? ".")
+            : childRole === "lead"
+              ? input.repository
+              : undefined;
+        if (repository !== undefined)
+          yield* validateOrganizationRepository(parent.thread.projectId, repository);
         const providers = yield* loadProviders;
         const organizationTarget =
           parent.thread.organization && !input.target
@@ -1427,6 +1513,7 @@ const make = Effect.gen(function* () {
                   ...(input.reviewTaskThreadId
                     ? { organizationReviewTaskThreadId: input.reviewTaskThreadId }
                     : {}),
+                  ...(repository === undefined ? {} : { organizationRepository: repository }),
                 }
               : {}),
             createdBy: "agent",

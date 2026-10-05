@@ -28,6 +28,7 @@ import * as Stream from "effect/Stream";
 
 import * as ServerConfig from "./config.ts";
 import * as GitManager from "./git/GitManager.ts";
+import { organizationRepositoryRoot } from "./orchestration-v2/OrganizationPolicy.ts";
 import * as ProjectStore from "./orchestration-v2/ProjectStore.ts";
 import * as Orchestrator from "./orchestration-v2/Orchestrator.ts";
 import * as ProjectionStore from "./orchestration-v2/ProjectionStore.ts";
@@ -252,7 +253,9 @@ export const make = Effect.gen(function* () {
           storageCleanupActivityAt(thread) < now - settings.worktreeAfterDays * DAY_MS;
         let eligible = deleted || old;
         if (!eligible && (settings.worktreeUnchanged || settings.worktreeOnMerge)) {
-          const repositoryCwd = path.resolve(project.workspaceRoot);
+          const repositoryCwd = path.resolve(
+            organizationRepositoryRoot(project.workspaceRoot, thread),
+          );
           const remote = yield* git.resolvePrimaryRemoteName(repositoryCwd);
           const branch = yield* git.resolveDefaultBranchName(repositoryCwd, remote);
           if (branch === null) return;
@@ -369,8 +372,9 @@ export const make = Effect.gen(function* () {
           )
         )
           return;
-        yield* git.removeWorktree({ cwd: project.workspaceRoot, path: worktreePath, force: false });
-        yield* gitManager.invalidateStatus(project.workspaceRoot);
+        const repositoryRoot = organizationRepositoryRoot(project.workspaceRoot, thread);
+        yield* git.removeWorktree({ cwd: repositoryRoot, path: worktreePath, force: false });
+        yield* gitManager.invalidateStatus(repositoryRoot);
         // Preserve branch and path: ProviderTurnStartService recreates the checkout
         // from that branch when the thread is resumed.
         yield* Effect.logInfo("storage cleanup removed worktree", { threadId: thread.id });

@@ -907,6 +907,8 @@ const make = Effect.gen(function* () {
       const run = projection.runs.find((candidate) => candidate.id === input.runId);
       const workspacePreparation = run?.workspacePreparation;
       if (run?.status !== "preparing" || workspacePreparation === undefined) return;
+      // The retry command enqueued the organization's own preparation effect.
+      if (projection.thread.organization) return;
       if (!(yield* reservePreparation(input.commandId))) return;
       yield* scheduleRetriedPreparation(input, projection, run, workspacePreparation).pipe(
         Effect.onError(() => releasePreparation(input.commandId)),

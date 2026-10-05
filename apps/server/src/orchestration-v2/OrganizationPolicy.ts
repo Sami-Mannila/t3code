@@ -1,5 +1,11 @@
 import * as Equal from "effect/Equal";
-import type { OrganizationThread, OrchestrationV2AppThread, ThreadId } from "@t3tools/contracts";
+import type {
+  OrganizationRepositoryPath,
+  OrganizationRole,
+  OrganizationThread,
+  OrchestrationV2AppThread,
+  ThreadId,
+} from "@t3tools/contracts";
 
 /** Shared by every canonical command, including commands originating through MCP. */
 export function organizationProblem(input: {
@@ -59,6 +65,8 @@ export function organizationProblem(input: {
     actor.id !== old?.ownerThreadId
   )
     return "Only the task's owner or direct coordinator can update this work.";
+  if (old && (old.repository ?? ".") !== (task.repository ?? "."))
+    return "A task's repository is fixed when it is delegated; delegate a new task for another repository.";
   if (
     old &&
     (old.title !== task.title ||
@@ -174,11 +182,36 @@ export function organizationProblem(input: {
   return null;
 }
 
+/** The repository a thread's task works in, relative to the project root. Absent means ".". */
+export function organizationRepository(thread: Pick<OrchestrationV2AppThread, "organization">) {
+  return thread.organization?.task?.repository ?? ".";
+}
+
+/** Git working directory of a thread's repository; repository paths are normalized POSIX. */
+export function organizationRepositoryRoot(
+  workspaceRoot: string,
+  thread: Pick<OrchestrationV2AppThread, "organization">,
+) {
+  const repository = organizationRepository(thread);
+  return repository === "."
+    ? workspaceRoot
+    : `${workspaceRoot.replace(/[\\/]+$/, "")}/${repository}`;
+}
+
+/**
+ * Only executors write files, so only they get an isolated worktree and branch. Chief, Advisor,
+ * leads and reviewers run in the project root, which may be a plain folder of repositories.
+ */
+export function organizationNeedsWorktree(role: OrganizationRole | undefined) {
+  return role === "executor";
+}
+
 export function delegatedOrganization(
   parent: OrchestrationV2AppThread,
   childId: ThreadId,
   title: string,
   review = false,
+  repository?: OrganizationRepositoryPath,
 ): OrganizationThread | undefined {
   if (!parent.organization) return undefined;
   const role =
@@ -196,6 +229,7 @@ export function delegatedOrganization(
     parentThreadId: parent.id,
     task: {
       title,
+      ...(repository === undefined ? {} : { repository }),
       ownerThreadId: childId,
       dependencyThreadIds: [],
       state: "queued",
@@ -217,7 +251,7 @@ export function organizationExecutionProblem(
 ): string | null {
   const org = thread.organization;
   if (!org) return null;
-  if (["executor", "reviewer"].includes(org.role) && requireWorkspace && !thread.worktreePath)
+  if (organizationNeedsWorktree(org.role) && requireWorkspace && !thread.worktreePath)
     return "Organization workers require their prepared worktree before execution.";
   if (org.role === "reviewer") {
     const target = threads.find(
@@ -257,20 +291,20 @@ export function organizationExecutionProblem(
 }
 
 export function organizationInstructions(
-  thread: Pick<OrchestrationV2AppThread, "id" | "organization">,
+  thread: Pick<OrchestrationV2AppThread, "id" | "organization" | "worktreePath" | "branch">,
 ): string {
   const org = thread.organization;
   if (!org) return "";
-  const contract = `Organization role: ${org.role}. Your identity is this native conversation (${thread.id}); role authority is server-bound. Chief → outcome lead → executor and independent reviewer. Use native delegate_task and t3_organization_task; never spawn a second CLI or resume another role's native session. Do not treat agent notifications as user approval. Worktrees separate implementation changes; there is no claimed OS sandbox. No quota polling: report actual provider failures to Chief and wait for explicit recovery. Default executor is OpenCode fireworks-ai/accounts/fireworks/models/deepseek-v4p1-flash; Chief/lead/reviewer default Codex gpt-6.1-sol. Unavailable targets must be reported, never substituted.`;
+  const contract = `Organization role: ${org.role}. Your identity is this native conversation (${thread.id}); role authority is server-bound. Chief → outcome lead → executor and independent reviewer. Use native delegate_task and t3_organization_task; never spawn a second CLI or resume another role's native session. Do not treat agent notifications as user approval. Only executors get a worktree and branch; every other role runs in the project root, which may be one Git repository or a plain folder of repositories, and does not edit files there. There is no claimed OS sandbox. No quota polling: report actual provider failures to Chief and wait for explicit recovery. Default executor is OpenCode fireworks-ai/accounts/fireworks/models/deepseek-v4p1-flash; Chief/lead/reviewer default Codex gpt-6.1-sol. Unavailable targets must be reported, never substituted.`;
   const role =
     org.role === "chief"
-      ? "You are the user's primary conversation. Delegate implementation outcomes to leads using delegate_task; do not implement files yourself. Report incoming task updates proactively here in plain language with project/outcome context, exact blocker and concrete options. Keep updates brief; final outcome acceptance belongs to the user."
+      ? 'You are the user\'s primary conversation. Delegate implementation outcomes to leads using delegate_task; do not implement files yourself. When an outcome changes code, pass delegate_task repository: the repository directory relative to the project root ("." when the root is the repository). Report incoming task updates proactively here in plain language with project/outcome context, exact blocker and concrete options. Keep updates brief; final outcome acceptance belongs to the user.'
       : org.role === "lead"
-        ? "Plan and delegate implementation using delegate_task. Supply dependencyThreadIds atomically in delegate_task when creating dependent implementation work; it waits until dependencies have current independent acceptance. Do not implement or copy child artifacts. Once a child submits, delegate_task(role=review, reviewTaskThreadId=child conversation ID) creates an independent reviewer. After all children are independently accepted, submit your own outcome with t3_organization_task(action=submit); the server aggregates their current manifests. Delegate an independent outcome review targeting your own conversation. Ask Chief for final user acceptance; never accept an outcome yourself."
+        ? `Plan and delegate implementation using delegate_task. Each implementation task works in one repository: pass repository relative to the project root (omitted, it uses ${org.task?.repository ? `your repository "${org.task.repository}"` : '"."'}); the server rejects a directory that is not a Git repository and lists the ones it found. Supply dependencyThreadIds atomically in delegate_task when creating dependent implementation work; it waits until dependencies have current independent acceptance. Do not implement or copy child artifacts. Once a child submits, delegate_task(role=review, reviewTaskThreadId=child conversation ID) creates an independent reviewer. After all children are independently accepted, submit your own outcome with t3_organization_task(action=submit); the server aggregates their current manifests. Delegate an independent outcome review targeting your own conversation. Ask Chief for final user acceptance; never accept an outcome yourself.`
         : org.role === "executor"
-          ? "Implement only your delegated task in your worktree. Read/claim your task using t3_organization_task, then submit with action=submit and manifest of relative files. A prose completion is not a submission. If blocked, action=block with exact reason. Do not self-review or delegate."
+          ? `Implement only your delegated task in your worktree${thread.worktreePath ? ` ${thread.worktreePath}` : ""}${thread.branch ? ` on branch ${thread.branch}` : ""}, created from repository "${organizationRepository(thread)}" under the project root. Manifest paths are relative to that worktree. Read/claim your task using t3_organization_task, then submit with action=submit and manifest of relative files. A prose completion is not a submission. If blocked, action=block with exact reason. Do not self-review or delegate.`
           : org.role === "reviewer"
-            ? `Review the actual submitted files of task ${org.reviewTaskThreadId ?? "assigned by your lead"}; t3_organization_task(action=read) with omitted threadId returns the assigned task ID, worktree, manifest and revision. Your own conversation ID also resolves to that assigned task; never substitute another target. Do not implement fixes. Pass the inspected task.revision as revision when calling accept_review or request_changes; the server rejects missing or stale revisions. Use accept_review only for the exact independently inspected submission, or request_changes with actionable findings. Your native session must differ from the submitter's.`
+            ? `Review the actual submitted files of task ${org.reviewTaskThreadId ?? "assigned by your lead"}; t3_organization_task(action=read) with omitted threadId returns the assigned task ID, manifest, revision and artifactSources with each source's repository, branch and workspace. You have no worktree of your own: inspect the files in place at artifactSources[].workspace. Your own conversation ID also resolves to that assigned task; never substitute another target. Do not implement fixes. Pass the inspected task.revision as revision when calling accept_review or request_changes; the server rejects missing or stale revisions. Use accept_review only for the exact independently inspected submission, or request_changes with actionable findings. Your native session must differ from the submitter's.`
             : "Advise on goals and portfolio decisions. Do not implement, delegate implementation, or claim user acceptance.";
-  return `${contract}\n${role}\nTask protocol: ownerThreadId is current ownership. On t3_organization_task read, reviewAssignment is the server-validated assigned reviewer; reviewerThreadId/reviewedRevision are completed attestations and are normally null before review acceptance. Do not declare assignment broken because those attestation fields are null. Resume a validated existing reviewer on its unchanged assigned revision after a tooling failure using t3_thread_send; a new review round uses delegate_task. Review artifactSources in their actual source worktrees, especially lead outcomes whose displayed aggregate paths are not files in the lead worktree.`;
+  return `${contract}\n${role}\nTask protocol: ownerThreadId is current ownership. On t3_organization_task read, reviewAssignment is the server-validated assigned reviewer; reviewerThreadId/reviewedRevision are completed attestations and are normally null before review acceptance. Do not declare assignment broken because those attestation fields are null. Resume a validated existing reviewer on its unchanged assigned revision after a tooling failure using t3_thread_send; a new review round uses delegate_task. Review artifactSources in their actual source worktrees, especially lead outcomes, whose aggregate paths are prefixed with child task IDs and are not files in the project root.`;
 }

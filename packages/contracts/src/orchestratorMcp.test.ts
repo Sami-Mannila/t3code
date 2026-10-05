@@ -22,6 +22,16 @@ const decodeThreadSendInput = Schema.decodeUnknownSync(OrchestratorMcpThreadSend
 const decodeThreadWaitInput = Schema.decodeUnknownSync(OrchestratorMcpThreadWaitInput);
 
 describe("orchestrator MCP contracts", () => {
+  it("accepts only normalized repository paths under the project root", () => {
+    const decode = (repository: string) =>
+      decodeDelegateTaskInput({ task: "Implement", repository }).repository;
+    expect(decode(".")).toBe(".");
+    expect(decode("tt-analytics")).toBe("tt-analytics");
+    expect(decode("group/repo")).toBe("group/repo");
+    for (const repository of ["../x", "/abs", "a/./b", "a//b", "a/", "a/.git", "a\\b", "C:repo"])
+      expect(() => decode(repository), repository).toThrow();
+  });
+
   it("decodes cross-provider delegated task requests and durable results", () => {
     const request = decodeDelegateTaskInput({
       task: "Inspect the workspace and report the result.",

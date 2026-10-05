@@ -1,8 +1,16 @@
 import type { OrganizationRole, OrchestrationV2AppThread, ThreadId } from "@t3tools/contracts";
+import { organizationRepository } from "./OrganizationPolicy.ts";
 
 type TaskThread = Pick<
   OrchestrationV2AppThread,
-  "id" | "projectId" | "title" | "worktreePath" | "organization" | "deletedAt" | "archivedAt"
+  | "id"
+  | "projectId"
+  | "title"
+  | "worktreePath"
+  | "branch"
+  | "organization"
+  | "deletedAt"
+  | "archivedAt"
 >;
 
 /** Read-only interpretation of canonical ownership, not a new assignment or review attestation. */
@@ -38,6 +46,8 @@ export function organizationTaskContext(thread: TaskThread, threads: ReadonlyArr
         ? [thread]
         : [];
   return {
+    repository: organizationRepository(thread),
+    branch: thread.branch,
     currentOwner: owner
       ? {
           threadId: owner.id,
@@ -51,6 +61,8 @@ export function organizationTaskContext(thread: TaskThread, threads: ReadonlyArr
       "currentOwner and reviewAssignment describe the live task assignment. task.reviewerThreadId and task.reviewedRevision are completed attestations only; null means review has not been accepted, not that no reviewer is assigned. artifactSources locates the submitted files for independent inspection; acceptance rechecks their current bytes. A valid existing reviewAssignment on the unchanged revision may resume its reviewer after a tooling failure without inventing a new assignment.",
     artifactSources: sources.map((source) => ({
       taskThreadId: source.id as ThreadId,
+      repository: organizationRepository(source),
+      branch: source.branch,
       workspace: source.worktreePath,
       manifest: source.organization?.task?.manifest ?? [],
       submittedRevision: source.organization?.task?.revision ?? null,

@@ -1,4 +1,4 @@
-import { OrganizationThread } from "./organization.ts";
+import { OrganizationRepositoryPath, OrganizationThread } from "./organization.ts";
 import { OrchestrationMessageContext } from "./composerContext.ts";
 import * as Effect from "effect/Effect";
 import * as Schema from "effect/Schema";
@@ -2875,6 +2875,7 @@ export const OrchestrationV2Command = Schema.Union([
     organizationDependencyThreadIds: Schema.optional(Schema.Array(ThreadId)),
     organizationReview: Schema.optional(Schema.Boolean),
     organizationReviewTaskThreadId: Schema.optional(ThreadId),
+    organizationRepository: Schema.optional(OrganizationRepositoryPath),
     ...OrchestrationV2CreationFields,
     commandId: CommandId,
     parentThreadId: ThreadId,

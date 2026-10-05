@@ -33,6 +33,7 @@ import {
   organizationLayout,
   ROLE_LABELS,
   canAcceptOrganizationOutcome,
+  outcomeFileGroups,
 } from "./organizationLayout";
 import styles from "./organization.module.css";
 
@@ -508,12 +509,20 @@ export function OrganizationPage() {
                       <small>{node.thread.runtime?.status ?? "idle"} · Open conversation</small>
                     </>
                   ) : (
-                    <small>
-                      Owner:{" "}
-                      {node.owner
-                        ? `${ROLE_LABELS[node.owner.source.organization!.role]} · ${node.owner.title}`
-                        : "Unavailable in this view"}
-                    </small>
+                    <>
+                      <small>
+                        Owner:{" "}
+                        {node.owner
+                          ? `${ROLE_LABELS[node.owner.source.organization!.role]} · ${node.owner.title}`
+                          : "Unavailable in this view"}
+                      </small>
+                      {node.thread.source.organization?.role === "executor" && (
+                        <small>
+                          {node.thread.source.organization.task?.repository ?? "."} ·{" "}
+                          {node.thread.branch ?? "Worktree not prepared"}
+                        </small>
+                      )}
+                    </>
                   )}
                 </Link>
               ) : (
@@ -556,15 +565,34 @@ export function OrganizationPage() {
           <div className="space-y-3 p-4 text-sm">
             <p>{acceptedTask?.title}</p>
             <p className="break-all">Reviewed revision: {accepting?.revision ?? "Unavailable"}</p>
-            <ul className="max-h-52 overflow-auto">
-              {acceptedTask?.files?.map((file) => (
-                <li key={file.path} className="break-all">
-                  {file.path} · {file.bytes} bytes
-                  <br />
-                  <span className="text-xs text-muted-foreground">{file.sha256}</span>
-                </li>
+            <div className="max-h-64 space-y-3 overflow-auto">
+              {outcomeFileGroups(acceptedTask?.files ?? [], scoped).map((group) => (
+                <section key={group.child?.id ?? ""} className="space-y-1">
+                  <p className="break-all font-medium">
+                    {group.child?.title ?? "Other files"}
+                    {group.child && (
+                      <>
+                        {" "}
+                        · {group.repository} · {group.branch ?? "No branch"}
+                      </>
+                    )}
+                  </p>
+                  {group.worktreePath && (
+                    <p className="break-all text-xs text-muted-foreground">{group.worktreePath}</p>
+                  )}
+                  <ul>
+                    {group.files.map((file) => (
+                      <li key={file.path} className="break-all">
+                        {file.path} · {file.bytes} bytes
+                        <br />
+                        <span className="text-xs text-muted-foreground">{file.sha256}</span>
+                      </li>
+                    ))}
+                  </ul>
+                </section>
               ))}
-            </ul>
+            </div>
+            <p>You merge each branch in its repository.</p>
             {chief && (
               <Link
                 to="/$environmentId/$threadId"

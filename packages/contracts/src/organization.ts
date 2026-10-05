@@ -10,8 +10,31 @@ export const OrganizationRole = Schema.Literals([
 ]);
 export type OrganizationRole = typeof OrganizationRole.Type;
 
+/**
+ * A Git repository directory relative to the project root, in normalized POSIX form.
+ * "." is the project root itself; a root can also be a plain folder of repositories.
+ */
+export const OrganizationRepositoryPath = TrimmedNonEmptyString.check(
+  Schema.makeFilter(
+    (value: string) =>
+      value === "." ||
+      (!/[\\\0]/.test(value) &&
+        !/^[A-Za-z]:/.test(value) &&
+        value
+          .split("/")
+          .every(
+            (segment) =>
+              segment !== "" && segment !== "." && segment !== ".." && segment !== ".git",
+          )) ||
+      'Repository must be "." or a normalized path relative to the project root, such as "tt-analytics".',
+  ),
+);
+export type OrganizationRepositoryPath = typeof OrganizationRepositoryPath.Type;
+
 export const OrganizationTask = Schema.Struct({
   title: TrimmedNonEmptyString,
+  /** Repository the task's work belongs to. Absent means ".". Fixed once delegated. */
+  repository: Schema.optional(OrganizationRepositoryPath),
   manifest: Schema.optional(Schema.Array(TrimmedNonEmptyString)),
   files: Schema.optional(
     Schema.Array(

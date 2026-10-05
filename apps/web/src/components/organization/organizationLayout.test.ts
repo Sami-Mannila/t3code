@@ -1,7 +1,11 @@
 import { describe, expect, it } from "vite-plus/test";
 import { EnvironmentId, ProjectId, ThreadId, type OrganizationThread } from "@t3tools/contracts";
 import type { EnvironmentThreadShell } from "@t3tools/client-runtime/state/models";
-import { canAcceptOrganizationOutcome, organizationLayout } from "./organizationLayout";
+import {
+  canAcceptOrganizationOutcome,
+  organizationLayout,
+  outcomeFileGroups,
+} from "./organizationLayout";
 const env = EnvironmentId.make("remote"),
   project = ProjectId.make("project");
 function role(
@@ -214,4 +218,37 @@ it("retains rejected submission reviewer only for matching correction revision, 
       (n) => n.id === "role:reviewer",
     ),
   ).toBe(false);
+});
+
+it("groups a lead outcome's files by the executor whose branch the user merges", () => {
+  const base = task("executor-b", "executor-b");
+  const organization = base.source.organization!;
+  const executor = {
+    ...base,
+    branch: "t3/organization/abc",
+    worktreePath: "/worktrees/abc",
+    source: { organization: { ...organization, task: { ...organization.task!, repository: "b" } } },
+  } as unknown as EnvironmentThreadShell;
+  const file = (path: string) => ({ path, sha256: "hash", bytes: 1 });
+  expect(
+    outcomeFileGroups(
+      [file("executor-b/src/a.ts"), file("executor-b/README.md"), file("unknown/x.ts")],
+      [chief, lead, executor],
+    ),
+  ).toEqual([
+    {
+      child: executor,
+      repository: "b",
+      branch: "t3/organization/abc",
+      worktreePath: "/worktrees/abc",
+      files: [file("src/a.ts"), file("README.md")],
+    },
+    {
+      child: undefined,
+      repository: ".",
+      branch: null,
+      worktreePath: null,
+      files: [file("unknown/x.ts")],
+    },
+  ]);
 });

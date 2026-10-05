@@ -8,6 +8,7 @@ import {
   organizationProblem,
   delegatedOrganization,
   organizationExecutionProblem,
+  organizationRepository,
 } from "./OrganizationPolicy.ts";
 import {
   latestExecutedRun,
@@ -6683,7 +6684,15 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
         childThreadId,
         taskTitle,
         command.organizationReview === true,
+        command.organizationRepository,
       );
+      if (initialOrganization?.role === "reviewer" && command.organizationRepository !== undefined)
+        return yield* new OrchestratorDispatchError({
+          commandId: command.commandId,
+          commandType: command.type,
+          cause:
+            "Reviewers inspect the submission in place; repository applies to implementation tasks.",
+        });
       const childOrganization =
         initialOrganization?.task && command.organizationDependencyThreadIds
           ? {
@@ -6870,7 +6879,15 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
               type: "defer_start",
               workspaceStrategy: {
                 type: "worktree",
-                baseRef: parentProjection.thread.branch ?? "HEAD",
+                // Leads delegated before executor-only worktrees have a branch in the
+                // project root's repository; an executor elsewhere starts from its HEAD.
+                baseRef:
+                  parentProjection.thread.branch !== null &&
+                  childThread.organization !== undefined &&
+                  organizationRepository(parentProjection.thread) ===
+                    organizationRepository(childThread)
+                    ? parentProjection.thread.branch
+                    : "HEAD",
               },
             }
           : { type: "start_immediately" },
@@ -8144,11 +8161,13 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
   /**
    * Returns a run whose workspace preparation failed to preparing. The failure
    * item turns cancelled so clients stop offering the retry; ThreadLaunchService
-   * runs the recorded preparation again once this commits.
+   * runs the recorded preparation again once this commits. Organization threads
+   * are prepared by the organization outbox effect instead, enqueued here.
    */
   const dispatchPreparedRunRetry = (
     command: Extract<OrchestrationV2Command, { readonly type: "prepared-run.retry" }>,
     events: Ref.Ref<Array<OrchestrationV2DomainEvent>>,
+    effects: Ref.Ref<Array<PendingOrchestrationEffectV2>>,
   ) =>
     Effect.gen(function* () {
       const projection = yield* loadProjectionForCommand(
@@ -8223,6 +8242,33 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
         type: "run.updated",
         payload: { ...state.run, status: "preparing", completedAt: null },
       });
+      const organization = projection.thread.organization;
+      // The failed preparation blocked the task; retrying it is the explicit unblock,
+      // otherwise admission would hold the retried run until a coordinator intervened.
+      if (organization?.task?.state === "blocked")
+        yield* emitEvent({
+          type: "thread.metadata-updated",
+          threadId: command.threadId,
+          occurredAt: now,
+          payload: {
+            ...projection.thread,
+            organization: {
+              ...organization,
+              task: { ...organization.task, state: "queued", notes: null },
+            },
+            updatedAt: now,
+          },
+        });
+      if (organization)
+        yield* Ref.update(effects, (existing) => [
+          ...existing,
+          {
+            id: `effect:${command.commandId}:organization-workspace:${state.run.id}`,
+            commandId: command.commandId,
+            threadId: command.threadId,
+            request: { type: "organization-workspace.prepare", runId: state.run.id },
+          } satisfies PendingOrchestrationEffectV2,
+        ]);
     });
 
   /**
@@ -9940,7 +9986,7 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
         yield* dispatchPreparedRunFail(command, events);
         break;
       case "prepared-run.retry":
-        yield* dispatchPreparedRunRetry(command, events);
+        yield* dispatchPreparedRunRetry(command, events, effects);
         break;
       case "runtime-request.respond":
         yield* dispatchRuntimeRequestRespond(command, events, effects);

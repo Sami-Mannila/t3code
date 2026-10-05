@@ -491,8 +491,9 @@ it.effect(
       });
       const prepared = yield* orchestrator.getThreadProjection(child.thread.id);
       assert.equal(prepared.runs[0]?.status, "starting");
-      assert.notEqual(prepared.thread.worktreePath, root);
-      assert.isTrue(yield* fs.exists(`${prepared.thread.worktreePath}/.git`));
+      // Leads coordinate from the project root; only executors get a worktree.
+      assert.equal(prepared.thread.worktreePath, null);
+      assert.equal(prepared.thread.branch, null);
       yield* OrganizationWorkspace.prepare({
         commandId: command.commandId,
         threadId: child.thread.id,
@@ -563,6 +564,9 @@ it.effect(
         threadId: reviewerId,
         runId: reviewer.runs[0]!.id,
       });
+      const preparedReviewer = (yield* threads.getThreadProjection(reviewerId)).thread;
+      assert.equal(preparedReviewer.worktreePath, null);
+      assert.equal(preparedReviewer.branch, null);
       for (const id of [executorId, reviewerId]) {
         const current = yield* threads.getThreadProjection(id);
         const native = current.providerThreads[0]!;
@@ -617,6 +621,10 @@ it.effect(
         assert.equal(content.organization.task?.reviewedRevision, null);
         assert.equal(content.reviewAttestation, null);
         assert.equal(content.artifactSources[0]?.workspace, readyExecutor.thread.worktreePath);
+        assert.equal(content.artifactSources[0]?.repository, ".");
+        assert.equal(content.artifactSources[0]?.branch, readyExecutor.thread.branch);
+        assert.equal(content.repository, ".");
+        assert.equal(content.branch, readyExecutor.thread.branch);
 
         assert.equal(content.workspace, readyExecutor.thread.worktreePath);
         assert.equal(content.organization.task?.files?.[0]?.path, "result.txt");
@@ -873,6 +881,361 @@ it.effect(
       assert.isAbove(replay.sequence, 0);
       assert.equal((yield* orchestrator.getThreadProjection(last.threadId)).runs.length, 1);
     }).pipe(Effect.provide(TestLayer.pipe(Layer.provideMerge(NodeServices.layer)))),
+);
+
+/** A plain folder holding Git repositories `a` and `b`, as when a project root groups repositories. */
+const multiRepositoryProject = (projectId: ProjectId) =>
+  Effect.gen(function* () {
+    const projects = yield* ProjectService.ProjectService;
+    const fs = yield* FileSystem.FileSystem;
+    const runner = yield* ProcessRunner.ProcessRunner;
+    const root = yield* fs.realPath(yield* fs.makeTempDirectoryScoped());
+    const git = (cwd: string, ...args: ReadonlyArray<string>) =>
+      runner.run({
+        command: "git",
+        args: ["-c", "user.name=Test", "-c", "user.email=test@example.test", ...args],
+        cwd,
+        timeout: "10 seconds",
+        maxOutputBytes: 1024 * 1024,
+      });
+    for (const name of ["a", "b"]) {
+      yield* fs.makeDirectory(`${root}/${name}`);
+      assert.equal((yield* git(`${root}/${name}`, "init")).code, 0);
+      assert.equal((yield* git(`${root}/${name}`, "commit", "--allow-empty", "-m", name)).code, 0);
+    }
+    yield* projects.create({
+      commandId: CommandId.make(`${projectId}-create`),
+      projectId,
+      title: "Repositories",
+      workspaceRoot: root,
+    });
+    return { root, git };
+  });
+
+const startRoot = (
+  orchestrator: Orchestrator.OrchestratorV2["Service"],
+  threadId: ThreadId,
+  projectId: ProjectId,
+  role: "chief" | "advisor",
+) =>
+  Effect.gen(function* () {
+    yield* orchestrator.dispatch({
+      type: "thread.create",
+      commandId: CommandId.make(`${threadId}-create`),
+      threadId,
+      projectId,
+      title: role,
+      modelSelection,
+      runtimeMode: "full-access",
+      interactionMode: "default",
+      branch: null,
+      worktreePath: null,
+      createdBy: "user",
+      creationSource: "web",
+      organization: { role, parentThreadId: null },
+    });
+    const commandId = CommandId.make(`${threadId}-start`);
+    yield* orchestrator.dispatch({
+      type: "message.dispatch",
+      commandId,
+      messageId: MessageId.make(`${threadId}-request`),
+      threadId,
+      text: "Plan the work",
+      attachments: [],
+      dispatchMode: { type: "start_immediately" },
+      createdBy: "user",
+      creationSource: "web",
+    });
+    return commandId;
+  });
+
+const delegate = (
+  orchestrator: Orchestrator.OrchestratorV2["Service"],
+  parentThreadId: ThreadId,
+  key: string,
+  extra: Partial<Extract<OrchestrationV2Command, { readonly type: "delegated_task.request" }>> = {},
+) =>
+  Effect.gen(function* () {
+    const parent = yield* orchestrator.getThreadProjection(parentThreadId);
+    const run = parent.runs[0]!;
+    const commandId = CommandId.make(key);
+    const result = yield* orchestrator.dispatch({
+      type: "delegated_task.request",
+      commandId,
+      parentThreadId,
+      parentRunId: run.id,
+      parentNodeId: run.rootNodeId!,
+      task: key,
+      title: key,
+      modelSelection,
+      runtimeMode: "full-access",
+      interactionMode: "default",
+      createdBy: "agent",
+      creationSource: "mcp",
+      ...extra,
+    });
+    const childId = result.storedEvents.find((event) => event.event.type === "thread.created")!
+      .event.threadId;
+    const child = yield* orchestrator.getThreadProjection(childId);
+    yield* OrganizationWorkspace.prepare({
+      commandId,
+      threadId: childId,
+      runId: child.runs[0]!.id,
+    });
+    return (yield* orchestrator.getThreadProjection(childId)).thread;
+  });
+
+it.effect(
+  "only executors get a worktree: they work in a named repository under a plain folder root",
+  () =>
+    Effect.gen(function* () {
+      const orchestrator = yield* Orchestrator.OrchestratorV2;
+      const threads = yield* ThreadManagement.ThreadManagementService;
+      const outbox = yield* EffectOutbox.EffectOutboxV2;
+      const sink = yield* EventSink.EventSinkV2;
+      const fs = yield* FileSystem.FileSystem;
+      const projectId = ProjectId.make("repositories-project");
+      const { root, git } = yield* multiRepositoryProject(projectId);
+      const chief = ThreadId.make("repositories-chief");
+      const advisor = ThreadId.make("repositories-advisor");
+      // Chief and Advisor are user-created root roles: they run in the project root.
+      for (const [id, role] of [
+        [chief, "chief"],
+        [advisor, "advisor"],
+      ] as const) {
+        const started = yield* startRoot(orchestrator, id, projectId, role);
+        const effects = yield* outbox.listByCommandId(started);
+        assert.deepEqual(
+          effects.map((effect) => effect.request.type),
+          ["provider-turn.start"],
+        );
+        const thread = (yield* orchestrator.getThreadProjection(id)).thread;
+        assert.equal(thread.worktreePath, null);
+        assert.equal(thread.branch, null);
+      }
+
+      const lead = yield* delegate(orchestrator, chief, "repositories-lead");
+      assert.equal(lead.organization?.role, "lead");
+      assert.equal(lead.worktreePath, null);
+      assert.equal(lead.branch, null);
+
+      const executor = yield* delegate(orchestrator, lead.id, "repositories-executor", {
+        organizationRepository: "b",
+      });
+      assert.equal(executor.organization?.task?.repository, "b");
+      assert.isNotNull(executor.worktreePath);
+      const common = yield* git(
+        executor.worktreePath!,
+        "rev-parse",
+        "--path-format=absolute",
+        "--git-common-dir",
+      );
+      assert.equal(yield* fs.realPath(common.stdout.trim()), `${root}/b/.git`);
+      assert.equal((yield* git(`${root}/b`, "rev-parse", "--verify", executor.branch!)).code, 0);
+
+      const metadata = (
+        id: ThreadId,
+        key: string,
+        patch: Partial<OrganizationTask>,
+        actor?: ThreadId,
+      ) =>
+        Effect.gen(function* () {
+          const org = (yield* threads.getThreadProjection(id)).thread.organization!;
+          return yield* threads.dispatch({
+            type: "thread.metadata.update",
+            commandId: CommandId.make(key),
+            threadId: id,
+            organization: { ...org, task: { ...org.task!, ...patch } },
+            ...(actor ? { organizationActorThreadId: actor } : {}),
+          });
+        });
+      const moved = yield* metadata(
+        executor.id,
+        "repository-moved",
+        { repository: "a" },
+        lead.id,
+      ).pipe(Effect.result);
+      assert.isTrue(
+        moved._tag === "Failure" &&
+          String((moved.failure as { cause?: unknown }).cause).includes("repository is fixed"),
+      );
+
+      yield* fs.writeFileString(`${executor.worktreePath}/result.txt`, "repository b\n");
+      yield* metadata(
+        executor.id,
+        "repositories-submit",
+        { state: "awaiting_review", manifest: ["result.txt"] },
+        executor.id,
+      );
+      const reviewer = yield* delegate(orchestrator, lead.id, "repositories-review", {
+        organizationReview: true,
+        organizationReviewTaskThreadId: executor.id,
+      });
+      assert.equal(reviewer.worktreePath, null);
+      assert.equal(reviewer.branch, null);
+      const reviewRepository = yield* orchestrator
+        .dispatch({
+          type: "delegated_task.request",
+          commandId: CommandId.make("repositories-review-repository"),
+          parentThreadId: lead.id,
+          parentRunId: (yield* orchestrator.getThreadProjection(lead.id)).runs[0]!.id,
+          parentNodeId: (yield* orchestrator.getThreadProjection(lead.id)).runs[0]!.rootNodeId!,
+          task: "Review",
+          modelSelection,
+          runtimeMode: "full-access",
+          interactionMode: "default",
+          createdBy: "agent",
+          creationSource: "mcp",
+          organizationReview: true,
+          organizationReviewTaskThreadId: executor.id,
+          organizationRepository: "b",
+        })
+        .pipe(Effect.result);
+      assert.isTrue(
+        reviewRepository._tag === "Failure" &&
+          String((reviewRepository.failure as { cause?: unknown }).cause).includes(
+            "Reviewers inspect the submission in place",
+          ),
+      );
+
+      // Independent review compares the recorded native conversations.
+      const recordNative = (id: ThreadId) =>
+        Effect.gen(function* () {
+          const native = (yield* threads.getThreadProjection(id)).providerThreads[0]!;
+          yield* sink.write({
+            commandId: CommandId.make(`repositories-native-${id}`),
+            events: [
+              {
+                id: EventId.make(`repositories-native-${id}`),
+                type: "provider-thread.updated",
+                threadId: id,
+                occurredAt: yield* DateTime.now,
+                payload: {
+                  ...native,
+                  nativeThreadRef: { driver, nativeId: `distinct-${id}`, strength: "strong" },
+                },
+              },
+            ],
+          });
+        });
+      yield* recordNative(executor.id);
+      yield* recordNative(reviewer.id);
+      const submitted = (yield* threads.getThreadProjection(executor.id)).thread.organization!
+        .task!;
+      yield* metadata(
+        executor.id,
+        "repositories-accept",
+        { state: "accepted", reviewedRevision: submitted.revision, reviewerThreadId: reviewer.id },
+        reviewer.id,
+      );
+      // The lead submits and the user accepts its outcome without a lead worktree.
+      yield* metadata(lead.id, "repositories-outcome", { state: "awaiting_review" }, lead.id);
+      const outcome = (yield* threads.getThreadProjection(lead.id)).thread.organization!.task!;
+      assert.equal(outcome.files?.[0]?.path, `${executor.id}/result.txt`);
+      const outcomeReviewer = yield* delegate(
+        orchestrator,
+        lead.id,
+        "repositories-outcome-review",
+        {
+          organizationReview: true,
+          organizationReviewTaskThreadId: lead.id,
+        },
+      );
+      yield* recordNative(lead.id);
+      yield* recordNative(outcomeReviewer.id);
+      yield* metadata(
+        lead.id,
+        "repositories-outcome-attest",
+        { reviewedRevision: outcome.revision, reviewerThreadId: outcomeReviewer.id },
+        outcomeReviewer.id,
+      );
+      yield* metadata(lead.id, "repositories-user-accept", { state: "accepted" });
+      assert.equal(
+        (yield* threads.getThreadProjection(lead.id)).thread.organization!.task!.state,
+        "accepted",
+      );
+    }).pipe(
+      Effect.provide(
+        Layer.mergeAll(ProcessRunner.layer, NativeToolkitLayer).pipe(
+          Layer.provideMerge(NodeServices.layer),
+        ),
+      ),
+    ),
+);
+
+it.effect("retrying a failed organization preparation runs the organization prepare again", () =>
+  Effect.gen(function* () {
+    const orchestrator = yield* Orchestrator.OrchestratorV2;
+    const threads = yield* ThreadManagement.ThreadManagementService;
+    const outbox = yield* EffectOutbox.EffectOutboxV2;
+    const projectId = ProjectId.make("retry-project");
+    yield* multiRepositoryProject(projectId);
+    const chief = ThreadId.make("retry-chief");
+    yield* startRoot(orchestrator, chief, projectId, "chief");
+    const parent = yield* orchestrator.getThreadProjection(chief);
+    const result = yield* orchestrator.dispatch({
+      type: "delegated_task.request",
+      commandId: CommandId.make("retry-lead"),
+      parentThreadId: chief,
+      parentRunId: parent.runs[0]!.id,
+      parentNodeId: parent.runs[0]!.rootNodeId!,
+      task: "Outcome",
+      modelSelection,
+      runtimeMode: "full-access",
+      interactionMode: "default",
+      createdBy: "agent",
+      creationSource: "mcp",
+    });
+    const leadId = result.storedEvents.find((event) => event.event.type === "thread.created")!.event
+      .threadId;
+    const lead = yield* threads.getThreadProjection(leadId);
+    const runId = lead.runs[0]!.id;
+    // What the effect worker records when preparation fails for good.
+    yield* threads.dispatch({
+      type: "prepared-run.fail",
+      commandId: CommandId.make("retry-failed"),
+      threadId: leadId,
+      runId,
+      failure: {
+        class: "unknown",
+        message: "simulated",
+        code: "organization_workspace_failed",
+        retryable: false,
+      },
+    });
+    yield* threads.dispatch({
+      type: "thread.metadata.update",
+      commandId: CommandId.make("retry-blocked"),
+      threadId: leadId,
+      organization: {
+        ...lead.thread.organization!,
+        task: { ...lead.thread.organization!.task!, state: "blocked", notes: "simulated" },
+      },
+    });
+    const retry = CommandId.make("retry-run");
+    yield* threads.dispatch({
+      type: "prepared-run.retry",
+      commandId: retry,
+      threadId: leadId,
+      runId,
+    });
+    assert.deepEqual(
+      (yield* outbox.listByCommandId(retry)).map((effect) => effect.request.type),
+      ["organization-workspace.prepare"],
+    );
+    const retried = yield* threads.getThreadProjection(leadId);
+    assert.equal(retried.runs[0]?.status, "preparing");
+    assert.equal(retried.thread.organization?.task?.state, "queued");
+    yield* OrganizationWorkspace.prepare({ commandId: retry, threadId: leadId, runId });
+    assert.equal((yield* threads.getThreadProjection(leadId)).runs[0]?.status, "starting");
+  }).pipe(
+    Effect.provide(
+      Layer.mergeAll(ProcessRunner.layer, ThreadManagement.layer).pipe(
+        Layer.provideMerge(TestLayer),
+        Layer.provideMerge(NodeServices.layer),
+      ),
+    ),
+  ),
 );
 
 it("wire commands cannot provide server artifact verification or spoof an agent actor through the user endpoint", () => {

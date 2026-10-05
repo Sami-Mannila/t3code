@@ -1,5 +1,10 @@
 import type { EnvironmentThreadShell } from "@t3tools/client-runtime/state/models";
-import type { EnvironmentId, ProjectId, OrganizationRole } from "@t3tools/contracts";
+import type {
+  EnvironmentId,
+  ProjectId,
+  OrganizationRole,
+  OrganizationThread,
+} from "@t3tools/contracts";
 
 export const ROLE_LABELS: Record<OrganizationRole, string> = {
   advisor: "Advisor",
@@ -275,4 +280,35 @@ export function canAcceptOrganizationOutcome(thread: EnvironmentThreadShell): bo
     task.reviewerThreadId !== thread.id &&
     !!task.files?.length
   );
+}
+
+type OutcomeFile = NonNullable<NonNullable<OrganizationThread["task"]>["files"]>[number];
+
+/**
+ * Splits a lead outcome's aggregate files (`<child thread ID>/<path>`) by the executor that
+ * produced them, so each group shows the repository and branch the user merges.
+ */
+export function outcomeFileGroups(
+  files: readonly OutcomeFile[],
+  threads: readonly EnvironmentThreadShell[],
+) {
+  const groups = new Map<
+    string,
+    { child: EnvironmentThreadShell | undefined; files: Array<OutcomeFile> }
+  >();
+  for (const file of files) {
+    const slash = file.path.indexOf("/");
+    const child = threads.find((t) => t.id === file.path.slice(0, slash));
+    const key = child ? child.id : "";
+    const group = groups.get(key) ?? { child, files: [] };
+    group.files.push(child ? { ...file, path: file.path.slice(slash + 1) } : file);
+    groups.set(key, group);
+  }
+  return [...groups.values()].map(({ child, files }) => ({
+    child,
+    repository: child?.source.organization?.task?.repository ?? ".",
+    branch: child?.branch ?? null,
+    worktreePath: child?.worktreePath ?? null,
+    files,
+  }));
 }

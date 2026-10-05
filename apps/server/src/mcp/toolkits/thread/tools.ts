@@ -263,7 +263,7 @@ const ScheduledTaskRunTool = Tool.make("run_scheduled_task_now", {
 const OrganizationTaskTool = Tool.make("t3_organization_task", {
   ...commandTool,
   description:
-    "Read or update a canonical organization task. Actor identity is bound to this conversation. Omit threadId to use your task; reviewers automatically target their explicitly assigned submission (their own conversation ID is an alias for that target). Other reviewer targets are rejected. Submit hashes actual manifest files; reviewers must supply the exact revision returned by read when calling accept_review or request_changes; mismatched revisions are rejected; lead outcomes require user acceptance. Read results distinguish reviewAssignment (current assigned reviewer) from reviewAttestation (completed review); null task.reviewerThreadId is normal before acceptance. artifactSources gives physical worktree locations, including child sources for a consolidated outcome. Keep user-facing updates in the Chief conversation.",
+    "Read or update a canonical organization task. Actor identity is bound to this conversation. Omit threadId to use your task; reviewers automatically target their explicitly assigned submission (their own conversation ID is an alias for that target). Other reviewer targets are rejected. Submit hashes actual manifest files; reviewers must supply the exact revision returned by read when calling accept_review or request_changes; mismatched revisions are rejected; lead outcomes require user acceptance. Read results distinguish reviewAssignment (current assigned reviewer) from reviewAttestation (completed review); null task.reviewerThreadId is normal before acceptance. artifactSources gives each source's repository (relative to the project root), branch and physical worktree location, including child sources for a consolidated outcome. Keep user-facing updates in the Chief conversation.",
   parameters: Schema.Struct({
     threadId: Schema.optional(ThreadId),
     action: Schema.Literals([
@@ -288,6 +288,8 @@ const OrganizationTaskTool = Tool.make("t3_organization_task", {
     threadId: ThreadId,
     organization: Schema.NullOr(OrganizationThread),
     workspace: Schema.NullOr(Schema.String),
+    repository: Schema.String,
+    branch: Schema.NullOr(Schema.String),
     currentOwner: Schema.NullOr(
       Schema.Struct({
         threadId: ThreadId,
@@ -309,6 +311,8 @@ const OrganizationTaskTool = Tool.make("t3_organization_task", {
     artifactSources: Schema.Array(
       Schema.Struct({
         taskThreadId: ThreadId,
+        repository: Schema.String,
+        branch: Schema.NullOr(Schema.String),
         workspace: Schema.NullOr(Schema.String),
         manifest: Schema.Array(Schema.String),
         submittedRevision: Schema.NullOr(Schema.String),

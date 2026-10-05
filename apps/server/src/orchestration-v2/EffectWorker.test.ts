@@ -1,7 +1,11 @@
 import { OrganizationAdmissionDeferred } from "./OrganizationAdmission.ts";
+import * as NodeServices from "@effect/platform-node/NodeServices";
 import { assert, it } from "@effect/vitest";
 import {
   CommandId,
+  type OrchestrationV2ServerCommand,
+  type OrchestrationV2ThreadProjection,
+  ProjectId,
   ProviderSessionId,
   ProviderThreadId,
   ProviderTurnId,
@@ -14,11 +18,16 @@ import * as DateTime from "effect/DateTime";
 import * as Deferred from "effect/Deferred";
 import * as Effect from "effect/Effect";
 import * as Exit from "effect/Exit";
+import * as FileSystem from "effect/FileSystem";
 import * as Layer from "effect/Layer";
 import * as Option from "effect/Option";
 import * as Queue from "effect/Queue";
 import * as Ref from "effect/Ref";
+import type * as Scope from "effect/Scope";
 import * as TestClock from "effect/testing/TestClock";
+
+import * as ServerConfig from "../config.ts";
+import * as ProjectStore from "./ProjectStore.ts";
 
 import * as CheckpointRollbackService from "./CheckpointRollbackService.ts";
 import * as EffectOutbox from "./EffectOutbox.ts";
@@ -915,4 +924,112 @@ it.effect(
       assert.equal(result._tag, "Failure");
       assert.deepEqual(yield* Ref.get(events), ["prepared-run.fail", "blocked"]);
     }),
+);
+
+const organizationPrepareCase = (input: {
+  readonly workspaceRoot: Effect.Effect<string, never, FileSystem.FileSystem | Scope.Scope>;
+  readonly project?: Effect.Effect<Option.Option<never>, ProjectStore.ProjectStoreV2Error>;
+}) =>
+  Effect.gen(function* () {
+    const workspaceRoot = yield* input.workspaceRoot;
+    const dispatched = yield* Ref.make<ReadonlyArray<OrchestrationV2ServerCommand>>([]);
+    const now = yield* DateTime.now;
+    const effect: EffectOutbox.OrchestrationEffectV2 = {
+      ...restartEffect(now, {
+        type: "replace",
+        replacementProviderSessionId: replacementSessionId,
+      }),
+      request: { type: "organization-workspace.prepare", runId },
+    };
+    const projection = {
+      thread: {
+        id: threadId,
+        projectId: ProjectId.make("organization-project"),
+        worktreePath: null,
+        branch: null,
+        organization: {
+          role: "executor",
+          parentThreadId: ThreadId.make("lead"),
+          task: {
+            title: "Implementation",
+            ownerThreadId: threadId,
+            dependencyThreadIds: [],
+            state: "queued",
+            revision: null,
+            reviewedRevision: null,
+            reviewerThreadId: null,
+            notes: null,
+          },
+        },
+      },
+      runs: [{ id: runId, status: "preparing" }],
+    } as unknown as OrchestrationV2ThreadProjection;
+    const layer = makeExecutorLayer({
+      events: yield* Ref.make<ReadonlyArray<string>>([]),
+      threads: {
+        getThreadProjection: () => Effect.succeed(projection),
+        dispatch: (command) =>
+          Ref.update(dispatched, (all) => [...all, command]).pipe(
+            Effect.as({ sequence: 1, storedEvents: [] }),
+          ),
+      },
+    }).pipe(
+      Layer.provide(
+        Layer.mergeAll(
+          NodeServices.layer,
+          Layer.mock(ProjectStore.ProjectStoreV2)({
+            get: () => input.project ?? Effect.succeed(Option.some({ workspaceRoot } as never)),
+          }),
+          ServerConfig.layerTest(process.cwd(), { prefix: "t3-effect-worker-organization-" }).pipe(
+            Layer.provide(NodeServices.layer),
+          ),
+        ),
+      ),
+    );
+    // The first of several attempts: the worker would retry a failure.
+    const result = yield* EffectWorker.OrchestrationEffectExecutorV2.pipe(
+      Effect.flatMap((executor) => executor.execute(effect, { willRetry: true })),
+      Effect.provide(layer),
+      Effect.result,
+    );
+    return { result, dispatched: yield* Ref.get(dispatched) };
+  });
+
+it.effect(
+  "a deterministic organization preparation failure settles on its first attempt with the Git cause",
+  () =>
+    Effect.gen(function* () {
+      const { result, dispatched } = yield* organizationPrepareCase({
+        // A plain folder is not a repository, so the executor's "." cannot be prepared.
+        workspaceRoot: Effect.flatMap(FileSystem.FileSystem, (fs) =>
+          fs.makeTempDirectoryScoped(),
+        ).pipe(Effect.orDie),
+      });
+      // Success completes the outbox effect instead of scheduling another attempt.
+      assert.equal(result._tag, "Success");
+      assert.deepEqual(
+        dispatched.map((command) => command.type),
+        ["prepared-run.fail", "thread.metadata.update"],
+      );
+      const blocked = dispatched[1] as Extract<
+        OrchestrationV2ServerCommand,
+        { readonly type: "thread.metadata.update" }
+      >;
+      assert.equal(blocked.organization?.task?.state, "blocked");
+      assert.include(blocked.organization?.task?.notes, "is not a Git repository");
+      assert.include(blocked.organization?.task?.notes, "fatal: not a git repository");
+    }).pipe(Effect.scoped, Effect.provide(NodeServices.layer)),
+);
+
+it.effect("a transient organization preparation failure stays retryable", () =>
+  Effect.gen(function* () {
+    const { result, dispatched } = yield* organizationPrepareCase({
+      workspaceRoot: Effect.succeed("/unused"),
+      project: Effect.fail(
+        new ProjectStore.ProjectStoreV2Error({ operation: "get", cause: "database busy" }),
+      ),
+    });
+    assert.equal(result._tag, "Failure");
+    assert.deepEqual(dispatched, []);
+  }).pipe(Effect.scoped, Effect.provide(NodeServices.layer)),
 );

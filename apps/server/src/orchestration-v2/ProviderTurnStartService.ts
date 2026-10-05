@@ -1,4 +1,8 @@
-import { organizationExecutionProblem, organizationInstructions } from "./OrganizationPolicy.ts";
+import {
+  organizationExecutionProblem,
+  organizationInstructions,
+  organizationRepositoryRoot,
+} from "./OrganizationPolicy.ts";
 import * as OrganizationArtifacts from "./OrganizationArtifacts.ts";
 import * as Path from "effect/Path";
 import { modelSelectionsEqual } from "@t3tools/shared/model";
@@ -516,10 +520,14 @@ export const layer: Layer.Layer<
               worktreePath,
               branch,
             });
-            yield* gitWorkflow.pruneWorktrees({ cwd: project.workspaceRoot }).pipe(
+            const repositoryRoot = organizationRepositoryRoot(
+              project.workspaceRoot,
+              projection.thread,
+            );
+            yield* gitWorkflow.pruneWorktrees({ cwd: repositoryRoot }).pipe(
               Effect.andThen(
                 gitWorkflow.createWorktree({
-                  cwd: project.workspaceRoot,
+                  cwd: repositoryRoot,
                   refName: branch,
                   path: worktreePath,
                 }),

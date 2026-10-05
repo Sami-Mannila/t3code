@@ -196,45 +196,57 @@ export const executorLayer: Layer.Layer<
                 ),
               );
             });
+            // Fails the run and blocks the task so the parent and Chief hear the real cause.
+            const failRun = (cause: unknown) =>
+              Effect.gen(function* () {
+                const projection = yield* threads.getThreadProjection(effect.threadId);
+                const message = cause instanceof Error ? cause.message : String(cause);
+                yield* threads.dispatch({
+                  type: "prepared-run.fail",
+                  commandId: CommandId.make(`${effect.commandId}:organization-prepare-failed`),
+                  threadId: effect.threadId,
+                  runId: request.runId,
+                  failure: {
+                    class: "unknown",
+                    message: message.slice(0, 4096),
+                    code: "organization_workspace_failed",
+                    retryable: false,
+                  },
+                });
+                if (projection.thread.organization?.task)
+                  yield* threads.dispatch({
+                    type: "thread.metadata.update",
+                    commandId: CommandId.make(`${effect.commandId}:organization-blocked`),
+                    threadId: effect.threadId,
+                    organization: {
+                      ...projection.thread.organization,
+                      task: {
+                        ...projection.thread.organization.task,
+                        state: "blocked",
+                        notes: `Workspace preparation failed: ${message.slice(0, 1_200)}\nFix the cause, then retry the run or delegate again.`,
+                      },
+                    },
+                  });
+              });
             return prepare.pipe(
-              Effect.tapError((cause) =>
-                willRetry || isOrganizationAdmissionDeferred(cause)
-                  ? Effect.void
-                  : Effect.gen(function* () {
-                      const projection = yield* threads.getThreadProjection(effect.threadId);
-                      yield* threads.dispatch({
-                        type: "prepared-run.fail",
-                        commandId: CommandId.make(
-                          `${effect.commandId}:organization-prepare-failed`,
+              Effect.catch((cause) =>
+                isOrganizationAdmissionDeferred(cause)
+                  ? Effect.fail(cause)
+                  : OrganizationWorkspace.isTerminalWorkspaceFailure(cause)
+                    ? // Retrying a deterministic failure only repeats it: settle the
+                      // run now and complete the effect.
+                      failRun(cause).pipe(
+                        Effect.andThen(
+                          Effect.logWarning("Organization workspace preparation failed", {
+                            effectId: effect.id,
+                            threadId: effect.threadId,
+                            error: String(cause),
+                          }),
                         ),
-                        threadId: effect.threadId,
-                        runId:
-                          effect.request.type === "organization-workspace.prepare"
-                            ? effect.request.runId
-                            : projection.runs[0]!.id,
-                        failure: {
-                          class: "unknown",
-                          message: String(cause).slice(0, 4096),
-                          code: "organization_workspace_failed",
-                          retryable: false,
-                        },
-                      });
-                      if (projection.thread.organization?.task)
-                        yield* threads.dispatch({
-                          type: "thread.metadata.update",
-                          commandId: CommandId.make(`${effect.commandId}:organization-blocked`),
-                          threadId: effect.threadId,
-                          organization: {
-                            ...projection.thread.organization,
-                            task: {
-                              ...projection.thread.organization.task,
-                              state: "blocked",
-                              notes:
-                                "Isolated worktree preparation failed; inspect the preparation error and retry explicitly.",
-                            },
-                          },
-                        });
-                    }),
+                      )
+                    : willRetry
+                      ? Effect.fail(cause)
+                      : failRun(cause).pipe(Effect.andThen(Effect.fail(cause))),
               ),
               Effect.mapError(
                 (cause) =>

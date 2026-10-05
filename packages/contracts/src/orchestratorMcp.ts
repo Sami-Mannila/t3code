@@ -36,6 +36,7 @@ import {
   ProviderOptionSelectionValue,
 } from "./model.ts";
 import { ProviderDriverKind, ProviderInstanceId } from "./providerInstance.ts";
+import { OrganizationRepositoryPath } from "./organization.ts";
 
 const OrchestratorMcpPrompt = TrimmedNonEmptyString.check(Schema.isMaxLength(120_000)).annotate({
   description: "Complete task or message text for the target agent.",
@@ -169,6 +170,10 @@ export type OrchestratorMcpTerminalDelegatedTaskStatus =
 export const OrchestratorMcpDelegateTaskInput = Schema.Struct({
   reviewTaskThreadId: Schema.optional(ThreadId),
   dependencyThreadIds: Schema.optional(Schema.Array(ThreadId)),
+  repository: Schema.optional(OrganizationRepositoryPath).annotate({
+    description:
+      'Organization only. Git repository for the delegated work, relative to the project root ("." is the root). An implementation task gets its own worktree and branch in it; omitted, it uses the lead\'s repository, else ".". Not accepted for reviews.',
+  }),
   task: OrchestratorMcpPrompt.annotate({
     description: "Self-contained task for one delegated child agent/subagent.",
   }),
@@ -575,6 +580,7 @@ export class OrchestratorMcpFailure extends Schema.TaggedError<OrchestratorMcpFa
       "parent_not_active",
       "provider_unavailable",
       "model_unavailable",
+      "repository_unavailable",
       "runtime_mode_escalation_denied",
       "interaction_mode_escalation_denied",
       "task_not_found",
