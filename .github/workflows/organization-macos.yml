@@ -1,0 +1,53 @@
+name: Organization Mac app
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [organization/v2]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: organization-macos-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build:
+    if: github.repository == 'Sami-Mannila/t3code'
+    runs-on: macos-15
+    timeout-minutes: 60
+    env:
+      CSC_IDENTITY_AUTO_DISCOVERY: "false"
+      T3CODE_DESKTOP_SIGNED: "false"
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          persist-credentials: false
+      - name: Verify Apple Silicon host
+        run: test "$(uname -m)" = arm64
+      - name: Setup Vite+
+        uses: voidzero-dev/setup-vp@250f29ce396baf5e8f24498e17c0dfdebabc26eb # v1
+        with:
+          node-version-file: package.json
+          run-install: false
+      - name: Install pinned dependencies
+        run: vp install --frozen-lockfile
+      - name: Setup Rust
+        uses: dtolnay/rust-toolchain@6bed0761d98439e5a578e2877258200ad565ba87 # stable
+        with:
+          toolchain: stable
+          targets: aarch64-apple-darwin
+      - name: Build unsigned organization app
+        run: >-
+          vp run dist:desktop:artifact
+          --platform mac --target zip --arch arm64
+          --build-version "0.0.46-preview.org20261005.${GITHUB_RUN_NUMBER}"
+          --output-dir release/organization-macos
+      - name: Upload app
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        with:
+          name: organization-macos-arm64-${{ github.sha }}
+          path: release/organization-macos/*.zip
+          if-no-files-found: error
+          retention-days: 14
