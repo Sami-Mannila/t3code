@@ -1,10 +1,13 @@
-// @effect-diagnostics globalFetch:off globalConsole:off globalConsoleInEffect:off - Host-side pilot uses sanitized CLI output and an in-memory OAuth exchange before native Effect RPC.
+// @effect-diagnostics globalFetch:off globalConsole:off globalConsoleInEffect:off nodeBuiltinImport:off - Host-side pilot uses sanitized CLI output, an in-memory OAuth exchange and synchronous read-only checks of the project root before native Effect RPC.
 import {
   pilotFailureReceipt,
   hasNewPilotFailure,
   type PilotFailureReceipt,
 } from "./organizationPilotObservation.ts";
 import * as NodeCrypto from "@effect/platform-node/NodeCrypto";
+import * as NodeChildProcess from "node:child_process";
+import * as NodeFS from "node:fs";
+import * as NodePath from "node:path";
 /** Disposable native-RPC pilot. Does not start a server and refuses model work without --authorized-run.
  * Run from the fork root with its private T3_PILOT_BOOTSTRAP_TOKEN already in the environment.
  * No token, provider settings, environment dump, prompt transcript, or credential file is logged. */
@@ -41,9 +44,16 @@ import { RpcClient, RpcSerialization } from "effect/unstable/rpc";
 class PilotBlocked extends Data.TaggedError("PilotBlocked")<{}> {}
 
 const origin = "http://127.0.0.1:3783";
-const workspaceRoot = `${process.cwd()}/.t3-pilot/project`;
 const token = process.env.T3_PILOT_BOOTSTRAP_TOKEN?.trim();
 const probeOnly = process.argv.includes("--probe-only");
+const rootIndex = process.argv.indexOf("--project-root");
+const requestedRoot = rootIndex >= 0 ? process.argv[rootIndex + 1]?.trim() : undefined;
+if (rootIndex >= 0 && (!requestedRoot || requestedRoot.startsWith("--")))
+  throw new Error("--project-root requires an absolute directory.");
+if (requestedRoot !== undefined && !NodePath.isAbsolute(requestedRoot))
+  throw new Error("--project-root must be an absolute directory.");
+const workspaceRoot = requestedRoot ?? `${process.cwd()}/.t3-pilot/project`;
+const multiRepo = process.argv.includes("--multi-repo");
 const observeIndex = process.argv.indexOf("--observe-chief");
 const observeChief = observeIndex >= 0 ? process.argv[observeIndex + 1]?.trim() : undefined;
 if (observeIndex >= 0 && (!observeChief || observeChief.startsWith("--")))
@@ -54,6 +64,64 @@ if (resumeIndex >= 0 && (!resumeChief || resumeChief.startsWith("--")))
   throw new Error("--resume-chief requires an exact existing Chief thread ID.");
 if (resumeChief && observeChief) throw new Error("Choose recovery or observation, not both.");
 const existingChief = resumeChief ?? observeChief;
+if (multiRepo && existingChief)
+  throw new Error(
+    "--multi-repo creates a new isolated project; it cannot resume or observe a Chief.",
+  );
+
+/** Read-only Git query in the C locale; null when Git exits non-zero. */
+const gitOutput = (cwd: string, args: ReadonlyArray<string>) => {
+  try {
+    return NodeChildProcess.execFileSync("git", ["-C", cwd, ...args], {
+      encoding: "utf8",
+      stdio: ["ignore", "pipe", "ignore"],
+      timeout: 10_000,
+      env: { ...process.env, LC_ALL: "C", LANGUAGE: "C" },
+    }).trim();
+  } catch {
+    return null;
+  }
+};
+const MULTI_REPO_TARGET = "repo-a";
+/**
+ * A multi-repo root is a plain folder of repositories: it must not be (or sit inside) a Git
+ * work tree, and the repository the executor works in must be one of its children.
+ */
+const validateMultiRepoRoot = (root: string) => {
+  const stat = NodeFS.statSync(root, { throwIfNoEntry: false });
+  if (!stat?.isDirectory()) throw new Error("--multi-repo: the project root is not a directory.");
+  const real = NodeFS.realpathSync(root);
+  if (gitOutput(real, ["rev-parse", "--is-inside-work-tree"]) === "true")
+    throw new Error(
+      "--multi-repo: the project root is inside a Git work tree; use a plain folder.",
+    );
+  const repositories = NodeFS.readdirSync(real, { withFileTypes: true })
+    .filter((entry) => entry.isDirectory())
+    .map((entry) => entry.name)
+    .filter((name) => {
+      const child = NodePath.join(real, name);
+      const top = gitOutput(child, ["rev-parse", "--show-toplevel"]);
+      return (
+        top !== null &&
+        NodeFS.realpathSync(top) === NodeFS.realpathSync(child) &&
+        gitOutput(child, ["rev-parse", "--verify", "--quiet", "HEAD^{commit}"]) !== null
+      );
+    })
+    .toSorted();
+  if (!repositories.includes(MULTI_REPO_TARGET))
+    throw new Error(
+      `--multi-repo: the project root must contain a Git repository "${MULTI_REPO_TARGET}" with a commit; found ${repositories.length ? repositories.join(", ") : "none"}.`,
+    );
+  return repositories;
+};
+if (multiRepo) {
+  const repositories = validateMultiRepoRoot(workspaceRoot);
+  console.log(`Pilot multi-repo root validated: repositories=${repositories.join(",")}`);
+} else if (
+  requestedRoot !== undefined &&
+  !NodeFS.statSync(requestedRoot, { throwIfNoEntry: false })?.isDirectory()
+)
+  throw new Error("--project-root is not a directory.");
 if (!process.argv.includes("--authorized-run") && !probeOnly && !observeChief) {
   console.log(
     "Prepared only: isolated native pilot, loopback 3783, no server or model calls. Root readiness approval is required before --authorized-run.",
@@ -212,7 +280,7 @@ const program = Effect.gen(function* () {
       type: "project.create",
       commandId: CommandId.make(yield* uuid()),
       projectId,
-      title: "Isolated organization smoke",
+      title: multiRepo ? "Isolated multi-repo organization smoke" : "Isolated organization smoke",
       workspaceRoot,
       defaultModelSelection: modelSelection,
     });
@@ -224,7 +292,9 @@ const program = Effect.gen(function* () {
       creationSource: "web",
       threadId,
       projectId,
-      title: "Chief of staff · isolated smoke",
+      title: multiRepo
+        ? "Chief of staff · isolated multi-repo smoke"
+        : "Chief of staff · isolated smoke",
       modelSelection,
       runtimeMode: "full-access",
       interactionMode: "default",
@@ -243,9 +313,11 @@ const program = Effect.gen(function* () {
       creationSource: "web",
       threadId,
       messageId: MessageId.make(yield* uuid()),
-      text: resumeChief
-        ? "The organization review lookup defect has been repaired and independently reviewed. Recover this existing isolated smoke workstream: ask the same project lead to resume its same assigned reviewer on the existing smoke-test.txt artifact. Do not create another Chief, outcome or executor task. Do not redo executor work unless independent review establishes a real artifact correction is necessary. Use the existing native task IDs and review assignment; no orgctl or duplicate coordinator. Finish the existing reviewed lead outcome awaiting my final acceptance, never accept it on my behalf. The only permitted artifact remains smoke-test.txt with exactly organization works followed by a newline, 19 bytes and SHA256 a74f3d39459e0245fe64e6360b24c033930204d115611ad5f5083c4fcb600707. No assets/research/credentials/production."
-        : `Run the isolated organization smoke described in AGENTS.md. Coordinate through a project lead, an executor and an independent reviewer using native T3 tools. Change only smoke-test.txt to exactly organization works followed by one newline (19 UTF-8 bytes; SHA256 a74f3d39459e0245fe64e6360b24c033930204d115611ad5f5083c4fcb600707). Use the configured role models: lead ${describe(roleModel("lead"))}, executor ${describe(executorModel)}, reviewer ${describe(roleModel("reviewer"))}. No research, installation, external source access, or other files. Finish at reviewed final outcome awaiting my acceptance, do not accept on my behalf.`,
+      text: multiRepo
+        ? `Run the isolated multi-repo organization smoke. The project root is a plain folder of Git repositories, not a repository itself. Delegate exactly one project lead. The lead must delegate exactly one executor with delegate_task repository="${MULTI_REPO_TARGET}" to create only smoke-test.txt in ${MULTI_REPO_TARGET} with exactly organization works followed by one newline (19 UTF-8 bytes; SHA256 a74f3d39459e0245fe64e6360b24c033930204d115611ad5f5083c4fcb600707), then an independent review of that submission. Use the configured role models: lead ${describe(roleModel("lead"))}, executor ${describe(executorModel)}, reviewer ${describe(roleModel("reviewer"))}. No other files or repositories, no research, installation, external source access or credentials. Finish at the reviewed lead outcome awaiting my acceptance; never accept it on my behalf.`
+        : resumeChief
+          ? "The organization review lookup defect has been repaired and independently reviewed. Recover this existing isolated smoke workstream: ask the same project lead to resume its same assigned reviewer on the existing smoke-test.txt artifact. Do not create another Chief, outcome or executor task. Do not redo executor work unless independent review establishes a real artifact correction is necessary. Use the existing native task IDs and review assignment; no orgctl or duplicate coordinator. Finish the existing reviewed lead outcome awaiting my final acceptance, never accept it on my behalf. The only permitted artifact remains smoke-test.txt with exactly organization works followed by a newline, 19 bytes and SHA256 a74f3d39459e0245fe64e6360b24c033930204d115611ad5f5083c4fcb600707. No assets/research/credentials/production."
+          : `Run the isolated organization smoke described in AGENTS.md. Coordinate through a project lead, an executor and an independent reviewer using native T3 tools. Change only smoke-test.txt to exactly organization works followed by one newline (19 UTF-8 bytes; SHA256 a74f3d39459e0245fe64e6360b24c033930204d115611ad5f5083c4fcb600707). Use the configured role models: lead ${describe(roleModel("lead"))}, executor ${describe(executorModel)}, reviewer ${describe(roleModel("reviewer"))}. No research, installation, external source access, or other files. Finish at reviewed final outcome awaiting my acceptance, do not accept on my behalf.`,
       attachments: [],
       dispatchMode: { type: queueBehindActive ? "queue_after_active" : "start_immediately" },
     });
