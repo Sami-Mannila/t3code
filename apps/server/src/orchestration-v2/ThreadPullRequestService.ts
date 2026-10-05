@@ -27,6 +27,7 @@ import * as ProjectStore from "./ProjectStore.ts";
 import * as PullRequestService from "../pullRequest/PullRequestService.ts";
 import * as RepositoryIdentityResolver from "../project/RepositoryIdentityResolver.ts";
 import { forkParked } from "../serverActivation.ts";
+import { isOrganizationExecutorBranch } from "./OrganizationPolicy.ts";
 import * as Orchestrator from "./Orchestrator.ts";
 
 class ThreadPullRequestServiceV2 extends Context.Service<
@@ -173,7 +174,8 @@ export const make = Effect.gen(function* () {
         ((thread.settledOverride !== "settled" && thread.settledAt === null) ||
           request.threadId !== null ||
           pendingBackfill.has(thread.id)) &&
-        (thread.branch !== null || thread.branchPullRequest != null),
+        (thread.branch !== null || thread.branchPullRequest != null) &&
+        !isOrganizationExecutorBranch(thread),
     );
     const groups = Map.groupBy(threads, (thread) =>
       JSON.stringify([thread.projectId, thread.worktreePath, thread.branch]),
@@ -345,9 +347,9 @@ export const make = Effect.gen(function* () {
               }).pipe(Effect.tap(() => Effect.sync(() => failBackfill(group)))),
           ),
         ),
-      // Wide enough that a sweep's GitHub branch lookups reach GitHubCli together and share one
-      // GraphQL document, instead of one `gh pr list` per branch.
-      { concurrency: 32, discard: true },
+      // Lookups that reach GitHubCli together share one GraphQL document. Each group also
+      // spawns several git processes first, so a sweep keeps only a few groups in flight.
+      { concurrency: 8, discard: true },
     );
   });
 
@@ -369,8 +371,11 @@ export const make = Effect.gen(function* () {
       case "thread.unarchived":
       case "thread.metadata-updated":
         return worker.enqueue({ threadId: event.threadId, refresh: false });
-      case "thread.unsettled":
+      // Every turn captures checkpoints and also ends with a run.updated that refreshes,
+      // so a checkpoint only re-reads the cached answer.
       case "checkpoint.captured":
+        return worker.enqueue({ threadId: event.threadId, refresh: false });
+      case "thread.unsettled":
         return worker.enqueue({ threadId: event.threadId, refresh: true });
       case "run.updated":
         if (

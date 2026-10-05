@@ -670,6 +670,8 @@ function makeManager(input?: {
   serverSettings?: Parameters<typeof ServerSettings.layerTest>[0];
   setupScriptRunner?: ProjectSetupScriptRunner.ProjectSetupScriptRunner["Service"];
   gitConfigReads?: string[];
+  /** Records the operation name of every git command the manager runs. */
+  gitOperations?: string[];
   /** Seeds the V2 stores the per-project settings lookup reads. */
   seed?: Effect.Effect<
     void,
@@ -685,30 +687,35 @@ function makeManager(input?: {
 
   const serverSettingsLayer = ServerSettings.ServerSettingsService.layerTest(input?.serverSettings);
 
-  const vcsDriverLayer = input?.gitConfigReads
-    ? Layer.effect(
-        GitVcsDriver.GitVcsDriver,
-        GitVcsDriver.make.pipe(
-          Effect.map((service) =>
-            GitVcsDriver.GitVcsDriver.of({
-              ...service,
-              readConfigValue: (cwd, key) =>
-                Effect.sync(() => input.gitConfigReads?.push(key)).pipe(
-                  Effect.andThen(service.readConfigValue(cwd, key)),
-                ),
-            }),
+  const vcsDriverLayer =
+    input?.gitConfigReads || input?.gitOperations
+      ? Layer.effect(
+          GitVcsDriver.GitVcsDriver,
+          GitVcsDriver.make.pipe(
+            Effect.map((service) =>
+              GitVcsDriver.GitVcsDriver.of({
+                ...service,
+                readConfigValue: (cwd, key) =>
+                  Effect.sync(() => input.gitConfigReads?.push(key)).pipe(
+                    Effect.andThen(service.readConfigValue(cwd, key)),
+                  ),
+                execute: (executeInput) =>
+                  Effect.sync(() => input.gitOperations?.push(executeInput.operation)).pipe(
+                    Effect.andThen(service.execute(executeInput)),
+                  ),
+              }),
+            ),
           ),
-        ),
-      ).pipe(
-        Layer.provideMerge(VcsProcess.layer),
-        Layer.provideMerge(NodeServices.layer),
-        Layer.provideMerge(serverConfigLayer),
-      )
-    : GitVcsDriver.layer.pipe(
-        Layer.provideMerge(VcsProcess.layer),
-        Layer.provideMerge(NodeServices.layer),
-        Layer.provideMerge(serverConfigLayer),
-      );
+        ).pipe(
+          Layer.provideMerge(VcsProcess.layer),
+          Layer.provideMerge(NodeServices.layer),
+          Layer.provideMerge(serverConfigLayer),
+        )
+      : GitVcsDriver.layer.pipe(
+          Layer.provideMerge(VcsProcess.layer),
+          Layer.provideMerge(NodeServices.layer),
+          Layer.provideMerge(serverConfigLayer),
+        );
   const sourceControlRegistryLayer = Layer.effect(
     SourceControlProviderRegistry.SourceControlProviderRegistry,
     (input?.sourceControlProvider === undefined
@@ -1161,6 +1168,36 @@ it.layer(GitManagerTestLayer)("GitManager", (it) => {
       expect(status.refName).toBe("feature/never-pushed");
       expect(status.pr).toBeNull();
       expect(ghCalls.filter((call) => call.startsWith("pr list "))).toHaveLength(0);
+    }),
+  );
+
+  it.effect("branch PR lookup reuses the branch layout until a refresh or invalidation", () =>
+    Effect.gen(function* () {
+      const repoDir = yield* makeTempDir("t3code-git-manager-");
+      yield* initRepo(repoDir);
+      const remoteDir = yield* createBareRemote();
+      yield* runGit(repoDir, ["remote", "add", "origin", remoteDir]);
+      yield* runGit(repoDir, ["checkout", "-b", "feature/layout-cache"]);
+      yield* runGit(repoDir, ["push", "-u", "origin", "feature/layout-cache"]);
+      const gitOperations: string[] = [];
+      const { manager } = yield* makeManager({ gitOperations });
+      const layoutReads = () =>
+        gitOperations.filter((operation) => operation.startsWith("GitManager.branchPullRequest."))
+          .length;
+      const lookup = (options?: { readonly refresh?: boolean }) =>
+        manager.branchPullRequest({ cwd: repoDir, branch: "feature/layout-cache" }, options);
+
+      yield* lookup();
+      const firstReads = layoutReads();
+      expect(firstReads).toBeGreaterThan(0);
+      yield* lookup();
+      expect(layoutReads()).toBe(firstReads);
+
+      yield* lookup({ refresh: true });
+      expect(layoutReads()).toBe(firstReads * 2);
+      yield* manager.invalidateStatus(repoDir);
+      yield* lookup();
+      expect(layoutReads()).toBe(firstReads * 3);
     }),
   );
 
