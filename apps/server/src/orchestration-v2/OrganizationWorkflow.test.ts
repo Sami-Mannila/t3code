@@ -27,6 +27,7 @@ import {
   DEFAULT_SERVER_SETTINGS,
   ProviderThreadId,
   RunId,
+  RuntimeRequestId,
   ThreadId,
 } from "@t3tools/contracts";
 import * as DateTime from "effect/DateTime";
@@ -1807,6 +1808,124 @@ it.effect("the Chief hears only status changes of its leads and blocked work", (
     ]);
     yield* update(lead, "lead-claim", { state: "working" });
     assert.deepEqual(yield* noticeIds(chief), ["organization:lead-claim"]);
+  }).pipe(Effect.provide(taskNoticeLayer)),
+);
+
+it.effect("new instructions unblock a blocked executor at once; notices and its own do not", () =>
+  Effect.gen(function* () {
+    const { orchestrator, chief, lead, executor, block, noticeIds } = yield* taskNoticeSetup;
+    const threads = yield* ThreadManagement.ThreadManagementService;
+    const state = (id: ThreadId) =>
+      threads
+        .getThreadProjection(id)
+        .pipe(Effect.map((projection) => projection.thread.organization?.task));
+    const send = (
+      key: string,
+      patch: Partial<Extract<OrchestrationV2Command, { type: "message.dispatch" }>>,
+    ) =>
+      orchestrator.dispatch({
+        type: "message.dispatch",
+        commandId: CommandId.make(key),
+        messageId: MessageId.make(key),
+        threadId: executor,
+        text: "Go with option 2.",
+        attachments: [],
+        dispatchMode: { type: "queue_after_active" },
+        createdBy: "agent",
+        creationSource: "mcp",
+        ...patch,
+      });
+
+    yield* block(executor, "executor-blocked");
+    // Server notices, other agents and the executor itself leave the block for its coordinator.
+    yield* send("notice", {
+      messageId: MessageId.make("organization-parent:notice"),
+      senderThreadId: lead,
+      creationSource: "server",
+      notification: { source: { kind: "background_task" }, outcome: "updated", summary: "x" },
+    });
+    yield* send("own-status", { senderThreadId: executor });
+    yield* send("chief-bypass", { senderThreadId: chief });
+    assert.equal((yield* state(executor))?.state, "blocked");
+
+    // Its lead's brief (t3_thread_send) unblocks it in the same command.
+    yield* send("lead-brief", { senderThreadId: lead });
+    const unblocked = (yield* state(executor))!;
+    assert.include(["working", "queued"], unblocked.state);
+    assert.equal(unblocked.notes, "Unblocked by new instructions from its lead.");
+    // The lead sent it, so the lead is not told about its own instruction.
+    assert.notInclude(yield* noticeIds(lead), "organization-parent:lead-brief");
+
+    // A user's message unblocks it, starting at once rather than being refused as blocked.
+    yield* block(executor, "executor-blocked-again");
+    yield* send("user-answer", {
+      createdBy: "user",
+      creationSource: "web",
+      dispatchMode: { type: "start_immediately" },
+    });
+    const byUser = (yield* state(executor))!;
+    assert.equal(byUser.notes, "Unblocked by new instructions from the user.");
+    assert.notEqual(byUser.state, "blocked");
+    assert.include(yield* noticeIds(lead), "organization-parent:user-answer");
+  }).pipe(Effect.provide(taskNoticeLayer)),
+);
+
+it.effect("answering a blocked lead's open question unblocks it", () =>
+  Effect.gen(function* () {
+    const { orchestrator, chief, lead, block, noticeIds } = yield* taskNoticeSetup;
+    const threads = yield* ThreadManagement.ThreadManagementService;
+    yield* block(lead, "lead-blocked");
+    yield* orchestrator.dispatch({
+      type: "thread.user-input.request",
+      commandId: CommandId.make("lead-question"),
+      threadId: lead,
+      requestId: RuntimeRequestId.make("server-question:lead-question"),
+      questions: [{ id: "pick", header: "Pick", question: "Option 1 or 2?", options: [] }],
+    });
+    yield* orchestrator.dispatch({
+      type: "runtime-request.respond",
+      commandId: CommandId.make("lead-question-answer"),
+      threadId: lead,
+      requestId: RuntimeRequestId.make("server-question:lead-question"),
+      answers: { pick: "2" },
+    });
+    const task = (yield* threads.getThreadProjection(lead)).thread.organization!.task!;
+    assert.notEqual(task.state, "blocked");
+    assert.equal(task.notes, "Unblocked by new instructions from the user.");
+    // A real status change: the Chief hears it once.
+    assert.include(yield* noticeIds(chief), "organization:lead-question-answer");
+
+    // A conversation outside the organization has nothing to unblock.
+    const plain = ThreadId.make("notice-plain");
+    const project = (yield* threads.getThreadProjection(lead)).thread.projectId;
+    yield* orchestrator.dispatch({
+      type: "thread.create",
+      commandId: CommandId.make("notice-create-plain"),
+      threadId: plain,
+      projectId: project,
+      title: "plain",
+      modelSelection,
+      runtimeMode: "full-access",
+      interactionMode: "default",
+      branch: null,
+      worktreePath: null,
+      createdBy: "user",
+      creationSource: "web",
+    });
+    yield* orchestrator.dispatch({
+      type: "message.dispatch",
+      commandId: CommandId.make("plain-message"),
+      messageId: MessageId.make("plain-message"),
+      threadId: plain,
+      text: "Hello",
+      attachments: [],
+      dispatchMode: { type: "start_immediately" },
+      createdBy: "user",
+      creationSource: "web",
+    });
+    assert.isUndefined(
+      (yield* threads.getThreadProjection(plain)).thread.organization ?? undefined,
+    );
   }).pipe(Effect.provide(taskNoticeLayer)),
 );
 

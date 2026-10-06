@@ -62,6 +62,63 @@ export function organizationExtendedTask(
   };
 }
 
+/**
+ * New instructions to a blocked lead or executor unblock it at once, so its label never lags the
+ * brief it was given: a message from the user (including an answer to its question), or one its
+ * own coordinator sent. Server notices, notifications, delegated results, scheduled runs and the
+ * agent's own or other agents' messages do not. Returns the unblocked task and who acted, or
+ * null when nothing changes.
+ */
+export function organizationInstructionUnblock(input: {
+  readonly thread: Pick<OrchestrationV2AppThread, "id" | "organization">;
+  readonly message: {
+    readonly messageId: string;
+    readonly createdBy: string;
+    readonly creationSource: string;
+    readonly senderThreadId?: ThreadId | undefined;
+    readonly notification?: unknown;
+    readonly delegatedCompletion?: unknown;
+    readonly scheduledTaskId?: unknown;
+  };
+  readonly coordinatorLabel: string;
+  readonly queued: boolean;
+}): { readonly task: OrganizationTask; readonly actorThreadId: ThreadId | undefined } | null {
+  const org = input.thread.organization;
+  const task = org?.task;
+  if (!task || task.state !== "blocked" || (org.role !== "lead" && org.role !== "executor"))
+    return null;
+  const { message } = input;
+  if (
+    isOrganizationNoticeMessageId(message.messageId) ||
+    message.notification !== undefined ||
+    message.delegatedCompletion !== undefined ||
+    message.scheduledTaskId !== undefined
+  )
+    return null;
+  const fromUser = message.createdBy === "user";
+  const fromCoordinator =
+    message.createdBy === "agent" &&
+    message.creationSource !== "server" &&
+    message.senderThreadId !== undefined &&
+    message.senderThreadId === org.parentThreadId;
+  if (!fromUser && !fromCoordinator) return null;
+  return {
+    actorThreadId: fromUser ? undefined : org.parentThreadId!,
+    task: {
+      ...task,
+      ownerThreadId: input.thread.id,
+      // A correction round resumes as one; otherwise the work runs or waits its turn.
+      state:
+        task.lastReview !== undefined && task.lastReview.revision === task.revision
+          ? "changes_requested"
+          : input.queued
+            ? "queued"
+            : "working",
+      notes: `Unblocked by new instructions from ${fromUser ? "the user" : input.coordinatorLabel}.`,
+    },
+  };
+}
+
 /** Shared by every canonical command, including commands originating through MCP. */
 export function organizationProblem(input: {
   thread: OrchestrationV2AppThread;

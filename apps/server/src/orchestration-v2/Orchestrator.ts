@@ -14,6 +14,7 @@ import {
   organizationChiefNoticeRelevant,
   organizationChiefNotice,
   ORGANIZATION_CHIEF_NOTICE_PREFIX,
+  organizationInstructionUnblock,
 } from "./OrganizationPolicy.ts";
 import {
   latestExecutedRun,
@@ -55,6 +56,7 @@ import {
   type OrchestrationV2Run,
   type OrchestrationV2RunAttempt,
   type OrchestrationV2RuntimeRequest,
+  type OrganizationTask,
   type OrchestrationV2ThreadShell,
   type OrchestrationV2ThreadShellSnapshot,
   type OrchestrationV2StoredEvent,
@@ -3275,128 +3277,18 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
       command.type === "thread.metadata.update" &&
       command.organization?.task &&
       !Equal.equals(thread.organization?.task, command.organization.task)
-    ) {
-      const snapshot = yield* projectionStore.getShellSnapshot().pipe(mapDispatchError(command));
-      const chief = snapshot.threads.find(
-        (item) =>
-          item.projectId === thread.projectId &&
-          item.organization?.role === "chief" &&
-          item.archivedAt === null &&
-          item.deletedAt === null,
+    )
+      yield* announceOrganizationTaskChange(
+        command,
+        {
+          thread,
+          previous: thread.organization?.task,
+          next: command.organization.task,
+          actorThreadId: command.organizationActorThreadId,
+        },
+        events,
+        effects,
       );
-      // The Chief hears status changes, never its own updates or worker churn.
-      const notifyChief =
-        chief !== undefined &&
-        chief.id !== thread.id &&
-        chief.id !== command.organizationActorThreadId &&
-        organizationChiefNoticeRelevant(
-          thread.organization?.task,
-          command.organization.task,
-          thread.organization?.parentThreadId === chief.id,
-        );
-      // The parent coordinator owns the next step after a child task changes.
-      const parent = snapshot.threads.find(
-        (item) =>
-          item.id === thread.organization?.parentThreadId &&
-          item.id !== thread.id &&
-          item.id !== chief?.id &&
-          item.id !== command.organizationActorThreadId &&
-          item.projectId === thread.projectId &&
-          item.archivedAt === null &&
-          item.deletedAt === null,
-      );
-      if (notifyChief || parent) {
-        const task = command.organization.task;
-        const state = task.state.replaceAll("_", " ");
-        const summary = `${thread.title}: ${state}`;
-        const notice = (threadId: ThreadId, messageId: MessageId, text: string) =>
-          dispatchMessage(
-            {
-              type: "message.dispatch",
-              commandId: command.commandId,
-              threadId,
-              messageId,
-              senderThreadId: thread.id,
-              text,
-              notification: {
-                source: { kind: "background_task" },
-                outcome: task.state === "blocked" ? "failed" : "updated",
-                summary,
-              },
-              attachments: [],
-              dispatchMode: { type: "queue_after_active" },
-              createdBy: "agent",
-              creationSource: "server",
-            },
-            events,
-            effects,
-          );
-        if (notifyChief) {
-          const project = yield* projects.get(thread.projectId).pipe(mapDispatchError(command));
-          const projectTitle = Option.isSome(project) ? project.value.title : thread.projectId;
-          // Like delegated completions, an unstarted queued notice absorbs later ones so the
-          // Chief takes one turn for a burst of updates.
-          const chiefProjection = yield* getProjectionWithPendingEvents(chief.id, events);
-          const queued = chiefProjection.messages.find(
-            (message) =>
-              message.id.startsWith(ORGANIZATION_CHIEF_NOTICE_PREFIX) &&
-              chiefProjection.runs.some(
-                (run) =>
-                  run.userMessageId === message.id &&
-                  run.status === "queued" &&
-                  run.startedAt === null,
-              ),
-          );
-          const chiefNotice = organizationChiefNotice({
-            projectTitle,
-            ...(queued ? { queuedText: queued.text } : {}),
-            threadId: thread.id,
-            task,
-          });
-          if (queued) {
-            const now = yield* DateTime.now;
-            yield* emit(
-              events,
-              command,
-            )({
-              type: "message.updated",
-              threadId: chief.id,
-              ...(queued.runId === null ? {} : { runId: queued.runId }),
-              ...(queued.nodeId === null ? {} : { nodeId: queued.nodeId }),
-              providerInstanceId: chiefProjection.thread.providerInstanceId,
-              occurredAt: now,
-              payload: {
-                ...queued,
-                text: chiefNotice.text,
-                ...(queued.notification
-                  ? {
-                      notification: {
-                        ...queued.notification,
-                        outcome: chiefNotice.blocked ? "failed" : "updated",
-                        summary: chiefNotice.summary,
-                      },
-                    }
-                  : {}),
-                updatedAt: now,
-              },
-            });
-          } else {
-            yield* notice(
-              chief.id,
-              MessageId.make(`${ORGANIZATION_CHIEF_NOTICE_PREFIX}${command.commandId}`),
-              chiefNotice.text,
-            );
-          }
-        }
-        if (parent) {
-          yield* notice(
-            parent.id,
-            MessageId.make(`organization-parent:${command.commandId}`),
-            `Child task update. ${task.title}: ${state}. ${task.notes ?? ""} This is coordinator evidence, not user approval. Continue your own task from its canonical record (t3_organization_task read): after an accepted review, submit your outcome for independent review; after blocked or changes requested, decide the next step.`,
-          );
-        }
-      }
-    }
 
     if (command.type === "thread.metadata.update" && command.regenerateTitle === true) {
       yield* Ref.update(effects, (existing) => [
@@ -4577,6 +4469,149 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
       ]);
     });
 
+  /**
+   * Tells the Chief and the parent coordinator about a task change, as commit-time notices of
+   * the command that changed it. The Chief hears only status changes (see
+   * organizationChiefNoticeRelevant); the parent hears every change of its child.
+   */
+  const announceOrganizationTaskChange = (
+    command: OrchestrationV2ServerCommand,
+    input: {
+      readonly thread: OrchestrationV2AppThread;
+      readonly previous: OrganizationTask | undefined;
+      readonly next: OrganizationTask;
+      readonly actorThreadId: ThreadId | undefined;
+    },
+    events: Ref.Ref<Array<OrchestrationV2DomainEvent>>,
+    effects: Ref.Ref<Array<PendingOrchestrationEffectV2>>,
+  ): Effect.Effect<void, OrchestratorV2Error> =>
+    Effect.gen(function* () {
+      const snapshot = yield* projectionStore.getShellSnapshot().pipe(mapDispatchError(command));
+      const chief = snapshot.threads.find(
+        (item) =>
+          item.projectId === input.thread.projectId &&
+          item.organization?.role === "chief" &&
+          item.archivedAt === null &&
+          item.deletedAt === null,
+      );
+      // The Chief hears status changes, never its own updates or worker churn.
+      const notifyChief =
+        chief !== undefined &&
+        chief.id !== input.thread.id &&
+        chief.id !== input.actorThreadId &&
+        organizationChiefNoticeRelevant(
+          input.previous,
+          input.next,
+          input.thread.organization?.parentThreadId === chief.id,
+        );
+      // The parent coordinator owns the next step after a child task changes.
+      const parent = snapshot.threads.find(
+        (item) =>
+          item.id === input.thread.organization?.parentThreadId &&
+          item.id !== input.thread.id &&
+          item.id !== chief?.id &&
+          item.id !== input.actorThreadId &&
+          item.projectId === input.thread.projectId &&
+          item.archivedAt === null &&
+          item.deletedAt === null,
+      );
+      if (notifyChief || parent) {
+        const task = input.next;
+        const state = task.state.replaceAll("_", " ");
+        const summary = `${input.thread.title}: ${state}`;
+        const notice = (threadId: ThreadId, messageId: MessageId, text: string) =>
+          dispatchMessage(
+            {
+              type: "message.dispatch",
+              commandId: command.commandId,
+              threadId,
+              messageId,
+              senderThreadId: input.thread.id,
+              text,
+              notification: {
+                source: { kind: "background_task" },
+                outcome: task.state === "blocked" ? "failed" : "updated",
+                summary,
+              },
+              attachments: [],
+              dispatchMode: { type: "queue_after_active" },
+              createdBy: "agent",
+              creationSource: "server",
+            },
+            events,
+            effects,
+          );
+        if (notifyChief) {
+          const project = yield* projects
+            .get(input.thread.projectId)
+            .pipe(mapDispatchError(command));
+          const projectTitle = Option.isSome(project)
+            ? project.value.title
+            : input.thread.projectId;
+          // Like delegated completions, an unstarted queued notice absorbs later ones so the
+          // Chief takes one turn for a burst of updates.
+          const chiefProjection = yield* getProjectionWithPendingEvents(chief.id, events);
+          const queued = chiefProjection.messages.find(
+            (message) =>
+              message.id.startsWith(ORGANIZATION_CHIEF_NOTICE_PREFIX) &&
+              chiefProjection.runs.some(
+                (run) =>
+                  run.userMessageId === message.id &&
+                  run.status === "queued" &&
+                  run.startedAt === null,
+              ),
+          );
+          const chiefNotice = organizationChiefNotice({
+            projectTitle,
+            ...(queued ? { queuedText: queued.text } : {}),
+            threadId: input.thread.id,
+            task,
+          });
+          if (queued) {
+            const now = yield* DateTime.now;
+            yield* emit(
+              events,
+              command,
+            )({
+              type: "message.updated",
+              threadId: chief.id,
+              ...(queued.runId === null ? {} : { runId: queued.runId }),
+              ...(queued.nodeId === null ? {} : { nodeId: queued.nodeId }),
+              providerInstanceId: chiefProjection.thread.providerInstanceId,
+              occurredAt: now,
+              payload: {
+                ...queued,
+                text: chiefNotice.text,
+                ...(queued.notification
+                  ? {
+                      notification: {
+                        ...queued.notification,
+                        outcome: chiefNotice.blocked ? "failed" : "updated",
+                        summary: chiefNotice.summary,
+                      },
+                    }
+                  : {}),
+                updatedAt: now,
+              },
+            });
+          } else {
+            yield* notice(
+              chief.id,
+              MessageId.make(`${ORGANIZATION_CHIEF_NOTICE_PREFIX}${command.commandId}`),
+              chiefNotice.text,
+            );
+          }
+        }
+        if (parent) {
+          yield* notice(
+            parent.id,
+            MessageId.make(`organization-parent:${command.commandId}`),
+            `Child task update. ${task.title}: ${state}. ${task.notes ?? ""} This is coordinator evidence, not user approval. Continue your own task from its canonical record (t3_organization_task read): after an accepted review, submit your outcome for independent review; after blocked or changes requested, decide the next step.`,
+          );
+        }
+      }
+    });
+
   const dispatchMessage = (
     command: Extract<OrchestrationV2Command, { readonly type: "message.dispatch" }>,
     events: Ref.Ref<Array<OrchestrationV2DomainEvent>>,
@@ -4584,6 +4619,54 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
   ) =>
     Effect.gen(function* () {
       let projection = yield* getProjectionWithPendingEvents(command.threadId, events);
+      if (projection.thread.organization?.task?.state === "blocked") {
+        const shell = yield* projectionStore.getShellSnapshot().pipe(mapDispatchError(command));
+        const coordinator = shell.threads.find(
+          (item) => item.id === projection.thread.organization?.parentThreadId,
+        );
+        const unblock = organizationInstructionUnblock({
+          thread: projection.thread,
+          message: { ...command, messageId: command.messageId },
+          coordinatorLabel: coordinator?.organization?.role === "chief" ? "the Chief" : "its lead",
+          queued: projection.runs.some(isBlockingRun),
+        });
+        const next = unblock && {
+          ...projection.thread.organization,
+          task: unblock.task,
+        };
+        // The same rules as any task update; a refused unblock leaves the message as it was.
+        if (
+          unblock &&
+          next &&
+          !organizationProblem({
+            thread: projection.thread,
+            next,
+            threads: shell.threads,
+            ...(unblock.actorThreadId ? { actorThreadId: unblock.actorThreadId } : {}),
+          })
+        ) {
+          const now = yield* DateTime.now;
+          const previous = projection.thread.organization.task;
+          const thread = { ...projection.thread, organization: next, updatedAt: now };
+          yield* emit(
+            events,
+            command,
+          )({
+            type: "thread.metadata-updated",
+            threadId: command.threadId,
+            providerInstanceId: thread.providerInstanceId,
+            occurredAt: now,
+            payload: thread,
+          });
+          yield* announceOrganizationTaskChange(
+            command,
+            { thread, previous, next: unblock.task, actorThreadId: unblock.actorThreadId },
+            events,
+            effects,
+          );
+          projection = yield* getProjectionWithPendingEvents(command.threadId, events);
+        }
+      }
       if (
         projection.thread.organization &&
         command.dispatchMode.type !== "queue_after_active" &&
