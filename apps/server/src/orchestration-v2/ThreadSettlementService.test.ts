@@ -1004,6 +1004,41 @@ describe("ThreadSettlementServiceV2 worker", () => {
       }),
     ),
   );
+
+  it.effect("skips branch lookups for organization executor branches", () =>
+    Effect.scoped(
+      Effect.gen(function* () {
+        yield* TestClock.setTime(Date.parse(NOW));
+        const fixture = yield* makeHarness({
+          snapshot: makeSnapshot(
+            [
+              {
+                ...makeThread("executor", { branch: "t3/organization/aaaaaaaaaaaaaaaaaaaaaaaa" }),
+                organization: { role: "executor", parentThreadId: ThreadId.make("lead") },
+              },
+              // The same prefix outside an organization is an ordinary user branch.
+              makeThread("plain", { branch: "t3/organization/user-branch" }),
+            ],
+            [makeProject(PROJECT_ID, "/workspace/project-root")],
+          ),
+          settings: {
+            ...DEFAULT_SERVER_SETTINGS,
+            sidebarAutoSettleAfterDays: null,
+            sidebarAutoSettleOnMerge: true,
+          },
+        });
+
+        yield* Effect.gen(function* () {
+          const reactor = yield* ThreadSettlementService.ThreadSettlementServiceV2;
+          yield* startHarness(reactor, fixture.activation, fixture.snapshotReads);
+
+          assert.deepStrictEqual(yield* Ref.get(fixture.branchCalls), [
+            { cwd: "/workspace/project-root", branch: "t3/organization/user-branch" },
+          ]);
+        }).pipe(Effect.provide(fixture.layer));
+      }),
+    ),
+  );
 });
 
 describe("ThreadSettlementServiceV2 terminals", () => {

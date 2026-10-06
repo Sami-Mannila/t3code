@@ -564,6 +564,7 @@ export const layer: Layer.Layer<
             const ownerResult = yield* eventSink
               .writeIfProviderThreadOwner({
                 guardPendingUserInputCancellations: true,
+                dropUnchangedNodeUpdates: true,
                 ...(input.commandId === undefined ? {} : { commandId: input.commandId }),
                 ...input.writeIfProviderThreadOwner,
                 events,
@@ -575,6 +576,7 @@ export const layer: Layer.Layer<
             return yield* eventSink
               .write({
                 guardPendingUserInputCancellations: true,
+                dropUnchangedNodeUpdates: true,
                 ...(input.commandId === undefined ? {} : { commandId: input.commandId }),
                 events,
               })
@@ -583,6 +585,7 @@ export const layer: Layer.Layer<
           const result = yield* eventSink
             .writeIfRunCurrent({
               guardPendingUserInputCancellations: true,
+              dropUnchangedNodeUpdates: true,
               ...(input.commandId === undefined ? {} : { commandId: input.commandId }),
               threadId: input.threadId,
               ...input.writeIfRunCurrent,

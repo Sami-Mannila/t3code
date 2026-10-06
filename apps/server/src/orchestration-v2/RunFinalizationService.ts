@@ -8,6 +8,7 @@ import * as PullRequestService from "../pullRequest/PullRequestService.ts";
 import * as VcsStatusBroadcaster from "../vcs/VcsStatusBroadcaster.ts";
 import * as WorkspaceEntries from "../workspace/WorkspaceEntries.ts";
 import * as CheckpointCapture from "./CheckpointCaptureService.ts";
+import { isOrganizationExecutorBranch } from "./OrganizationPolicy.ts";
 import * as ProjectionStore from "./ProjectionStore.ts";
 
 export class RunFinalizationError extends Schema.TaggedError<RunFinalizationError>()(
@@ -104,7 +105,8 @@ export const observerLive = Layer.effect(
           );
           if (local.refName === null || local.isDefaultRef) return;
           const thread = yield* projections.getThreadShell(threadId);
-          if (!thread || thread.branch !== local.refName) return;
+          if (!thread || thread.branch !== local.refName || isOrganizationExecutorBranch(thread))
+            return;
           if (thread.activeRunId !== null && thread.activeRunId !== runId) return;
           yield* vcsStatus.refreshPullRequestStatus(cwd).pipe(
             Effect.catch((error) =>

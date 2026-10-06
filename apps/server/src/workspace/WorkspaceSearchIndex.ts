@@ -1,4 +1,7 @@
+// @effect-diagnostics nodeBuiltinImport:off
 import * as NodeModule from "node:module";
+import * as NodeOS from "node:os";
+import * as NodePath from "node:path";
 
 import type {
   DirItem,
@@ -38,7 +41,8 @@ const WORKSPACE_INDEX_MAX_ENTRIES = 25_000;
 const WORKSPACE_INDEX_PAGE_SIZE = WORKSPACE_INDEX_MAX_ENTRIES + 2;
 const WORKSPACE_INDEX_SCAN_TIMEOUT = "15 seconds";
 const WORKSPACE_INDEX_SCAN_TIMEOUT_MS = 15_000;
-const WORKSPACE_INDEX_IDLE_TTL = "15 minutes";
+// Each live index keeps a native file watcher on its workspace; release idle ones promptly.
+const WORKSPACE_INDEX_IDLE_TTL = "5 minutes";
 const CONTENT_SEARCH_TIME_BUDGET_MS = 250;
 const CONTENT_SEARCH_MAX_MATCHES_PER_FILE = 100;
 
@@ -300,6 +304,24 @@ function withDirectoryAncestors(entries: ReadonlyArray<ProjectEntry>): ProjectEn
   return [...entryByPath.values()];
 }
 
+/**
+ * fff refuses to index the filesystem root or the home directory unless asked,
+ * because a watcher over either floods the process with unrelated fs events.
+ * Projects rooted there still get an index, without a watcher: refreshes after
+ * turns and file writes rescan it lazily instead.
+ */
+export function finderScanOptions(cwd: string, homeDir: string) {
+  const resolved = NodePath.resolve(cwd);
+  const isFsRoot = NodePath.parse(resolved).root === resolved;
+  const isHomeDir = resolved === NodePath.resolve(homeDir);
+  if (!isFsRoot && !isHomeDir) return {};
+  return {
+    ...(isFsRoot ? { enableFsRootScanning: true } : {}),
+    ...(isHomeDir ? { enableHomeDirScanning: true } : {}),
+    disableWatch: true,
+  };
+}
+
 const createFinder = Effect.fn("WorkspaceSearchIndex.createFinder")(function* (
   cwd: string,
   variant: WorkspaceSearchIndexVariant,
@@ -314,8 +336,7 @@ const createFinder = Effect.fn("WorkspaceSearchIndex.createFinder")(function* (
         // composer path search, file picker) keep the lightweight index.
         disableContentIndexing: variant !== "content",
         aiMode: false,
-        enableFsRootScanning: true,
-        enableHomeDirScanning: true,
+        ...finderScanOptions(cwd, NodeOS.homedir()),
       }),
     catch: (cause) =>
       new WorkspaceSearchIndexCreateFailed({

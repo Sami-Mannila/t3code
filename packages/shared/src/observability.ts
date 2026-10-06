@@ -156,6 +156,30 @@ export interface TraceSink {
 export interface LocalFileTracerOptions extends TraceSinkOptions {
   readonly delegate?: Tracer.Tracer;
   readonly sink?: TraceSink;
+  /** Spans the trace file skips. The delegate (e.g. OTLP) still receives them. */
+  readonly omitSpan?: (name: string) => boolean;
+}
+
+/**
+ * Per-query, per-transaction and per-event spans that fire thousands of times a
+ * minute while agents stream. They dominate the local trace file and its write
+ * cost, so it records them only when verbose tracing is on.
+ */
+export const VERBOSE_TRACE_SPAN_NAMES: ReadonlyArray<string> = [
+  "sql.execute",
+  "sql.transaction",
+  "OrchestrationEventStore.rowToV2StoredEvent",
+];
+export const VERBOSE_TRACE_SPAN_PREFIXES: ReadonlyArray<string> = [
+  "orchestrationV2.EventSink.",
+  "ThreadLiveEventCoalescer.",
+];
+
+export function isVerboseTraceSpan(name: string): boolean {
+  return (
+    VERBOSE_TRACE_SPAN_NAMES.includes(name) ||
+    VERBOSE_TRACE_SPAN_PREFIXES.some((prefix) => name.startsWith(prefix))
+  );
 }
 
 type OtlpSpan = OtlpTracer.ScopeSpan["spans"][number];
@@ -472,12 +496,12 @@ class LocalFileSpan implements Tracer.Span {
   attributes: Map<string, unknown>;
   events: Array<[name: string, startTime: bigint, attributes: Record<string, unknown>]>;
   private readonly delegate: Tracer.Span;
-  private readonly push: (record: EffectTraceRecord) => void;
+  private readonly push: ((record: EffectTraceRecord) => void) | null;
 
   constructor(
     options: Parameters<Tracer.Tracer["span"]>[0],
     delegate: Tracer.Span,
-    push: (record: EffectTraceRecord) => void,
+    push: ((record: EffectTraceRecord) => void) | null,
   ) {
     this.delegate = delegate;
     this.push = push;
@@ -508,7 +532,7 @@ class LocalFileSpan implements Tracer.Span {
     };
     this.delegate.end(endTime, traceExit);
 
-    if (this.sampled) {
+    if (this.sampled && this.push !== null) {
       this.push(spanToTraceRecord(this));
     }
   }
@@ -551,7 +575,8 @@ export const makeLocalFileTracer = Effect.fn("makeLocalFileTracer")(function* (
 
   return Tracer.make({
     span(spanOptions) {
-      return new LocalFileSpan(spanOptions, delegate.span(spanOptions), sink.push);
+      const push = options.omitSpan?.(spanOptions.name) ? null : sink.push;
+      return new LocalFileSpan(spanOptions, delegate.span(spanOptions), push);
     },
     ...(delegate.context ? { context: delegate.context } : {}),
   });

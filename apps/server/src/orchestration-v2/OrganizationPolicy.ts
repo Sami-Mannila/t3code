@@ -210,6 +210,24 @@ export function organizationNeedsWorktree(role: OrganizationRole | undefined) {
   return role === "executor";
 }
 
+/** Prefix of the branch OrganizationWorkspace.prepare checks out for each executor task. */
+export const ORGANIZATION_EXECUTOR_BRANCH_PREFIX = "t3/organization/";
+
+/**
+ * An executor's task branch stays local: the organization reviews and integrates it without a
+ * pull request, so pull request discovery and status lookups skip it.
+ */
+export function isOrganizationExecutorBranch(thread: {
+  readonly organization?: OrganizationThread | null | undefined;
+  readonly branch: string | null;
+}) {
+  return (
+    thread.organization != null &&
+    thread.branch !== null &&
+    thread.branch.startsWith(ORGANIZATION_EXECUTOR_BRANCH_PREFIX)
+  );
+}
+
 /**
  * Delegated children are admitted by the organization's own preparation, which a Retry re-runs.
  * Chief and Advisor are user conversations whose runs use the generic workspace preparation.

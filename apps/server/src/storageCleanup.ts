@@ -28,7 +28,10 @@ import * as Stream from "effect/Stream";
 
 import * as ServerConfig from "./config.ts";
 import * as GitManager from "./git/GitManager.ts";
-import { organizationRepositoryRoot } from "./orchestration-v2/OrganizationPolicy.ts";
+import {
+  isOrganizationExecutorBranch,
+  organizationRepositoryRoot,
+} from "./orchestration-v2/OrganizationPolicy.ts";
 import * as ProjectStore from "./orchestration-v2/ProjectStore.ts";
 import * as Orchestrator from "./orchestration-v2/Orchestrator.ts";
 import * as ProjectionStore from "./orchestration-v2/ProjectionStore.ts";
@@ -37,6 +40,7 @@ import { forkParked } from "./serverActivation.ts";
 import * as Settings from "./serverSettings.ts";
 import * as TerminalManager from "./terminal/Manager.ts";
 import * as GitVcsDriver from "./vcs/GitVcsDriver.ts";
+import * as WorkspaceEntries from "./workspace/WorkspaceEntries.ts";
 import { withWorkspaceLease } from "./workspace/workspaceLease.ts";
 
 const decodeCleanupThread = Schema.decodeUnknownEffect(
@@ -116,6 +120,7 @@ export const make = Effect.gen(function* () {
   const git = yield* GitVcsDriver.GitVcsDriver;
   const gitManager = yield* GitManager.GitManager;
   const terminals = yield* TerminalManager.TerminalManager;
+  const workspaceEntries = yield* WorkspaceEntries.WorkspaceEntries;
   const fs = yield* FileSystem.FileSystem;
   const path = yield* Path.Path;
   const liveTerminals = new Map<string, Map<string, TerminalSummary>>();
@@ -282,7 +287,12 @@ export const make = Effect.gen(function* () {
           });
           if (ancestor.exitCode !== 0) return;
           eligible = settings.worktreeUnchanged;
-          if (!eligible && settings.worktreeOnMerge && thread.branch !== null) {
+          if (
+            !eligible &&
+            settings.worktreeOnMerge &&
+            thread.branch !== null &&
+            !isOrganizationExecutorBranch(thread)
+          ) {
             const pullRequest = yield* gitManager.branchPullRequest(
               { cwd: worktreePath, branch: thread.branch },
               { refresh: true },
@@ -375,6 +385,7 @@ export const make = Effect.gen(function* () {
         const repositoryRoot = organizationRepositoryRoot(project.workspaceRoot, thread);
         yield* git.removeWorktree({ cwd: repositoryRoot, path: worktreePath, force: false });
         yield* gitManager.invalidateStatus(repositoryRoot);
+        yield* workspaceEntries.invalidate(worktreePath);
         // Preserve branch and path: ProviderTurnStartService recreates the checkout
         // from that branch when the thread is resumed.
         yield* Effect.logInfo("storage cleanup removed worktree", { threadId: thread.id });

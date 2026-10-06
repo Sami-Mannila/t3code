@@ -1,3 +1,6 @@
+// @effect-diagnostics nodeBuiltinImport:off
+import * as NodeOS from "node:os";
+
 import {
   FileFinder,
   type FileItem,
@@ -102,6 +105,54 @@ it.effect("keeps returned FileFinder creation diagnostics out of the cause chain
       reason: "native index rejected the directory",
     });
     expect(error.cause).toBeUndefined();
+  }),
+);
+
+it.effect("leaves filesystem root and home directory scanning at fff's default", () =>
+  Effect.gen(function* () {
+    const finder = {
+      destroy: vi.fn(),
+      waitForIndexReady: vi.fn(async () => ({ ok: true as const, value: true })),
+    } as unknown as FileFinder;
+    const create = vi.spyOn(FileFinder, "create").mockReturnValueOnce({ ok: true, value: finder });
+
+    yield* Effect.scoped(WorkspaceSearchIndex.make("/workspace/project"));
+
+    const options = create.mock.calls[0]?.[0];
+    expect(options?.basePath).toBe("/workspace/project");
+    expect(options?.enableFsRootScanning).toBeUndefined();
+    expect(options?.enableHomeDirScanning).toBeUndefined();
+    expect(options?.disableWatch).toBeUndefined();
+  }),
+);
+
+it("scans the home directory and filesystem root only without a watcher", () => {
+  expect(WorkspaceSearchIndex.finderScanOptions("/home/user/project", "/home/user")).toEqual({});
+  expect(WorkspaceSearchIndex.finderScanOptions("/home/user/", "/home/user")).toEqual({
+    enableHomeDirScanning: true,
+    disableWatch: true,
+  });
+  expect(WorkspaceSearchIndex.finderScanOptions("/", "/home/user")).toEqual({
+    enableFsRootScanning: true,
+    disableWatch: true,
+  });
+});
+
+it.effect("indexes a project rooted at the home directory", () =>
+  Effect.gen(function* () {
+    const finder = {
+      destroy: vi.fn(),
+      waitForIndexReady: vi.fn(async () => ({ ok: true as const, value: true })),
+    } as unknown as FileFinder;
+    const create = vi.spyOn(FileFinder, "create").mockReturnValueOnce({ ok: true, value: finder });
+
+    yield* Effect.scoped(WorkspaceSearchIndex.make(NodeOS.homedir()));
+
+    expect(create.mock.calls[0]?.[0]).toMatchObject({
+      basePath: NodeOS.homedir(),
+      enableHomeDirScanning: true,
+      disableWatch: true,
+    });
   }),
 );
 

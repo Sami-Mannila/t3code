@@ -31,6 +31,7 @@ import { SqlitePersistenceMemory } from "../persistence/Layers/Sqlite.ts";
 import * as EventSink from "./EventSink.ts";
 import * as EventStore from "./EventStore.ts";
 import * as IdAllocator from "./IdAllocator.ts";
+import * as ProjectionMaintenance from "./ProjectionMaintenance.ts";
 import * as ProjectionStore from "./ProjectionStore.ts";
 import * as ProviderEventIngestor from "./ProviderEventIngestor.ts";
 import * as ThreadCommandExecutor from "./ThreadCommandExecutor.ts";
@@ -54,6 +55,9 @@ const TestEventSinkLayer = EventSink.layer.pipe(
 const TestLayer = Layer.mergeAll(
   TestStoresLayer,
   TestEventSinkLayer,
+  ProjectionMaintenance.layer.pipe(
+    Layer.provide(Layer.mergeAll(TestStoresLayer, TestDatabaseLayer)),
+  ),
   IdAllocator.layer,
   ThreadCommandExecutor.layer,
   ProviderEventIngestor.layer.pipe(
@@ -1336,6 +1340,125 @@ layer("ProviderEventIngestorV2", (it) => {
         instanceId: modelSelection.instanceId,
         model: "gpt-6.1-sol",
       });
+    }),
+  );
+
+  it.effect("persists one node.updated for repeated identical provider snapshots", () =>
+    Effect.gen(function* () {
+      const now = yield* DateTime.now;
+      const eventSink = yield* EventSink.EventSinkV2;
+      const eventStore = yield* EventStore.EventStoreV2;
+      const projectionStore = yield* ProjectionStore.ProjectionStoreV2;
+      const maintenance = yield* ProjectionMaintenance.ProjectionMaintenanceV2;
+      const ingestor = yield* ProviderEventIngestor.ProviderEventIngestorV2;
+      const idAllocator = yield* IdAllocator.IdAllocatorV2;
+      const threadEvent = yield* threadCreatedEvent(now);
+      const threadId = threadEvent.threadId;
+      const providerSessionId = yield* idAllocator.allocate.providerSession({
+        providerInstanceId: modelSelection.instanceId,
+        threadId,
+      });
+      yield* eventSink.write({ events: [threadEvent] });
+      const nodeId = NodeId.make(`${threadId}:reasoning`);
+      const running: OrchestrationV2ExecutionNode = {
+        id: nodeId,
+        threadId,
+        runId: null,
+        parentNodeId: null,
+        rootNodeId: nodeId,
+        kind: "reasoning",
+        status: "running",
+        countsForRun: false,
+        providerThreadId: null,
+        providerTurnId: null,
+        nativeItemRef: null,
+        runtimeRequestId: null,
+        checkpointScopeId: null,
+        startedAt: now,
+        completedAt: null,
+      };
+      const ingest = (node: OrchestrationV2ExecutionNode) =>
+        ingestor.ingestNormalized({
+          providerSessionId,
+          providerInstanceId: modelSelection.instanceId,
+          threadId,
+          event: { type: "node.updated", driver: CODEX_DRIVER, node },
+        });
+      const nodeSequences = () =>
+        eventStore.read({ threadId }).pipe(
+          Stream.runCollect,
+          Effect.map((events) =>
+            Array.from(events).flatMap((stored) =>
+              stored.event.type === "node.updated" ? [stored.event.payload.status] : [],
+            ),
+          ),
+        );
+
+      const first = yield* ingest(running);
+      const sequenceAfterFirst = yield* eventStore.latestSequence({ threadId });
+      const repeats = yield* Effect.forEach(Array.from({ length: 20 }), () => ingest(running));
+
+      assert.equal(first.length, 1);
+      assert.isTrue(repeats.every((stored) => stored.length === 0));
+      assert.equal(yield* eventStore.latestSequence({ threadId }), sequenceAfterFirst);
+      assert.deepEqual(yield* nodeSequences(), ["running"]);
+
+      // Every real change persists, including a return to an earlier payload.
+      const completed = { ...running, status: "completed" as const, completedAt: now };
+      assert.equal((yield* ingest(completed)).length, 1);
+      assert.equal((yield* ingest(completed)).length, 0);
+      assert.equal((yield* ingest(running)).length, 1);
+      assert.deepEqual(yield* nodeSequences(), ["running", "completed", "running"]);
+
+      // A mixed batch keeps non-node events and the first sighting of each
+      // payload, and drops repeats against the projection and within the batch.
+      const otherId = NodeId.make(`${threadId}:other`);
+      const other = { ...running, id: otherId, rootNodeId: otherId };
+      const otherThread = yield* threadCreatedEvent(now);
+      const event = (payload: OrchestrationV2ExecutionNode) =>
+        Effect.map(idAllocator.allocate.event({ threadId }), (id): OrchestrationV2DomainEvent => ({
+          id,
+          type: "node.updated",
+          threadId,
+          occurredAt: now,
+          payload,
+        }));
+      const mixed = yield* eventSink.write({
+        dropUnchangedNodeUpdates: true,
+        events: [
+          yield* event(running),
+          yield* event(other),
+          otherThread,
+          yield* event(other),
+          yield* event(completed),
+          yield* event(completed),
+        ],
+      });
+      assert.deepEqual(
+        mixed.map((stored) => [
+          stored.event.type,
+          stored.event.type === "node.updated" ? stored.event.payload.id : null,
+        ]),
+        [
+          ["node.updated", otherId],
+          ["thread.created", null],
+          ["node.updated", nodeId],
+        ],
+      );
+
+      // Replaying the log reproduces the live projection.
+      const live = yield* projectionStore.getThreadProjection(threadId);
+      const verification = yield* maintenance.rebuild;
+      const rebuilt = yield* projectionStore.getThreadProjection(threadId);
+      assert.isTrue(verification.valid);
+      assert.deepEqual(rebuilt.nodes, live.nodes);
+      assert.deepEqual(
+        live.nodes.map((node) => [node.id, node.status]),
+        [
+          [nodeId, "completed"],
+          [otherId, "running"],
+        ].sort(([a], [b]) => a!.localeCompare(b!)),
+      );
     }),
   );
 });
