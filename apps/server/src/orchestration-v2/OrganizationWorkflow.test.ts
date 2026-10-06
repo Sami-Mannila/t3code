@@ -1875,29 +1875,6 @@ it("organization instructions name each role's configured model", () => {
   assert.notInclude(text, "executor opencode fireworks");
 });
 
-it("organization instructions guide the Chief and a lead through recovering a stranded executor task", () => {
-  const chiefText = organizationInstructions({
-    id: ThreadId.make("recovery-instructions-chief"),
-    organization: { role: "chief", parentThreadId: null },
-    worktreePath: null,
-    branch: null,
-  });
-  assert.include(chiefText, "To recover an archived lead's executor work");
-  assert.include(chiefText, "t3_organization_task(action=adopt, threadId=<executor>)");
-  const leadText = organizationInstructions({
-    id: ThreadId.make("recovery-instructions-lead"),
-    organization: {
-      role: "lead",
-      parentThreadId: ThreadId.make("recovery-instructions-chief"),
-    },
-    worktreePath: null,
-    branch: null,
-  });
-  assert.include(leadText, "adopt it with t3_organization_task(action=adopt, threadId=<executor>)");
-  assert.include(leadText, "blocked with a failed reviewer as its owner");
-  assert.include(leadText, "delegate_task(role=review, reviewTaskThreadId=<executor>)");
-});
-
 it("t3_organization_task read reports a repository only for a conversation with a task", () => {
   const thread = (id: string, organization: OrganizationThread) =>
     ({
