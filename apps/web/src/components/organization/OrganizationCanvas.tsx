@@ -1,5 +1,6 @@
 import {
   type CSSProperties,
+  type MouseEvent as ReactMouseEvent,
   type ReactNode,
   useEffect,
   useEffectEvent,
@@ -9,14 +10,34 @@ import {
 } from "react";
 import { scopeProjectRef } from "@t3tools/client-runtime/environment";
 import type { EnvironmentThreadShell } from "@t3tools/client-runtime/state/models";
-import type { EnvironmentId, OrganizationTask, ProjectId } from "@t3tools/contracts";
+import {
+  ProviderDriverKind,
+  type EnvironmentId,
+  type OrganizationTask,
+  type ProjectId,
+} from "@t3tools/contracts";
 
 import { cn } from "~/lib/utils";
-import { useThreadShellsForProjectRefs } from "~/state/entities";
-import { CheckIcon } from "lucide-react";
+import { useServerConfigs, useThreadShellsForProjectRefs } from "~/state/entities";
+import {
+  ArchiveIcon,
+  CheckIcon,
+  ChevronRightIcon,
+  UserRoundCheckIcon,
+  UserRoundIcon,
+  UserRoundXIcon,
+} from "lucide-react";
 import { Button } from "~/components/ui/button";
 import { Tooltip, TooltipPopup, TooltipTrigger } from "~/components/ui/tooltip";
 import { canArchiveWorkstream } from "@t3tools/shared/organizationWorkstream";
+import { ProviderInstanceIcon } from "~/components/chat/ProviderInstanceIcon";
+import { resolvePullRequestState } from "~/components/pullRequest/pullRequestPresentation";
+import { useOpenPrLink } from "~/lib/openPullRequestLink";
+import {
+  applyProviderInstanceSettings,
+  deriveProviderInstanceEntries,
+  type ProviderInstanceEntry,
+} from "~/providerInstances";
 import { OrganizationArchiveDialog } from "./OrganizationArchiveDialog";
 import { fitOrganization, resizeOrganization, zoomOrganization } from "./organizationCamera";
 import {
@@ -26,6 +47,7 @@ import {
   threadIsActive,
   threadModelLabel,
   type OrganizationLeadCard,
+  type OrganizationPullRequest,
   type OrganizationReview,
   type OrganizationReviewRound,
   type OrganizationSubtask,
@@ -92,10 +114,196 @@ function Pill({ state, label }: { state: OrganizationTask["state"]; label?: stri
   );
 }
 
-/** "provider · model · activity", truncated with the full value on hover. */
-function Meta({ thread }: { thread: Shell }) {
-  const text = `${threadModelLabel(thread)} · ${threadActivity(thread)}`;
-  return <Truncated className={cn("block", styles["org-meta"])} text={text} />;
+/** The provider's configured instances for the environment the canvas draws. */
+function useProviderEntryByInstanceId(
+  environmentId: EnvironmentId,
+): ReadonlyMap<string, ProviderInstanceEntry> {
+  const configs = useServerConfigs();
+  return useMemo(() => {
+    const config = configs.get(environmentId);
+    if (!config) return new Map<string, ProviderInstanceEntry>();
+    const entries = applyProviderInstanceSettings(
+      deriveProviderInstanceEntries(config.providers),
+      config.settings,
+    );
+    return new Map(entries.map((entry) => [entry.instanceId, entry]));
+  }, [configs, environmentId]);
+}
+
+const instanceIdOf = (thread: Shell) =>
+  thread.runtime?.providerInstanceId ?? thread.modelSelection.instanceId;
+
+/** The provider glyph; model and activity live in its tooltip, never as card text. */
+function ProviderIcon(props: { thread: Shell; entry: ProviderInstanceEntry | undefined }) {
+  const { thread, entry } = props;
+  const instanceId = instanceIdOf(thread);
+  return (
+    <Tooltip>
+      <TooltipTrigger render={<span className={styles["org-provider"]} />}>
+        <ProviderInstanceIcon
+          driverKind={entry?.driverKind ?? ProviderDriverKind.make(instanceId)}
+          displayName={entry?.displayName ?? instanceId}
+          accentColor={entry?.accentColor}
+          acpRegistryAgentId={entry?.acpRegistryAgentId}
+          acpRegistryIconUrl={entry?.acpRegistryIconUrl}
+          indicatorBackground="var(--background)"
+          iconClassName="size-4"
+          statusDotClassName={threadIsActive(thread) ? "bg-success" : "bg-muted-foreground/40"}
+        />
+      </TooltipTrigger>
+      <TooltipPopup side="top">
+        {threadModelLabel(thread)} · {threadActivity(thread)}
+      </TooltipPopup>
+    </Tooltip>
+  );
+}
+
+/** Role caption, title and the hover-only archive action; the header opens the conversation. */
+function CardHeader(props: {
+  thread: Shell;
+  role: string;
+  entry: ProviderInstanceEntry | undefined;
+  onOpen: () => void;
+  onArchive?: (() => void) | undefined;
+}) {
+  return (
+    <div className={styles["org-header-wrap"]}>
+      <button type="button" className={styles["org-header"]} onClick={props.onOpen}>
+        <span className={styles["org-role"]}>
+          <ProviderIcon thread={props.thread} entry={props.entry} />
+          {props.role}
+        </span>
+        <span className={styles["org-title"]}>{props.thread.title}</span>
+      </button>
+      {props.onArchive ? (
+        <Tooltip>
+          <TooltipTrigger
+            render={
+              <button
+                type="button"
+                className={styles["org-archive"]}
+                aria-label="Archive workstream"
+                onClick={props.onArchive}
+              />
+            }
+          >
+            <ArchiveIcon className="size-3.5" aria-hidden />
+          </TooltipTrigger>
+          <TooltipPopup>Archive workstream</TooltipPopup>
+        </Tooltip>
+      ) : null}
+    </div>
+  );
+}
+
+/** One pull request as a chip: state glyph, number and a short title, opening on click. */
+function PullRequestChip(props: {
+  pullRequest: OrganizationPullRequest;
+  onOpen: (event: ReactMouseEvent<HTMLElement>, url: string) => void;
+}) {
+  const { pullRequest } = props;
+  const presentation = resolvePullRequestState({
+    state: pullRequest.state,
+    isDraft: pullRequest.isDraft,
+  });
+  return (
+    <Tooltip>
+      <TooltipTrigger
+        render={
+          <a
+            className={styles["org-pr-chip"]}
+            href={pullRequest.url}
+            target="_blank"
+            rel="noopener noreferrer"
+            onClick={(event) => props.onOpen(event, pullRequest.url)}
+          />
+        }
+      >
+        <presentation.Icon
+          className={cn("size-3 shrink-0", presentation.toneClassName)}
+          aria-hidden
+        />
+        <span className={styles["org-pr-number"]}>#{pullRequest.number}</span>
+        {pullRequest.title ? (
+          <span className={styles["org-pr-title"]}>{pullRequest.title}</span>
+        ) : null}
+      </TooltipTrigger>
+      <TooltipPopup side="top">
+        {pullRequest.title
+          ? `#${pullRequest.number}: ${pullRequest.title}`
+          : `Pull request #${pullRequest.number}`}
+      </TooltipPopup>
+    </Tooltip>
+  );
+}
+
+/** Earlier-round merged pull requests as one chip that reveals the history list. */
+function MergedHistoryChip(props: { count: number; expanded: boolean; onOpenHistory: () => void }) {
+  const presentation = resolvePullRequestState({ state: "merged", isDraft: false });
+  return (
+    <button
+      type="button"
+      className={cn(styles["org-pr-chip"], styles["org-pr-merged"])}
+      aria-expanded={props.expanded}
+      onClick={props.onOpenHistory}
+    >
+      <presentation.Icon
+        className={cn("size-3 shrink-0", presentation.toneClassName)}
+        aria-hidden
+      />
+      {props.count} merged
+    </button>
+  );
+}
+
+function reviewerPresentation(review: OrganizationReview | null): {
+  Icon: typeof UserRoundIcon;
+  className: string;
+  label: string;
+} {
+  switch (review?.state) {
+    case "accepted":
+      return {
+        Icon: UserRoundCheckIcon,
+        className: "text-success",
+        label: `Accepted rev ${shortRevision(review.revision)}`,
+      };
+    case "changes_requested":
+      return {
+        Icon: UserRoundXIcon,
+        className: "text-warning-foreground",
+        label: review.notes ? `Changes requested: “${review.notes}”` : "Changes requested",
+      };
+    case "inspecting":
+      return {
+        Icon: UserRoundIcon,
+        className: "text-warning-foreground",
+        label: `Inspecting rev ${shortRevision(review.revision)}`,
+      };
+    case "awaiting_reviewer":
+      return {
+        Icon: UserRoundIcon,
+        className: "text-warning-foreground",
+        label: "Awaiting reviewer",
+      };
+    default:
+      return { Icon: UserRoundIcon, className: "text-muted-foreground/50", label: "No review yet" };
+  }
+}
+
+/** Green when accepted, amber while under review, grey with none; the verdict is the tooltip. */
+function ReviewerGlyph({ review }: { review: OrganizationReview | null }) {
+  const presentation = reviewerPresentation(review);
+  return (
+    <Tooltip>
+      <TooltipTrigger
+        render={<span className={cn(styles["org-reviewer"], presentation.className)} />}
+      >
+        <presentation.Icon className="size-3.5" aria-hidden />
+      </TooltipTrigger>
+      <TooltipPopup side="top">{presentation.label}</TooltipPopup>
+    </Tooltip>
+  );
 }
 
 function ReviewLine(props: {
@@ -121,10 +329,7 @@ function ReviewLine(props: {
   const content = (
     <>
       <Dot thread={reviewer} />
-      <span className={styles["org-review-who"]}>
-        {props.label}
-        {reviewer ? ` · ${threadModelLabel(reviewer)}` : ""} ·
-      </span>
+      <span className={styles["org-review-who"]}>{props.label} ·</span>
       <span className={styles["org-review-verdict"]}>{verdict}</span>
     </>
   );
@@ -144,37 +349,86 @@ function ReviewLine(props: {
   );
 }
 
-function EarlierRounds(props: {
-  rounds: ReadonlyArray<OrganizationReviewRound>;
+const reviewVerdict = (round: OrganizationReviewRound) =>
+  round.verdict === "changes_requested"
+    ? `changes requested${round.notes ? `: “${round.notes}”` : ""}`
+    : "reviewed";
+
+/** One disclosure per card: finished rounds, earlier reviewer verdicts and their pull requests. */
+function History(props: {
+  card: OrganizationLeadCard;
+  open: boolean;
+  onToggle: (open: boolean) => void;
   onOpenThread: (thread: Shell) => void;
+  onOpenPullRequest: (event: ReactMouseEvent<HTMLElement>, url: string) => void;
 }) {
-  if (props.rounds.length === 0) return null;
+  const { card } = props;
+  const subtaskRounds = card.subtasks.flatMap((subtask) =>
+    subtask.earlierRounds.map((round) => ({ subtask, round })),
+  );
   return (
-    <details className={styles["org-rounds"]}>
-      <summary>
-        {props.rounds.length === 1 ? "1 earlier review" : `${props.rounds.length} earlier reviews`}
-      </summary>
-      {props.rounds.map((round) => (
-        <button
-          key={round.reviewer.id}
-          type="button"
-          className={styles["org-review"]}
-          onClick={() => props.onOpenThread(round.reviewer)}
-        >
-          <span className={styles["org-sub-truncate"]}>
-            round {round.round} ·{" "}
-            {round.verdict === "changes_requested"
-              ? `changes requested${round.notes ? `: “${round.notes}”` : ""}`
-              : threadModelLabel(round.reviewer)}
-          </span>
-        </button>
-      ))}
-    </details>
+    <div className={styles["org-history"]}>
+      <button
+        type="button"
+        className={styles["org-history-toggle"]}
+        aria-expanded={props.open}
+        onClick={() => props.onToggle(!props.open)}
+      >
+        <ChevronRightIcon
+          className={cn("size-3 shrink-0 transition-transform", props.open && "rotate-90")}
+          aria-hidden
+        />
+        History
+      </button>
+      {props.open ? (
+        <div className={styles["org-history-body"]}>
+          {card.rounds.map((round) => (
+            <div key={round.round} className={styles["org-history-row"]}>
+              <span className={styles["org-history-label"]}>
+                Round {round.round} · {round.state.replaceAll("_", " ")}
+              </span>
+              {round.pullRequests.map((pullRequest) => (
+                <PullRequestChip
+                  key={pullRequest.url}
+                  pullRequest={pullRequest}
+                  onOpen={props.onOpenPullRequest}
+                />
+              ))}
+            </div>
+          ))}
+          {card.outcomeEarlierRounds.map((round) => (
+            <button
+              key={round.reviewer.id}
+              type="button"
+              className={cn(styles["org-history-row"], styles["org-history-link"])}
+              onClick={() => props.onOpenThread(round.reviewer)}
+            >
+              <span className={styles["org-history-label"]}>
+                Outcome · round {round.round} · {reviewVerdict(round)}
+              </span>
+            </button>
+          ))}
+          {subtaskRounds.map(({ subtask, round }) => (
+            <button
+              key={`${subtask.thread.id}:${round.reviewer.id}`}
+              type="button"
+              className={cn(styles["org-history-row"], styles["org-history-link"])}
+              onClick={() => props.onOpenThread(round.reviewer)}
+            >
+              <span className={styles["org-history-label"]}>
+                {subtask.task.title} · round {round.round} · {reviewVerdict(round)}
+              </span>
+            </button>
+          ))}
+        </div>
+      ) : null}
+    </div>
   );
 }
 
 function RoleCard(props: {
   thread: Shell;
+  providerEntryByInstanceId: ReadonlyMap<string, ProviderInstanceEntry>;
   highlightThreadId: string | null;
   onOpenThread: (thread: Shell) => void;
 }) {
@@ -187,26 +441,22 @@ function RoleCard(props: {
       )}
       data-org-thread={thread.id}
     >
-      <button
-        type="button"
-        className={styles["org-header"]}
-        onClick={() => props.onOpenThread(thread)}
-      >
-        <span className={styles["org-role"]}>
-          <Dot thread={thread} />
-          {ROLE_LABELS[thread.source.organization!.role]}
-        </span>
-        <span className={styles["org-title"]}>{thread.title}</span>
-        <Meta thread={thread} />
-      </button>
+      <CardHeader
+        thread={thread}
+        role={ROLE_LABELS[thread.source.organization!.role]}
+        entry={props.providerEntryByInstanceId.get(instanceIdOf(thread))}
+        onOpen={() => props.onOpenThread(thread)}
+      />
     </article>
   );
 }
 
 function SubtaskRow(props: {
   subtask: OrganizationSubtask;
+  providerEntryByInstanceId: ReadonlyMap<string, ProviderInstanceEntry>;
   highlightThreadId: string | null;
   onOpenThread: (thread: Shell) => void;
+  onOpenPullRequest: (event: ReactMouseEvent<HTMLElement>, url: string) => void;
 }) {
   const { subtask } = props;
   const executor = subtask.thread;
@@ -223,53 +473,59 @@ function SubtaskRow(props: {
           <CheckIcon className="size-3" strokeWidth={3} />
         ) : null}
       </div>
-      <div className="min-w-0">
-        <button
-          type="button"
-          className={styles["org-item-main"]}
-          onClick={() => props.onOpenThread(executor)}
+      <Tooltip>
+        <TooltipTrigger
+          render={
+            <button
+              type="button"
+              className={styles["org-item-main"]}
+              onClick={() => props.onOpenThread(executor)}
+            />
+          }
         >
-          <span className={styles["org-item-title"]}>
-            {subtask.number} · {subtask.task.title}
-          </span>
-          <span className={styles["org-sub"]}>
-            <Dot thread={executor} />
-            <Truncated
-              className={styles["org-sub-truncate"]}
-              text={`Executor · ${threadModelLabel(executor)} · ${threadActivity(executor)}`}
-            />
-          </span>
-          <span className={styles["org-sub"]}>
-            <Truncated
-              className={styles["org-sub-truncate"]}
-              text={`${subtask.repository} · ${subtask.branch ?? "worktree not prepared"}`}
-            />
-          </span>
-          {subtask.needs.length > 0 || subtask.inCycle ? (
-            <span className={styles["org-sub"]}>
-              {subtask.needs.map((need) => (
-                <span
-                  key={need.threadId}
-                  className={cn(styles["org-dep"], subtask.inCycle && styles["org-dep-cycle"])}
-                >
-                  needs {need.label}
-                </span>
-              ))}
-              {subtask.inCycle ? (
-                <span className={styles["org-dep-cycle"]}>dependency cycle</span>
-              ) : null}
+          <span className={styles["org-item-line"]}>
+            <span className={styles["org-item-title"]}>
+              {subtask.number} · {subtask.task.title}
             </span>
-          ) : null}
-        </button>
-        {subtask.review ? (
-          <ReviewLine
-            label="Review"
-            review={subtask.review}
-            onOpenThread={props.onOpenThread}
-            highlightThreadId={props.highlightThreadId}
+            {subtask.needs.length > 0 || subtask.inCycle ? (
+              <span className={styles["org-needs"]}>
+                {subtask.needs.map((need) => (
+                  <span
+                    key={need.threadId}
+                    className={cn(styles["org-dep"], subtask.inCycle && styles["org-dep-cycle"])}
+                  >
+                    needs {need.label}
+                  </span>
+                ))}
+                {subtask.inCycle ? (
+                  <span className={styles["org-dep-cycle"]}>dependency cycle</span>
+                ) : null}
+              </span>
+            ) : null}
+          </span>
+        </TooltipTrigger>
+        <TooltipPopup side="top">
+          <div className={styles["org-tooltip-line"]}>
+            Executor · {threadModelLabel(executor)} · {threadActivity(executor)}
+          </div>
+          <div className={styles["org-tooltip-line"]}>
+            {subtask.repository} · {subtask.branch ?? "worktree not prepared"}
+          </div>
+        </TooltipPopup>
+      </Tooltip>
+      <div className={styles["org-item-trailing"]}>
+        <ProviderIcon
+          thread={executor}
+          entry={props.providerEntryByInstanceId.get(instanceIdOf(executor))}
+        />
+        <ReviewerGlyph review={subtask.review} />
+        {subtask.pullRequests.map((pullRequest) => (
+          <PullRequestChip
+            key={pullRequest.url}
+            pullRequest={pullRequest}
+            onOpen={props.onOpenPullRequest}
           />
-        ) : null}
-        <EarlierRounds rounds={subtask.earlierRounds} onOpenThread={props.onOpenThread} />
+        ))}
       </div>
       <Pill state={subtask.task.state} />
     </div>
@@ -278,12 +534,19 @@ function SubtaskRow(props: {
 
 function LeadCard(props: {
   card: OrganizationLeadCard;
+  providerEntryByInstanceId: ReadonlyMap<string, ProviderInstanceEntry>;
   highlightThreadId: string | null;
   onOpenThread: (thread: Shell) => void;
+  onOpenPullRequest: (event: ReactMouseEvent<HTMLElement>, url: string) => void;
   onArchive: (lead: Shell) => void;
 }) {
   const { card } = props;
   const { lead, outcome } = card;
+  const [historyOpen, setHistoryOpen] = useState(false);
+  const hasHistory =
+    card.rounds.length > 0 ||
+    card.outcomeEarlierRounds.length > 0 ||
+    card.subtasks.some((subtask) => subtask.earlierRounds.length > 0);
   return (
     <article
       className={cn(
@@ -292,26 +555,39 @@ function LeadCard(props: {
       )}
       data-org-thread={lead.id}
     >
-      <button
-        type="button"
-        className={styles["org-header"]}
-        onClick={() => props.onOpenThread(lead)}
-      >
-        <span className={styles["org-role"]}>
-          <Dot thread={lead} />
-          Project lead
-        </span>
-        <span className={styles["org-title"]}>{lead.title}</span>
-        <Meta thread={lead} />
-      </button>
+      <CardHeader
+        thread={lead}
+        role={ROLE_LABELS.lead}
+        entry={props.providerEntryByInstanceId.get(instanceIdOf(lead))}
+        onOpen={() => props.onOpenThread(lead)}
+        onArchive={canArchiveWorkstream(lead.source) ? () => props.onArchive(lead) : undefined}
+      />
       {outcome ? (
         <div className={styles["org-outcome"]}>
-          {outcome.rounds?.length
-            ? `Outcome · round ${outcome.rounds.at(-1)!.round + 1}`
-            : "Outcome"}
+          <span className={styles["org-outcome-round"]}>
+            Round {(outcome.rounds?.length ?? 0) + 1}
+          </span>
           <Pill state={outcome.state} {...(card.outcomeWait ? { label: card.outcomeWait } : {})} />
           {outcome.title !== lead.title ? (
             <Truncated className={styles["org-outcome-title"]} text={outcome.title} />
+          ) : null}
+        </div>
+      ) : null}
+      {card.pullRequests.length > 0 || card.mergedHistory.length > 0 ? (
+        <div className={styles["org-pr-row"]}>
+          {card.pullRequests.map((pullRequest) => (
+            <PullRequestChip
+              key={pullRequest.url}
+              pullRequest={pullRequest}
+              onOpen={props.onOpenPullRequest}
+            />
+          ))}
+          {card.mergedHistory.length > 0 ? (
+            <MergedHistoryChip
+              count={card.mergedHistory.length}
+              expanded={historyOpen}
+              onOpenHistory={() => setHistoryOpen(true)}
+            />
           ) : null}
         </div>
       ) : null}
@@ -323,32 +599,14 @@ function LeadCard(props: {
           highlightThreadId={props.highlightThreadId}
         />
       ) : null}
-      <EarlierRounds rounds={card.outcomeEarlierRounds} onOpenThread={props.onOpenThread} />
-      {outcome?.rounds?.length ? (
-        <details className={styles["org-rounds"]}>
-          <summary>
-            {outcome.rounds.length === 1
-              ? "1 earlier round"
-              : `${outcome.rounds.length} earlier rounds`}
-          </summary>
-          {outcome.rounds.map((round) => (
-            <div key={round.round} className={styles["org-review"]}>
-              <span className={styles["org-sub-truncate"]}>
-                round {round.round} · {round.state.replaceAll("_", " ")}
-                {round.pullRequests.length
-                  ? ` · ${round.pullRequests.map((number) => `#${number}`).join(", ")}`
-                  : ""}
-              </span>
-            </div>
-          ))}
-        </details>
-      ) : null}
-      {canArchiveWorkstream(lead.source) ? (
-        <div className={styles["org-accept"]}>
-          <Button size="sm" variant="outline" onClick={() => props.onArchive(lead)}>
-            Archive workstream
-          </Button>
-        </div>
+      {hasHistory ? (
+        <History
+          card={card}
+          open={historyOpen}
+          onToggle={setHistoryOpen}
+          onOpenThread={props.onOpenThread}
+          onOpenPullRequest={props.onOpenPullRequest}
+        />
       ) : null}
       <div className={styles["org-todo"]}>
         {card.subtasks.length === 0 ? (
@@ -358,8 +616,10 @@ function LeadCard(props: {
             <SubtaskRow
               key={subtask.thread.id}
               subtask={subtask}
+              providerEntryByInstanceId={props.providerEntryByInstanceId}
               highlightThreadId={props.highlightThreadId}
               onOpenThread={props.onOpenThread}
+              onOpenPullRequest={props.onOpenPullRequest}
             />
           ))
         )}
@@ -370,8 +630,10 @@ function LeadCard(props: {
 
 function UnassignedCard(props: {
   subtasks: ReadonlyArray<OrganizationSubtask>;
+  providerEntryByInstanceId: ReadonlyMap<string, ProviderInstanceEntry>;
   highlightThreadId: string | null;
   onOpenThread: (thread: Shell) => void;
+  onOpenPullRequest: (event: ReactMouseEvent<HTMLElement>, url: string) => void;
 }) {
   return (
     <article className={styles["org-card"]}>
@@ -382,8 +644,10 @@ function UnassignedCard(props: {
           <SubtaskRow
             key={subtask.thread.id}
             subtask={subtask}
+            providerEntryByInstanceId={props.providerEntryByInstanceId}
             highlightThreadId={props.highlightThreadId}
             onOpenThread={props.onOpenThread}
+            onOpenPullRequest={props.onOpenPullRequest}
           />
         ))}
       </div>
@@ -410,6 +674,8 @@ export function OrganizationCanvas(props: {
     [props.environmentId, props.projectId],
   );
   const threads = useThreadShellsForProjectRefs(refs);
+  const providerEntryByInstanceId = useProviderEntryByInstanceId(props.environmentId);
+  const openPullRequest = useOpenPrLink();
   const model = useMemo(
     () => organizationModel(threads, props.environmentId, props.projectId, props.workstream ?? ""),
     [threads, props.environmentId, props.projectId, props.workstream],
@@ -427,6 +693,7 @@ export function OrganizationCanvas(props: {
             <RoleCard
               key={thread.id}
               thread={thread}
+              providerEntryByInstanceId={providerEntryByInstanceId}
               highlightThreadId={highlight}
               onOpenThread={props.onOpenThread}
             />
@@ -444,16 +711,20 @@ export function OrganizationCanvas(props: {
           <LeadCard
             key={card.lead.id}
             card={card}
+            providerEntryByInstanceId={providerEntryByInstanceId}
             highlightThreadId={highlight}
             onOpenThread={props.onOpenThread}
+            onOpenPullRequest={openPullRequest}
             onArchive={setArchiving}
           />
         ))}
         {model.unassigned.length > 0 ? (
           <UnassignedCard
             subtasks={model.unassigned}
+            providerEntryByInstanceId={providerEntryByInstanceId}
             highlightThreadId={highlight}
             onOpenThread={props.onOpenThread}
+            onOpenPullRequest={openPullRequest}
           />
         ) : null}
       </div>
