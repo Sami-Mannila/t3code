@@ -75,6 +75,87 @@ const lead = role("lead", { role: "lead", parentThreadId: chief.id });
 const model = (threads: EnvironmentThreadShell[], workstream = "") =>
   organizationModel(threads, env, project, workstream);
 
+/** A synced pull request link, as the shell carries it. */
+function pullRequest(
+  number: number,
+  state: "open" | "closed" | "merged",
+  options: { title?: string; linkedAt?: string; isDraft?: boolean; repository?: string } = {},
+) {
+  const at = options.linkedAt ?? "2027-01-01T00:00:00.000Z";
+  const repository = options.repository ?? "acme/app";
+  return {
+    host: "github.com",
+    repository,
+    number,
+    url: `https://github.com/${repository}/pull/${number}`,
+    source: "agent" as const,
+    linkedAt: at,
+    snapshot: {
+      state,
+      title: options.title ?? `Pull request ${number}`,
+      headBranch: `feature/${number}`,
+      baseBranch: "main",
+      isDraft: options.isDraft ?? false,
+      updatedAt: at,
+      syncedAt: at,
+    },
+    stack: null,
+  };
+}
+
+function withPullRequests(
+  thread: EnvironmentThreadShell,
+  links: ReadonlyArray<ReturnType<typeof pullRequest>>,
+): EnvironmentThreadShell {
+  return {
+    ...thread,
+    pullRequests: links,
+    source: { ...thread.source, pullRequests: links },
+  } as EnvironmentThreadShell;
+}
+
+/** A lead that owns an outcome task, so its rounds and pull requests can be exercised. */
+function leadWithTask(
+  patch: Partial<OrganizationTask>,
+  links: ReadonlyArray<ReturnType<typeof pullRequest>> = [],
+): EnvironmentThreadShell {
+  return withPullRequests(
+    role("lead", {
+      role: "lead",
+      parentThreadId: chief.id,
+      task: {
+        title: "Outcome",
+        ownerThreadId: ThreadId.make("lead"),
+        dependencyThreadIds: [],
+        state: "working",
+        revision: null,
+        reviewedRevision: null,
+        reviewerThreadId: null,
+        notes: null,
+        ...patch,
+      },
+    }),
+    links,
+  );
+}
+
+function round(
+  roundNumber: number,
+  pullRequests: number[],
+  dependencyThreadIds: string[] = [],
+): NonNullable<OrganizationTask["rounds"]>[number] {
+  return {
+    round: roundNumber,
+    state: "accepted",
+    revision: "r1",
+    reviewedRevision: "r1",
+    dependencyThreadIds: dependencyThreadIds.map((id) => ThreadId.make(id)),
+    pullRequests,
+    summary: null,
+    endedAt: "2027-01-01T00:00:00.000Z",
+  };
+}
+
 describe("organization cards", () => {
   it("puts Chief before Advisor and scopes every card to the selected environment", () => {
     const result = model([
@@ -270,5 +351,92 @@ describe("review lines", () => {
     const working = withTask(executor, { state: "working" });
     expect(card([chief, reviewed, working]).outcomeWait).toBe("reviewed · waiting for work work");
     expect(card([chief, withTask(reviewed, { state: "accepted" })]).outcomeWait).toBeNull();
+  });
+});
+
+describe("pull request chips", () => {
+  it("gives every subtask its executor's pull requests, state and title", () => {
+    const executor = withPullRequests(task("work", "work"), [
+      pullRequest(12, "open", { title: "Add the pilot" }),
+    ]);
+    const subtask = model([chief, lead, executor]).leads[0]!.subtasks[0]!;
+    expect(subtask.pullRequests).toEqual([
+      {
+        number: 12,
+        url: "https://github.com/acme/app/pull/12",
+        title: "Add the pilot",
+        state: "open",
+        isDraft: false,
+      },
+    ]);
+  });
+
+  it("collapses merged pull requests from a finished round into the card's merged history", () => {
+    const card = model([
+      chief,
+      leadWithTask({ rounds: [round(1, [7])] }, [
+        pullRequest(7, "merged", { title: "Round one work" }),
+        pullRequest(9, "open", { title: "Round two work" }),
+      ]),
+    ]).leads[0]!;
+    expect(card.mergedHistory.map((pr) => pr.number)).toEqual([7]);
+    // The merged link is collapsed out of the individual chips; the open one stays.
+    expect(card.pullRequests.map((pr) => pr.number)).toEqual([9]);
+    // The finished round still names it, so the history disclosure can show it.
+    expect(card.rounds[0]!.pullRequests.map((pr) => pr.number)).toEqual([7]);
+  });
+
+  it("collapses an executor's merged earlier-round pull request out of its row", () => {
+    const executor = withPullRequests(task("work", "work"), [pullRequest(7, "merged")]);
+    const card = model([chief, leadWithTask({ rounds: [round(1, [7], [executor.id])] }), executor])
+      .leads[0]!;
+    expect(card.mergedHistory.map((pr) => pr.number)).toEqual([7]);
+    expect(card.subtasks[0]!.pullRequests).toEqual([]);
+  });
+
+  it("collapses a round's pull request only from that round's own repository", () => {
+    const repoA = withPullRequests(task("a", "a"), [
+      pullRequest(7, "merged", { repository: "acme/a" }),
+    ]);
+    const repoB = withPullRequests(task("b", "b"), [
+      pullRequest(7, "open", { repository: "acme/b" }),
+    ]);
+    const card = model([chief, leadWithTask({ rounds: [round(1, [7], [repoA.id])] }), repoA, repoB])
+      .leads[0]!;
+    // Only repo A's executor belongs to the round, so only repo A's #7 collapses.
+    expect(card.mergedHistory.map((pr) => [pr.number, pr.url])).toEqual([
+      [7, "https://github.com/acme/a/pull/7"],
+    ]);
+    expect(card.subtasks.find((s) => s.thread.id === "a")!.pullRequests).toEqual([]);
+    expect(card.subtasks.find((s) => s.thread.id === "b")!.pullRequests).toEqual([
+      {
+        number: 7,
+        url: "https://github.com/acme/b/pull/7",
+        title: "Pull request 7",
+        state: "open",
+        isDraft: false,
+      },
+    ]);
+    // History resolves the round against its own owners too.
+    expect(card.rounds[0]!.pullRequests.map((pr) => pr.url)).toEqual([
+      "https://github.com/acme/a/pull/7",
+    ]);
+  });
+
+  it("does not draw a lead's inherited copy of an executor's pull request twice", () => {
+    const link = pullRequest(7, "open", { repository: "acme/a" });
+    const executor = withPullRequests(task("a", "a"), [link]);
+    const card = model([chief, leadWithTask({}, [link]), executor]).leads[0]!;
+    expect(card.pullRequests).toEqual([]);
+    expect(card.subtasks[0]!.pullRequests.map((pr) => pr.number)).toEqual([7]);
+  });
+
+  it("keeps an unmerged earlier-round pull request as an individual chip", () => {
+    const card = model([
+      chief,
+      leadWithTask({ rounds: [round(1, [7])] }, [pullRequest(7, "closed")]),
+    ]).leads[0]!;
+    expect(card.mergedHistory).toEqual([]);
+    expect(card.pullRequests.map((pr) => pr.number)).toEqual([7]);
   });
 });

@@ -4,12 +4,18 @@ import type {
   ProjectId,
   OrganizationRole,
   OrganizationTask,
+  PullRequestState,
+  ThreadPullRequestLink,
 } from "@t3tools/contracts";
 import {
   organizationOutcomeGate,
   type OrganizationOutcomeGate,
   type OutcomeThread,
 } from "@t3tools/shared/organizationOutcome";
+import {
+  threadPullRequestKeyOf,
+  visibleThreadPullRequests,
+} from "@t3tools/shared/threadPullRequests";
 
 export const ROLE_LABELS: Record<OrganizationRole, string> = {
   advisor: "Advisor",
@@ -48,6 +54,22 @@ export interface OrganizationReviewRound {
   readonly notes: string | null;
 }
 
+/** One pull request as a card draws it: state and title are already resolved from its snapshot. */
+export interface OrganizationPullRequest {
+  readonly number: number;
+  readonly url: string;
+  readonly title: string;
+  readonly state: PullRequestState;
+  readonly isDraft: boolean;
+}
+
+/** A lead's finished round, its pull requests resolved for display. */
+export interface OrganizationRound {
+  readonly round: number;
+  readonly state: string;
+  readonly pullRequests: ReadonlyArray<OrganizationPullRequest>;
+}
+
 export interface OrganizationSubtask {
   readonly thread: Shell;
   readonly task: OrganizationTask;
@@ -60,6 +82,11 @@ export interface OrganizationSubtask {
   readonly review: OrganizationReview | null;
   readonly earlierRounds: ReadonlyArray<OrganizationReviewRound>;
   readonly inCycle: boolean;
+  /**
+   * The executor's visible pull request links, with earlier-round merged ones collapsed into the
+   * card's merged history instead.
+   */
+  readonly pullRequests: ReadonlyArray<OrganizationPullRequest>;
 }
 
 export interface OrganizationLeadCard {
@@ -70,6 +97,12 @@ export interface OrganizationLeadCard {
   readonly subtasks: ReadonlyArray<OrganizationSubtask>;
   /** What a reviewed outcome still waits on before the server accepts it; null otherwise. */
   readonly outcomeWait: string | null;
+  /** The lead's own visible pull requests, minus earlier-round merged ones. */
+  readonly pullRequests: ReadonlyArray<OrganizationPullRequest>;
+  /** Merged pull requests from finished rounds, shown as one collapsed chip. */
+  readonly mergedHistory: ReadonlyArray<OrganizationPullRequest>;
+  /** The outcome's finished rounds with their pull requests resolved for the history list. */
+  readonly rounds: ReadonlyArray<OrganizationRound>;
 }
 
 export interface OrganizationModel {
@@ -103,6 +136,71 @@ const outcomeThread = (thread: Shell): OutcomeThread => ({
 
 const pullRequestNumbers = (pullRequests: ReadonlyArray<{ readonly number: number }>) =>
   pullRequests.map((pullRequest) => `#${pullRequest.number}`).join(", ");
+
+/** A thread's live pull request links, tombstones dropped, ready to map for display. */
+const visiblePullRequestLinks = (thread: Shell): ReadonlyArray<ThreadPullRequestLink> =>
+  visibleThreadPullRequests(thread.pullRequests ?? thread.source.pullRequests ?? []);
+
+const toPullRequest = (link: ThreadPullRequestLink): OrganizationPullRequest => ({
+  number: link.number,
+  url: link.url,
+  title: link.snapshot?.title ?? "",
+  state: link.snapshot?.state ?? "open",
+  isDraft: link.snapshot?.isDraft ?? false,
+});
+
+const byPullRequestNumber = (left: OrganizationPullRequest, right: OrganizationPullRequest) =>
+  left.number - right.number;
+
+/**
+ * A lead's finished rounds own pull requests that are already merged; showing them as individual
+ * chips would bury the current round. They collapse into one merged count, so this returns the
+ * merged history plus the link keys the rows must hide.
+ *
+ * A round only owns what its own participants linked: the lead and the round's
+ * `dependencyThreadIds`. Resolving a round's recorded number against every executor would let a
+ * multi-repo project collapse another repository's same-numbered pull request.
+ */
+function collapseMergedHistory(
+  lead: Shell,
+  byId: ReadonlyMap<string, Shell>,
+  task: OrganizationTask | undefined,
+): {
+  readonly mergedHistory: ReadonlyArray<OrganizationPullRequest>;
+  readonly collapsed: ReadonlySet<string>;
+  readonly rounds: ReadonlyArray<OrganizationRound>;
+} {
+  const mergedHistory: OrganizationPullRequest[] = [];
+  const collapsed = new Set<string>();
+  const rounds: OrganizationRound[] = [];
+  for (const round of task?.rounds ?? []) {
+    const owners = [lead, ...round.dependencyThreadIds.map((id) => byId.get(id))].filter(
+      (thread): thread is Shell => thread !== undefined,
+    );
+    const ownerLinks = new Map<string, ThreadPullRequestLink>();
+    for (const thread of owners) {
+      for (const link of visiblePullRequestLinks(thread)) {
+        const key = threadPullRequestKeyOf(link);
+        if (!ownerLinks.has(key)) ownerLinks.set(key, link);
+      }
+    }
+    const roundPullRequests: OrganizationPullRequest[] = [];
+    for (const number of round.pullRequests) {
+      for (const link of ownerLinks.values()) {
+        if (link.number !== number) continue;
+        roundPullRequests.push(toPullRequest(link));
+        if (link.snapshot?.state !== "merged") continue;
+        const key = threadPullRequestKeyOf(link);
+        if (collapsed.has(key)) continue;
+        collapsed.add(key);
+        mergedHistory.push(toPullRequest(link));
+      }
+    }
+    rounds.push({ round: round.round, state: round.state, pullRequests: roundPullRequests });
+  }
+  mergedHistory.sort(byPullRequestNumber);
+  return { mergedHistory, collapsed, rounds };
+}
 
 /** The server accepts outcomes; the card says what a reviewed one is waiting for. */
 export function outcomeWaitLabel(gate: OrganizationOutcomeGate): string | null {
@@ -211,7 +309,10 @@ export function organizationModel(
   };
 
   /** Dependency order among siblings; members of a cycle keep creation order at the end. */
-  const checklist = (executors: Shell[]): OrganizationSubtask[] => {
+  const checklist = (
+    executors: Shell[],
+    collapsed: ReadonlySet<string> = new Set(),
+  ): OrganizationSubtask[] => {
     const siblings = new Set(executors.map((t) => t.id as string));
     const pending = new Map(
       executors.map((t) => [
@@ -256,6 +357,9 @@ export function organizationModel(
         review,
         earlierRounds: earlier,
         inCycle: cyclic.has(thread.id),
+        pullRequests: visiblePullRequestLinks(thread)
+          .filter((link) => !collapsed.has(threadPullRequestKeyOf(link)))
+          .map(toPullRequest),
       };
     });
   };
@@ -279,13 +383,31 @@ export function organizationModel(
     .sort(createdOrder)
     .map((lead) => {
       const { review, earlier } = reviewOf(lead);
+      const outcome = lead.source.organization!.task;
+      const executorThreads = executorsByLead.get(lead.id) ?? [];
+      const { mergedHistory, collapsed, rounds } = collapseMergedHistory(lead, byId, outcome);
+      // A lead that inherited an executor's link should not draw it twice; the row owns it.
+      const executorKeys = new Set(
+        executorThreads.flatMap((thread) =>
+          visiblePullRequestLinks(thread).map(threadPullRequestKeyOf),
+        ),
+      );
       return {
         lead,
-        outcome: lead.source.organization!.task,
+        outcome,
         outcomeReview: review,
         outcomeEarlierRounds: earlier,
-        subtasks: checklist(executorsByLead.get(lead.id) ?? []),
+        subtasks: checklist(executorThreads, collapsed),
         outcomeWait: outcomeWaitLabel(organizationOutcomeGate(outcomeThread(lead), outcomeThreads)),
+        pullRequests: visiblePullRequestLinks(lead)
+          .filter(
+            (link) =>
+              !collapsed.has(threadPullRequestKeyOf(link)) &&
+              !executorKeys.has(threadPullRequestKeyOf(link)),
+          )
+          .map(toPullRequest),
+        mergedHistory,
+        rounds,
       };
     });
   const roots = threads
