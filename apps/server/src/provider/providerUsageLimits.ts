@@ -121,6 +121,11 @@ function usageWindowEquals(a: ServerProviderUsageWindow, b: ServerProviderUsageW
  * per-window epoch bookkeeping needed to reconcile the two was more code
  * than the sub-second regression it prevented. The next runtime event
  * corrects it.
+ *
+ * An available probe with no windows is the exception: it means the endpoint
+ * had nothing to report at that moment (a Team account whose `get_usage`
+ * omits `rate_limits`), not that the account has no limits. Keep the windows
+ * a turn already streamed and only refresh the probe's `checkedAt`/credits.
  */
 export function resolveUsageLimitsAfterProbe(input: {
   readonly published: ServerProviderUsageLimits | undefined;
@@ -129,6 +134,20 @@ export function resolveUsageLimitsAfterProbe(input: {
   const { published, probed } = input;
   if (probed?.unavailable?.reason === "probeFailed" && published && !published.unavailable) {
     return published;
+  }
+  if (
+    probed &&
+    !probed.unavailable &&
+    probed.windows.length === 0 &&
+    published &&
+    !published.unavailable &&
+    published.windows.length > 0
+  ) {
+    return {
+      ...published,
+      checkedAt: probed.checkedAt,
+      ...(probed.resetCredits !== undefined ? { resetCredits: probed.resetCredits } : {}),
+    };
   }
   return probed;
 }

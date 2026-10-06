@@ -95,6 +95,20 @@ describe("claudeUsageResponseToLimits", () => {
     ).toEqual({ checkedAt, windows: [], unavailable: { reason: "unsupported" } });
   });
 
+  it("keeps an available-but-empty Team account readable so streamed events can fill it", () => {
+    // This account answers `available: true` with no windows; the CLI reports
+    // them mid-turn. An `unsupported` snapshot would refuse those updates.
+    expect(
+      claudeUsageResponseToLimits({
+        checkedAt,
+        response: { rate_limits_available: true, rate_limits: null },
+      }),
+    ).toEqual({
+      names: { overageIncluded: undefined },
+      limits: { checkedAt, windows: [] },
+    });
+  });
+
   it("skips a window the endpoint reports without a utilization", () => {
     expect(
       claudeUsageResponseToLimits({
@@ -140,6 +154,86 @@ describe("claudeRateLimitEventToUpdate", () => {
           usedPercent: 85,
           windowDurationMins: 10080,
           resetsAt: "2026-07-14T03:33:20.000Z",
+        },
+      ],
+    });
+  });
+
+  it("reads both account-wide windows from a unifiedWindows event", () => {
+    expect(
+      claudeRateLimitEventToUpdate(
+        {
+          status: "allowed",
+          rateLimitType: "five_hour",
+          resetsAt: 1_791_231_000,
+          unifiedWindows: {
+            five_hour: { utilization: 0.6, resetsAt: 1_791_231_000 },
+            seven_day: { utilization: 0.18, resetsAt: 1_791_694_800 },
+          },
+        } as never,
+        noNames,
+      ),
+    ).toEqual({
+      windows: [
+        {
+          id: "five_hour",
+          kind: "session",
+          label: "Session",
+          usedPercent: 60,
+          windowDurationMins: 300,
+          resetsAt: "2026-10-05T20:10:00.000Z",
+        },
+        {
+          id: "seven_day",
+          kind: "weekly",
+          label: "Weekly",
+          usedPercent: 18,
+          windowDurationMins: 10080,
+          resetsAt: "2026-10-11T05:00:00.000Z",
+        },
+      ],
+    });
+  });
+
+  it("lands the overage-included bucket from a unifiedWindows event on the probe's row", () => {
+    expect(
+      claudeRateLimitEventToUpdate(
+        {
+          status: "allowed_warning",
+          rateLimitType: "seven_day",
+          unifiedWindows: {
+            five_hour: { utilization: 0.4, resetsAt: 1_791_312_600 },
+            seven_day: { utilization: 0.5, resetsAt: 1_791_694_800 },
+            seven_day_overage_included: { utilization: 0, resetsAt: 1_791_694_800 },
+          },
+        } as never,
+        { overageIncluded: "Fable" },
+      ),
+    ).toEqual({
+      windows: [
+        {
+          id: "five_hour",
+          kind: "session",
+          label: "Session",
+          usedPercent: 40,
+          windowDurationMins: 300,
+          resetsAt: "2026-10-06T18:50:00.000Z",
+        },
+        {
+          id: "seven_day",
+          kind: "weekly",
+          label: "Weekly",
+          usedPercent: 50,
+          windowDurationMins: 10080,
+          resetsAt: "2026-10-11T05:00:00.000Z",
+        },
+        {
+          id: "seven_day_fable",
+          kind: "weekly",
+          label: "Weekly · Fable",
+          usedPercent: 0,
+          windowDurationMins: 10080,
+          resetsAt: "2026-10-11T05:00:00.000Z",
         },
       ],
     });

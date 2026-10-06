@@ -2714,6 +2714,16 @@ export const layer: Layer.Layer<ProjectionStoreV2, never, SqlClient.SqlClient> =
                     )
                     AND request.type = 'run_interrupt_request'
                   UNION
+                  SELECT pending_item.payload_json, pending_item.ordinal, pending_item.turn_item_id
+                  FROM orchestration_v2_projection_runtime_requests AS pending_request
+                  INNER JOIN orchestration_v2_projection_turn_items AS pending_item
+                    ON pending_item.thread_id = pending_request.thread_id
+                    AND pending_item.node_id = pending_request.node_id
+                  WHERE pending_request.thread_id = ${threadId}
+                    AND pending_request.status = 'pending'
+                    AND pending_item.type IN ('approval_request', 'user_input_request')
+                    AND json_extract(pending_item.payload_json, '$.requestId') = pending_request.runtime_request_id
+                  UNION
                   SELECT latest.payload_json, latest.ordinal, latest.turn_item_id
                   FROM (
                     SELECT payload_json, ordinal, turn_item_id

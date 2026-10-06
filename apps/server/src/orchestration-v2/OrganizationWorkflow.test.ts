@@ -7,6 +7,7 @@ import {
   organizationExtendedTask,
   organizationChiefNotice,
   organizationFailedRunTaskUpdate,
+  organizationIdleLeadBlock,
   organizationProblem,
 } from "./OrganizationPolicy.ts";
 import { McpSchema, McpServer } from "effect/unstable/ai";
@@ -19,6 +20,7 @@ import * as NodeServices from "@effect/platform-node/NodeServices";
 import { assert, it } from "@effect/vitest";
 import {
   CommandId,
+  ContextTransferId,
   EventId,
   EnvironmentId,
   MessageId,
@@ -2070,6 +2072,81 @@ it("a preparation failure blocks only work about to run, and its retry restores 
   assert.isNull(organizationPreparationUnblock(task({ state: "accepted" })));
 });
 
+it("only an idle lead that ended cleanly without asking is flagged blocked", () => {
+  const task = (state: OrganizationTask["state"]): OrganizationTask => ({
+    title: "Lead work",
+    ownerThreadId: ThreadId.make("idle-lead"),
+    dependencyThreadIds: [],
+    state,
+    revision: null,
+    reviewedRevision: null,
+    reviewerThreadId: null,
+    notes: null,
+  });
+  const base = {
+    task: task("working"),
+    runStatus: "completed" as const,
+    progress: "result_available" as const,
+    hasOpenQuestion: false,
+    resultText: "  Which release\nshould I ship?  ",
+    resultRunCompletedAt: undefined,
+  };
+  const blocked = organizationIdleLeadBlock(base)!;
+  assert.equal(blocked.state, "blocked");
+  assert.equal(
+    blocked.notes,
+    "Stopped without submitting or asking the user. Last message: Which release should I ship?",
+  );
+  // A deliberate round state is left alone.
+  for (const state of [
+    "queued",
+    "awaiting_review",
+    "changes_requested",
+    "accepted",
+    "blocked",
+  ] as const)
+    assert.isNull(organizationIdleLeadBlock({ ...base, task: task(state) }), state);
+  // A person stopped the run on purpose.
+  for (const runStatus of ["interrupted", "cancelled", "rolled_back"] as const)
+    assert.isNull(organizationIdleLeadBlock({ ...base, runStatus }), runStatus);
+  // Running work or an already-open question on the Chief is not idle.
+  assert.isNull(organizationIdleLeadBlock({ ...base, progress: "waiting_for_children" }));
+  assert.isNull(organizationIdleLeadBlock({ ...base, progress: "working" }));
+  assert.isNull(organizationIdleLeadBlock({ ...base, hasOpenQuestion: true }));
+  // A run that ended before the current round began belongs to an earlier round.
+  assert.isNull(
+    organizationIdleLeadBlock({
+      ...base,
+      task: {
+        ...task("working"),
+        roundStartedAt: "2026-01-02T00:00:00.000Z" as OrganizationTask["roundStartedAt"],
+      },
+      resultRunCompletedAt: "2026-01-01T00:00:00.000Z",
+    }),
+  );
+  // An extend steers its brief into the active run: it started before the round but ends after
+  // it, so the run is the new round's and must be blocked when it ends idle.
+  assert.isNotNull(
+    organizationIdleLeadBlock({
+      ...base,
+      task: {
+        ...task("working"),
+        roundStartedAt: "2026-01-02T00:00:00.000Z" as OrganizationTask["roundStartedAt"],
+      },
+      resultRunCompletedAt: "2026-01-02T01:00:00.000Z",
+    }),
+  );
+  // A failed run is forwarded too, and the notes stay one bounded line.
+  const failed = organizationIdleLeadBlock({
+    ...base,
+    runStatus: "failed",
+    resultText: `boom\n${"x".repeat(600)}`,
+  })!;
+  assert.equal(failed.state, "blocked");
+  assert.isAtMost(failed.notes!.length, 400);
+  assert.notInclude(failed.notes!, "\n");
+});
+
 it("a task title spanning lines cannot forge another entry in a merged Chief notice", () => {
   const notice = organizationChiefNotice({
     projectTitle: "Project",
@@ -2504,6 +2581,486 @@ it.effect("queued Chief notices merge into one turn with each task's latest stat
     assert.equal(merged.notification?.summary, "2 task updates");
     assert.notInclude(merged.text, "Explain the outcome");
     assert.include(merged.text, "end your turn without a message");
+  }).pipe(Effect.provide(taskNoticeLayer)),
+);
+
+it.effect(
+  "a lead that ends an extended round without submitting is blocked and its Chief is told",
+  () =>
+    Effect.gen(function* () {
+      const orchestrator = yield* Orchestrator.OrchestratorV2;
+      const projects = yield* ProjectService.ProjectService;
+      const sink = yield* EventSink.EventSinkV2;
+      const fs = yield* FileSystem.FileSystem;
+      const root = yield* fs.makeTempDirectoryScoped();
+      const now = yield* DateTime.now;
+      const projectId = ProjectId.make("idle-lead-project");
+      yield* projects.create({
+        commandId: CommandId.make("idle-lead-project-create"),
+        projectId,
+        title: "Idle lead",
+        workspaceRoot: root,
+      });
+      const chief = ThreadId.make("idle-chief");
+      const lead = ThreadId.make("idle-lead");
+      const taskNodeId = NodeId.make("idle-lead-task");
+      const leadRunId = RunId.make("idle-lead-run");
+      const leadProviderThreadId = ProviderThreadId.make("idle-lead-provider");
+      yield* orchestrator.dispatch({
+        type: "thread.create",
+        commandId: CommandId.make("idle-lead-create-chief"),
+        threadId: chief,
+        projectId,
+        title: "chief",
+        modelSelection,
+        runtimeMode: "full-access",
+        interactionMode: "default",
+        branch: null,
+        worktreePath: null,
+        createdBy: "user",
+        creationSource: "web",
+        organization: { role: "chief", parentThreadId: null },
+      });
+      // The lead is an app-owned child that already delivered a result transfer in an earlier
+      // round, so only the pre-transfer flag below can reach the Chief for this extended round.
+      yield* sink.write({
+        commandId: CommandId.make("idle-lead-seed"),
+        events: [
+          {
+            id: EventId.make("idle-lead-thread"),
+            type: "thread.created",
+            threadId: lead,
+            occurredAt: now,
+            payload: {
+              createdBy: "agent",
+              creationSource: "server",
+              id: lead,
+              projectId,
+              title: "lead",
+              providerInstanceId: modelSelection.instanceId,
+              modelSelection,
+              runtimeMode: "full-access",
+              interactionMode: "default",
+              branch: null,
+              worktreePath: null,
+              activeProviderThreadId: leadProviderThreadId,
+              lineage: {
+                parentThreadId: chief,
+                relationshipToParent: "subagent",
+                rootThreadId: chief,
+              },
+              forkedFrom: { type: "node", nodeId: taskNodeId },
+              organization: {
+                role: "lead",
+                parentThreadId: chief,
+                task: {
+                  title: "Lead work",
+                  ownerThreadId: lead,
+                  dependencyThreadIds: [],
+                  state: "working",
+                  revision: null,
+                  reviewedRevision: null,
+                  reviewerThreadId: null,
+                  notes: null,
+                },
+              },
+              createdAt: now,
+              updatedAt: now,
+              archivedAt: null,
+              settledOverride: null,
+              settledAt: null,
+              lastVisitedAt: null,
+              deletedAt: null,
+            },
+          },
+          {
+            id: EventId.make("idle-lead-provider"),
+            type: "provider-thread.updated",
+            threadId: lead,
+            driver,
+            providerInstanceId: modelSelection.instanceId,
+            occurredAt: now,
+            payload: {
+              id: leadProviderThreadId,
+              driver,
+              providerInstanceId: modelSelection.instanceId,
+              providerSessionId: null,
+              appThreadId: lead,
+              ownerNodeId: taskNodeId,
+              nativeThreadRef: { driver, nativeId: `native-${lead}`, strength: "strong" },
+              nativeConversationHeadRef: null,
+              status: "active",
+              firstRunOrdinal: 1,
+              lastRunOrdinal: 1,
+              handoffIds: [],
+              forkedFrom: null,
+              createdAt: now,
+              updatedAt: now,
+            },
+          },
+          {
+            id: EventId.make("idle-lead-run"),
+            type: "run.updated",
+            threadId: lead,
+            runId: leadRunId,
+            nodeId: taskNodeId,
+            providerInstanceId: modelSelection.instanceId,
+            occurredAt: now,
+            payload: {
+              id: leadRunId,
+              threadId: lead,
+              ordinal: 1,
+              providerInstanceId: modelSelection.instanceId,
+              modelSelection,
+              providerThreadId: leadProviderThreadId,
+              userMessageId: MessageId.make("idle-lead-user"),
+              rootNodeId: taskNodeId,
+              activeAttemptId: null,
+              status: "running",
+              requestedAt: now,
+              startedAt: now,
+              completedAt: null,
+              checkpointId: null,
+              contextHandoffId: null,
+            },
+          },
+          {
+            id: EventId.make("idle-lead-message"),
+            type: "message.updated",
+            threadId: lead,
+            runId: leadRunId,
+            occurredAt: now,
+            payload: {
+              id: MessageId.make("idle-lead-answer"),
+              threadId: lead,
+              runId: leadRunId,
+              nodeId: taskNodeId,
+              role: "assistant",
+              text: "Which release should I ship, 1 or 2?",
+              attachments: [],
+              streaming: false,
+              createdBy: "agent",
+              creationSource: "provider",
+              createdAt: now,
+              updatedAt: now,
+            },
+          },
+          {
+            id: EventId.make("idle-lead-subagent"),
+            type: "subagent.updated",
+            threadId: chief,
+            nodeId: taskNodeId,
+            driver,
+            providerInstanceId: modelSelection.instanceId,
+            occurredAt: now,
+            payload: {
+              id: taskNodeId,
+              threadId: chief,
+              runId: null,
+              parentNodeId: NodeId.make("idle-chief-root"),
+              origin: "app_owned",
+              createdBy: "agent",
+              driver,
+              providerInstanceId: modelSelection.instanceId,
+              providerThreadId: null,
+              childThreadId: lead,
+              nativeTaskRef: null,
+              prompt: "Plan the release.",
+              title: null,
+              model: null,
+              completionWake: "always",
+              status: "running",
+              result: null,
+              startedAt: now,
+              completedAt: null,
+              updatedAt: now,
+            },
+          },
+          {
+            id: EventId.make("idle-lead-transfer"),
+            type: "context-transfer.created",
+            threadId: chief,
+            occurredAt: now,
+            payload: {
+              id: ContextTransferId.make("idle-lead-transfer"),
+              type: "subagent_result",
+              sourceThreadId: lead,
+              targetThreadId: chief,
+              sourcePoint: { threadId: lead, runId: leadRunId },
+              basePoint: null,
+              sourceProviderInstanceId: modelSelection.instanceId,
+              targetProviderInstanceId: modelSelection.instanceId,
+              targetRunId: null,
+              status: "consumed",
+              resolution: null,
+              createdBy: "system",
+              error: null,
+              createdAt: now,
+              updatedAt: now,
+              consumedAt: now,
+            },
+          },
+        ],
+      });
+      const afterSequence = yield* sink.latestSequence();
+      const running = (yield* orchestrator.getThreadProjection(lead)).runs.find(
+        (run) => run.id === leadRunId,
+      )!;
+      yield* sink.write({
+        commandId: CommandId.make("idle-lead-complete"),
+        events: [
+          {
+            id: EventId.make("idle-lead-complete"),
+            type: "run.updated",
+            threadId: lead,
+            runId: leadRunId,
+            nodeId: taskNodeId,
+            providerInstanceId: modelSelection.instanceId,
+            occurredAt: now,
+            payload: { ...running, status: "completed", completedAt: now },
+          },
+        ],
+      });
+      const blockedEvent = yield* sink
+        .stream({ afterSequence, eventType: "thread.metadata-updated" })
+        .pipe(
+          Stream.filter(
+            (stored) =>
+              stored.event.type === "thread.metadata-updated" && stored.event.threadId === lead,
+          ),
+          Stream.take(1),
+          Stream.runHead,
+        );
+      assert.isTrue(blockedEvent._tag === "Some");
+      const blocked = (yield* orchestrator.getThreadProjection(lead)).thread.organization!.task!;
+      assert.equal(blocked.state, "blocked");
+      assert.include(blocked.notes, "Which release should I ship");
+      const chiefNotice = (yield* orchestrator.getThreadProjection(chief)).messages.find(
+        (message) => message.id.startsWith("organization:"),
+      )!;
+      assert.include(chiefNotice.text, "blocked");
+      assert.equal(chiefNotice.notification?.outcome, "failed");
+
+      // The Chief's next instruction resumes the blocked lead.
+      yield* orchestrator.dispatch({
+        type: "message.dispatch",
+        commandId: CommandId.make("idle-lead-brief"),
+        messageId: MessageId.make("idle-lead-brief"),
+        threadId: lead,
+        senderThreadId: chief,
+        text: "Ship option 1.",
+        attachments: [],
+        dispatchMode: { type: "queue_after_active" },
+        createdBy: "agent",
+        creationSource: "mcp",
+      });
+      const resumed = (yield* orchestrator.getThreadProjection(lead)).thread.organization!.task!;
+      assert.notEqual(resumed.state, "blocked");
+      assert.equal(resumed.notes, "Unblocked by new instructions from the Chief.");
+    }).pipe(Effect.provide(taskNoticeLayer)),
+);
+
+it.effect("a lead waiting on a running executor child is not blocked when its run ends", () =>
+  Effect.gen(function* () {
+    const orchestrator = yield* Orchestrator.OrchestratorV2;
+    const projects = yield* ProjectService.ProjectService;
+    const sink = yield* EventSink.EventSinkV2;
+    const fs = yield* FileSystem.FileSystem;
+    const root = yield* fs.makeTempDirectoryScoped();
+    const now = yield* DateTime.now;
+    const projectId = ProjectId.make("busy-lead-project");
+    yield* projects.create({
+      commandId: CommandId.make("busy-lead-project-create"),
+      projectId,
+      title: "Busy lead",
+      workspaceRoot: root,
+    });
+    const chief = ThreadId.make("busy-chief");
+    const lead = ThreadId.make("busy-lead");
+    const taskNodeId = NodeId.make("busy-lead-task");
+    const leadRunId = RunId.make("busy-lead-run");
+    const leadProviderThreadId = ProviderThreadId.make("busy-lead-provider");
+    yield* orchestrator.dispatch({
+      type: "thread.create",
+      commandId: CommandId.make("busy-lead-create-chief"),
+      threadId: chief,
+      projectId,
+      title: "chief",
+      modelSelection,
+      runtimeMode: "full-access",
+      interactionMode: "default",
+      branch: null,
+      worktreePath: null,
+      createdBy: "user",
+      creationSource: "web",
+      organization: { role: "chief", parentThreadId: null },
+    });
+    yield* sink.write({
+      commandId: CommandId.make("busy-lead-seed"),
+      events: [
+        {
+          id: EventId.make("busy-lead-thread"),
+          type: "thread.created",
+          threadId: lead,
+          occurredAt: now,
+          payload: {
+            createdBy: "agent",
+            creationSource: "server",
+            id: lead,
+            projectId,
+            title: "lead",
+            providerInstanceId: modelSelection.instanceId,
+            modelSelection,
+            runtimeMode: "full-access",
+            interactionMode: "default",
+            branch: null,
+            worktreePath: null,
+            activeProviderThreadId: leadProviderThreadId,
+            lineage: {
+              parentThreadId: chief,
+              relationshipToParent: "subagent",
+              rootThreadId: chief,
+            },
+            forkedFrom: { type: "node", nodeId: taskNodeId },
+            organization: {
+              role: "lead",
+              parentThreadId: chief,
+              task: {
+                title: "Lead work",
+                ownerThreadId: lead,
+                dependencyThreadIds: [],
+                state: "working",
+                revision: null,
+                reviewedRevision: null,
+                reviewerThreadId: null,
+                notes: null,
+              },
+            },
+            createdAt: now,
+            updatedAt: now,
+            archivedAt: null,
+            settledOverride: null,
+            settledAt: null,
+            lastVisitedAt: null,
+            deletedAt: null,
+          },
+        },
+        {
+          id: EventId.make("busy-lead-provider"),
+          type: "provider-thread.updated",
+          threadId: lead,
+          driver,
+          providerInstanceId: modelSelection.instanceId,
+          occurredAt: now,
+          payload: {
+            id: leadProviderThreadId,
+            driver,
+            providerInstanceId: modelSelection.instanceId,
+            providerSessionId: null,
+            appThreadId: lead,
+            ownerNodeId: taskNodeId,
+            nativeThreadRef: { driver, nativeId: `native-${lead}`, strength: "strong" },
+            nativeConversationHeadRef: null,
+            status: "active",
+            firstRunOrdinal: 1,
+            lastRunOrdinal: 1,
+            handoffIds: [],
+            forkedFrom: null,
+            createdAt: now,
+            updatedAt: now,
+          },
+        },
+        {
+          id: EventId.make("busy-lead-run"),
+          type: "run.updated",
+          threadId: lead,
+          runId: leadRunId,
+          nodeId: taskNodeId,
+          providerInstanceId: modelSelection.instanceId,
+          occurredAt: now,
+          payload: {
+            id: leadRunId,
+            threadId: lead,
+            ordinal: 1,
+            providerInstanceId: modelSelection.instanceId,
+            modelSelection,
+            providerThreadId: leadProviderThreadId,
+            userMessageId: MessageId.make("busy-lead-user"),
+            rootNodeId: taskNodeId,
+            activeAttemptId: null,
+            status: "completed",
+            requestedAt: now,
+            startedAt: now,
+            completedAt: now,
+            checkpointId: null,
+            contextHandoffId: null,
+          },
+        },
+        {
+          id: EventId.make("busy-lead-message"),
+          type: "message.updated",
+          threadId: lead,
+          runId: leadRunId,
+          occurredAt: now,
+          payload: {
+            id: MessageId.make("busy-lead-answer"),
+            threadId: lead,
+            runId: leadRunId,
+            nodeId: taskNodeId,
+            role: "assistant",
+            text: "Waiting on the executor.",
+            attachments: [],
+            streaming: false,
+            createdBy: "agent",
+            creationSource: "provider",
+            createdAt: now,
+            updatedAt: now,
+          },
+        },
+        {
+          id: EventId.make("busy-lead-child"),
+          type: "subagent.updated",
+          threadId: lead,
+          nodeId: NodeId.make("busy-lead-child-node"),
+          driver,
+          providerInstanceId: modelSelection.instanceId,
+          occurredAt: now,
+          payload: {
+            id: NodeId.make("busy-lead-child-node"),
+            threadId: lead,
+            runId: leadRunId,
+            parentNodeId: taskNodeId,
+            origin: "app_owned",
+            createdBy: "agent",
+            driver,
+            providerInstanceId: modelSelection.instanceId,
+            providerThreadId: null,
+            childThreadId: ThreadId.make("busy-lead-executor"),
+            nativeTaskRef: null,
+            prompt: "Implement it.",
+            title: null,
+            model: null,
+            completionWake: "always",
+            status: "running",
+            result: null,
+            startedAt: now,
+            completedAt: null,
+            updatedAt: now,
+          },
+        },
+      ],
+    });
+    // Drives the same idle check the terminal-run handler uses, without waiting on a fork.
+    yield* orchestrator.recoverDelegatedTask(lead, leadRunId);
+    const task = (yield* orchestrator.getThreadProjection(lead)).thread.organization!.task!;
+    assert.equal(task.state, "working");
+    assert.isNull(task.notes);
+    assert.deepEqual(
+      (yield* orchestrator.getThreadProjection(chief)).messages.filter((message) =>
+        message.id.startsWith("organization:"),
+      ),
+      [],
+    );
   }).pipe(Effect.provide(taskNoticeLayer)),
 );
 

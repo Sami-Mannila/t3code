@@ -14,6 +14,7 @@ import {
   organizationPreparesRuns,
   organizationChiefNoticeRelevant,
   organizationChiefNotice,
+  organizationIdleLeadBlock,
   ORGANIZATION_CHIEF_NOTICE_PREFIX,
   organizationInstructionUnblock,
 } from "./OrganizationPolicy.ts";
@@ -10638,6 +10639,74 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
       threadDispatch.withLock(commandThreadId(command), dispatchWithReceiptEffect(command)),
     );
 
+  /**
+   * A lead whose run ends still working, with nothing running and no question open on the Chief,
+   * never submitted, asked, or blocked, so no task-state change ever reached the Chief. Record the
+   * round blocked with the lead's last message; the ordinary task-update path announces it. A
+   * cheap shell read rejects every other thread before the locks. The decision is then re-read
+   * under the organization-serialization and lead locks, so a round extended or a run started
+   * since the terminal event is never overwritten. A deterministic command id keyed by the result
+   * run makes retries and recovery idempotent.
+   */
+  const blockIdleOrganizationLead = (threadId: ThreadId) =>
+    Effect.gen(function* () {
+      const shell = yield* projectionStore.getThreadShell(threadId);
+      const organization = shell?.organization;
+      if (organization?.role !== "lead" || organization.task?.state !== "working") return;
+      yield* threadDispatch.withLock(
+        ThreadId.make("__organization_command_serialization__"),
+        threadDispatch.withLock(
+          threadId,
+          Effect.gen(function* () {
+            const projection = yield* projectionStore.getThreadRecords(
+              threadId,
+              ["runs", "messages", "subagents", "providerThreads", "turnItems"],
+              {
+                messageRoles: ["user", "assistant"],
+                turnItemTypes: ["assistant_message", "error"],
+              },
+            );
+            const organization = projection.thread.organization;
+            if (organization?.role !== "lead" || organization.task === undefined) return;
+            const progress = delegatedTaskProgress(projection);
+            const resultRun = progress.resultRun;
+            if (progress.state !== "result_available" || resultRun === undefined) return;
+            if (resultRun.status !== "completed" && resultRun.status !== "failed") return;
+            const parentThreadId = organization.parentThreadId;
+            const openQuestions =
+              parentThreadId === null
+                ? []
+                : (yield* projectionStore.getThreadRecords(parentThreadId, ["runtimeRequests"]))
+                    .runtimeRequests;
+            const blocked = organizationIdleLeadBlock({
+              task: organization.task,
+              runStatus: resultRun.status,
+              progress: progress.state,
+              hasOpenQuestion: openQuestions.some(
+                (request) =>
+                  request.status === "pending" &&
+                  String(request.id).startsWith(
+                    `${SERVER_QUESTION_ID_PREFIX}organization:${threadId}:`,
+                  ),
+              ),
+              resultText: subagentResultForRun(projection, resultRun).text,
+              resultRunCompletedAt:
+                resultRun.completedAt === null
+                  ? undefined
+                  : DateTime.formatIso(resultRun.completedAt),
+            });
+            if (blocked === null) return;
+            yield* dispatchWithReceiptEffect({
+              type: "thread.metadata.update",
+              commandId: CommandId.make(`organization:lead-idle:${resultRun.id}`),
+              threadId,
+              organization: { ...organization, task: blocked },
+            });
+          }),
+        ),
+      );
+    });
+
   const handleTerminalRun = (stored: OrchestrationV2StoredEvent) =>
     Effect.gen(function* () {
       const threadId = stored.event.threadId;
@@ -10668,6 +10737,10 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
             threadId,
             organization: { ...org!, task: nextTask },
           });
+      }
+      // Same lock order as the failed-task block above: never nest the parent lock inside it.
+      if (stored.event.type === "run.updated") {
+        yield* blockIdleOrganizationLead(threadId);
       }
       const parentThreadId = yield* appOwnedSubagentParentThreadId(threadId);
       if (parentThreadId !== undefined) {
@@ -10748,6 +10821,7 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
               const thread = yield* projectionStore.getThreadShell(threadId);
               const parentThreadId = thread?.lineage.parentThreadId;
               if (parentThreadId === undefined || parentThreadId === null) return;
+              yield* blockIdleOrganizationLead(threadId);
               yield* threadDispatch.withLock(parentThreadId, finalizeAppOwnedSubagent(threadId));
             }).pipe(
               Effect.catchCause((cause) =>
@@ -10849,6 +10923,7 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
     Effect.gen(function* () {
       const parentThreadId = yield* appOwnedSubagentParentThreadId(threadId);
       if (parentThreadId === undefined) return;
+      yield* blockIdleOrganizationLead(threadId);
       yield* threadDispatch.withLock(
         parentThreadId,
         finalizeAppOwnedSubagent(threadId, { settledContinuationOf: sourceRunId }),
