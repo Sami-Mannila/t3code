@@ -102,8 +102,10 @@ const organization = (leadState: TaskState = "accepted") => [
   shell("plain", null),
 ];
 
-const harness = (threads: Array<OrchestrationV2ThreadShell>) => {
+/** `failOnce` (`"<command type>:<thread id>"`) fails that per-thread command the first time. */
+const harness = (threads: Array<OrchestrationV2ThreadShell>, failOnce?: string) => {
   const dispatched: Array<string> = [];
+  let failed = false;
   const layer = ThreadManagementService.layer.pipe(
     Layer.provide(
       Layer.mock(Orchestrator.OrchestratorV2)({
@@ -116,16 +118,27 @@ const harness = (threads: Array<OrchestrationV2ThreadShell>) => {
             ),
           } as never),
         dispatch: (command) =>
-          Effect.sync(() => {
+          Effect.suspend(() => {
             if (command.type !== "thread.archive" && command.type !== "thread.unarchive")
               throw new Error(`unexpected ${command.type}`);
-            dispatched.push(`${command.type}:${command.threadId}`);
+            const key = `${command.type}:${command.threadId}`;
+            if (key === failOnce && !failed) {
+              failed = true;
+              return Effect.fail(
+                new Orchestrator.OrchestratorDispatchError({
+                  commandId: command.commandId,
+                  commandType: command.type,
+                  cause: "injected failure",
+                }),
+              );
+            }
+            dispatched.push(key);
             const index = threads.findIndex((thread) => thread.id === command.threadId);
             threads[index] = {
               ...threads[index]!,
               archivedAt: command.type === "thread.archive" ? NOW : null,
             };
-            return { sequence: 8, storedEvents: [] };
+            return Effect.succeed({ sequence: 8, storedEvents: [] });
           }),
       }),
     ),
@@ -172,10 +185,10 @@ describe("workstream archive", () => {
       dispatched.length = 0;
       yield* dispatch(workstream("thread.workstream.unarchive", "lead-a"));
       expect(dispatched).toEqual([
-        "thread.unarchive:lead-a",
-        "thread.unarchive:reviewer-a",
-        "thread.unarchive:executor-a2",
         "thread.unarchive:executor-a1",
+        "thread.unarchive:executor-a2",
+        "thread.unarchive:reviewer-a",
+        "thread.unarchive:lead-a",
       ]);
       expect(threads.every((thread) => thread.archivedAt === null)).toBe(true);
     }),
@@ -192,6 +205,29 @@ describe("workstream archive", () => {
         "thread.archive:reviewer-a",
         "thread.archive:lead-a",
       ]);
+    }),
+  );
+
+  it.effect("keeps the lead archived when a restore fails partway, so a retry finishes it", () =>
+    Effect.gen(function* () {
+      const threads = organization().map((thread) =>
+        ["lead-a", "executor-a1", "executor-a2", "reviewer-a"].includes(thread.id)
+          ? { ...thread, archivedAt: NOW }
+          : thread,
+      );
+      const { dispatch, dispatched } = harness(threads, "thread.unarchive:executor-a2");
+      yield* Effect.flip(dispatch(workstream("thread.workstream.unarchive", "lead-a")));
+      expect(dispatched).toEqual(["thread.unarchive:executor-a1"]);
+      expect(threads.find((thread) => thread.id === "lead-a")?.archivedAt).toBe(NOW);
+
+      yield* dispatch(workstream("thread.workstream.unarchive", "lead-a"));
+      expect(dispatched).toEqual([
+        "thread.unarchive:executor-a1",
+        "thread.unarchive:executor-a2",
+        "thread.unarchive:reviewer-a",
+        "thread.unarchive:lead-a",
+      ]);
+      expect(threads.every((thread) => thread.archivedAt === null)).toBe(true);
     }),
   );
 

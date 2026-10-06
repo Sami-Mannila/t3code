@@ -471,10 +471,11 @@ const make = Effect.gen(function* () {
 
   /**
    * Archives or restores a lead together with every executor and reviewer
-   * reporting to it, through the ordinary per-thread archive commands: deepest
-   * threads first when archiving, the lead first when restoring. Restoring
-   * re-derives the subtree, so threads archived on their own beforehand come
-   * back with it. Each per-thread command id derives from the workstream
+   * reporting to it, through the ordinary per-thread archive commands, deepest
+   * threads first and the lead last in both directions, so an interrupted
+   * restore leaves the lead archived and restoring the workstream stays
+   * offered. Restoring re-derives the subtree, so threads archived on their own
+   * beforehand come back with it. Each per-thread command id derives from the workstream
    * command, and threads already in the target state are skipped, so a retry
    * finishes an interrupted run without replaying anything.
    */
@@ -521,7 +522,7 @@ const make = Effect.gen(function* () {
         sequence: Math.max(active.snapshotSequence, archived.snapshotSequence),
         storedEvents: [],
       };
-      for (const thread of archiving ? subtree : subtree.toReversed()) {
+      for (const thread of subtree) {
         if ((thread.archivedAt !== null) === archiving) continue;
         result = yield* orchestrator.dispatch({
           type: archiving ? "thread.archive" : "thread.unarchive",
