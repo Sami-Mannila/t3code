@@ -331,13 +331,8 @@ function retainedInterruptRequestTurnItems(
 function retainedPendingRequestTurnItems(
   projection: OrchestrationV2ThreadProjection,
   visible: ReadonlyArray<OrchestrationV2ProjectedTurnItem>,
+  pendingRequestIds: ReadonlySet<string>,
 ): OrchestrationV2TurnItem[] {
-  const pendingRequestIds = new Set<string>();
-  for (const request of projection.runtimeRequests) {
-    if (request.status === "pending") {
-      pendingRequestIds.add(String(request.id));
-    }
-  }
   if (pendingRequestIds.size === 0) {
     return [];
   }
@@ -439,7 +434,8 @@ export function computeLatestLocalTurnOrdinal(
 
 /**
  * Encoded timeline contribution for a bounded snapshot: visible rows plus the
- * duplicated local turnItems and any retained interrupt-request dependencies.
+ * duplicated local turnItems and any retained request dependencies (interrupt
+ * requests and still-pending approval/user-input request items).
  */
 export function boundedTimelineEncodedBytes(input: {
   readonly visibleTurnItems: ReadonlyArray<OrchestrationV2ProjectedTurnItem>;
@@ -475,17 +471,19 @@ export function buildBoundedThreadProjection(input: {
   };
   const latestLocalTurnOrdinal = computeLatestLocalTurnOrdinal(input.projection.turnItems);
 
-  // Reserve bytes for small interrupt-request dependencies that may sit outside
-  // the recent window but are required for visibility of results inside it.
-  const dependencyReserve = (() => {
-    const pendingRequestIds = new Set<string>();
-    for (const request of controlProjection.runtimeRequests) {
-      if (request.status === "pending") {
-        pendingRequestIds.add(String(request.id));
-      }
+  const pendingRequestIds = new Set<string>();
+  for (const request of controlProjection.runtimeRequests) {
+    if (request.status === "pending") {
+      pendingRequestIds.add(String(request.id));
     }
-    // Upper bound: all request items in the full projection. Window selection
-    // uses this reserve so the final contribution stays under the cap.
+  }
+
+  // Reserve bytes for small retained dependencies that may sit outside the recent
+  // window but are required for visibility of results inside it: interrupt
+  // requests and still-pending approval/user-input request items.
+  const dependencyReserve = (() => {
+    // Upper bound: all retained request items in the full projection. Window
+    // selection uses this reserve so the final contribution stays under the cap.
     let reserve = 0;
     for (const item of controlProjection.turnItems) {
       if (
@@ -525,7 +523,7 @@ export function buildBoundedThreadProjection(input: {
   const windowTurnItems = localTurnItemsForVisibleWindow(controlProjection, visibleTurnItems);
   const dependencyTurnItems = [
     ...retainedInterruptRequestTurnItems(controlProjection, visibleTurnItems),
-    ...retainedPendingRequestTurnItems(controlProjection, visibleTurnItems),
+    ...retainedPendingRequestTurnItems(controlProjection, visibleTurnItems, pendingRequestIds),
   ];
   const turnItemById = new Map<string, OrchestrationV2TurnItem>();
   for (const item of windowTurnItems) {

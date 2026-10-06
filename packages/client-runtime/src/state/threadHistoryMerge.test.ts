@@ -106,6 +106,59 @@ describe("threadHistoryMerge", () => {
     expect(merged.visibleTurnItems).toEqual([]);
   });
 
+  it("keeps a retained out-of-window pending user-input row when merging older history", () => {
+    const pendingItem = {
+      id: "item-user-input-request" as never,
+      type: "user_input_request" as const,
+      threadId: v2ThreadId,
+      runId: null,
+      nodeId: "node-user-input" as never,
+      providerThreadId: null,
+      providerTurnId: null,
+      nativeItemRef: null,
+      parentItemId: null,
+      ordinal: 1,
+      status: "waiting" as const,
+      title: null,
+      startedAt: NOW,
+      completedAt: null,
+      updatedAt: NOW,
+      requestId: "request-user-input" as never,
+      questions: [
+        {
+          id: "q1",
+          header: "Pick one",
+          question: "Which branch?",
+          options: [{ label: "main", description: "Use main" }],
+        },
+      ],
+      responseMode: "message" as const,
+    };
+    const recent = row(5);
+    const projection = {
+      ...v2Projection,
+      turnItems: [pendingItem, recent.item],
+      visibleTurnItems: [{ ...recent, position: 0 }],
+    };
+    // The older page carries a stale copy of the retained request row.
+    const staleRow = {
+      position: 0,
+      visibility: "local" as const,
+      sourceThreadId: v2ThreadId,
+      sourceItemId: pendingItem.id,
+      item: { ...pendingItem, status: "completed" as const, completedAt: NOW },
+    };
+
+    const merged = mergeOlderHistoryIntoProjection(projection, [staleRow]);
+
+    expect(merged.visibleTurnItems.map((entry) => String(entry.sourceItemId))).toEqual([
+      "item-user-input-request",
+      "item-5",
+    ]);
+    // The row keeps the live item from turnItems, not the stale page copy.
+    expect(merged.visibleTurnItems[0]?.item).toBe(pendingItem);
+  });
+
   it("marks history expanded after a successful page", () => {
     const next = applyHistoryPageMeta(
       {
