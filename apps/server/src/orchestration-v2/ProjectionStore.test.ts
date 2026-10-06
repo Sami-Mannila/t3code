@@ -36,6 +36,7 @@ import {
   decodeThreadHistoryCursor,
   selectHistoryPageFromCursor,
   THREAD_HISTORY_PAGE_POLICY,
+  THREAD_HISTORY_SNAPSHOT_ROW_LIMIT,
 } from "./threadHistoryPaging.ts";
 
 const TestLayer = Layer.mergeAll(
@@ -1415,6 +1416,260 @@ it.layer(TestLayer)("ProjectionStoreV2", (it) => {
       assert.isTrue(
         agentWindow.projection.visibleTurnItems.some((row) => row.sourceItemId === agentPromptId),
       );
+    }),
+  );
+
+  it.effect("retains pending question and approval items in a windowed snapshot", () =>
+    Effect.gen(function* () {
+      const projectionStore = yield* ProjectionStore.ProjectionStoreV2;
+      const sql = yield* SqlClient.SqlClient;
+      const now = yield* DateTime.now;
+      const nowIso = DateTime.formatIso(now);
+      const threadId = ThreadId.make("thread:pending-request-window");
+      yield* projectionStore.apply({
+        id: EventId.make("event:pending-request-window:thread"),
+        type: "thread.created",
+        threadId,
+        occurredAt: now,
+        payload: {
+          createdBy: "user",
+          creationSource: "web",
+          id: threadId,
+          projectId: ProjectId.make("project:pending-request-window"),
+          title: "Pending request window",
+          providerInstanceId,
+          modelSelection,
+          runtimeMode: "full-access",
+          interactionMode: "default",
+          branch: null,
+          worktreePath: null,
+          activeProviderThreadId: null,
+          lineage: { parentThreadId: null, relationshipToParent: null, rootThreadId: threadId },
+          forkedFrom: null,
+          createdAt: now,
+          updatedAt: now,
+          archivedAt: null,
+          settledOverride: null,
+          settledAt: null,
+          lastVisitedAt: null,
+          deletedAt: null,
+        },
+      });
+
+      const questionRequestId = RuntimeRequestId.make("request:pending-request-window:question");
+      const questionItemId = TurnItemId.make("turn-item:pending-request-window:question");
+      const questionNodeId = NodeId.make("user-input:pending-request-window");
+      const approvalRequestId = RuntimeRequestId.make("request:pending-request-window:approval");
+      const approvalItemId = TurnItemId.make("turn-item:pending-request-window:approval");
+      const approvalNodeId = NodeId.make("approval:pending-request-window");
+
+      const turnItemBase = (ordinal: number) => ({
+        threadId,
+        runId: null,
+        providerThreadId: null,
+        providerTurnId: null,
+        nativeItemRef: null,
+        parentItemId: null,
+        ordinal,
+        startedAt: nowIso,
+        completedAt: nowIso,
+        updatedAt: nowIso,
+      });
+
+      const turnItemRows = [
+        {
+          turn_item_id: questionItemId,
+          thread_id: threadId,
+          run_id: null,
+          node_id: questionNodeId,
+          provider_thread_id: null,
+          provider_turn_id: null,
+          parent_item_id: null,
+          ordinal: 1,
+          type: "user_input_request",
+          status: "waiting",
+          updated_at: nowIso,
+          payload_json: encodeUnknownJsonString({
+            ...turnItemBase(1),
+            id: questionItemId,
+            nodeId: questionNodeId,
+            status: "waiting",
+            title: null,
+            type: "user_input_request",
+            requestId: questionRequestId,
+            questions: [
+              {
+                id: "q1",
+                header: "Pick one",
+                question: "Which branch?",
+                options: [{ label: "main", description: "Use main" }],
+              },
+            ],
+            responseMode: "message",
+          }),
+        },
+        {
+          turn_item_id: approvalItemId,
+          thread_id: threadId,
+          run_id: null,
+          node_id: approvalNodeId,
+          provider_thread_id: null,
+          provider_turn_id: null,
+          parent_item_id: null,
+          ordinal: 2,
+          type: "approval_request",
+          status: "waiting",
+          updated_at: nowIso,
+          payload_json: encodeUnknownJsonString({
+            ...turnItemBase(2),
+            id: approvalItemId,
+            nodeId: approvalNodeId,
+            status: "waiting",
+            title: null,
+            type: "approval_request",
+            requestId: approvalRequestId,
+            requestKind: "command",
+            prompt: "Run the command?",
+          }),
+        },
+        ...Array.from({ length: 15 }, (_, index) => {
+          const ordinal = index + 3;
+          const id = `turn-item:pending-request-window:user:${ordinal}`;
+          return {
+            turn_item_id: id,
+            thread_id: threadId,
+            run_id: null,
+            node_id: null,
+            provider_thread_id: null,
+            provider_turn_id: null,
+            parent_item_id: null,
+            ordinal,
+            type: "user_message",
+            status: "completed",
+            updated_at: nowIso,
+            payload_json: encodeUnknownJsonString({
+              ...turnItemBase(ordinal),
+              id,
+              nodeId: null,
+              status: "completed",
+              title: null,
+              type: "user_message",
+              createdBy: "user",
+              creationSource: "web",
+              messageId: `message:pending-request-window:${ordinal}`,
+              inputIntent: "turn_start",
+              text: `Turn ${ordinal}`,
+              attachments: [],
+            }),
+          };
+        }),
+      ];
+      yield* sql`INSERT INTO orchestration_v2_projection_turn_items ${sql.insert(turnItemRows)}`;
+
+      const runtimeRequestRows = [
+        {
+          runtime_request_id: questionRequestId,
+          thread_id: threadId,
+          node_id: questionNodeId,
+          provider_turn_id: null,
+          kind: "user_input",
+          status: "pending",
+          created_at: nowIso,
+          resolved_at: null,
+          payload_json: encodeUnknownJsonString({
+            id: questionRequestId,
+            nodeId: questionNodeId,
+            providerTurnId: null,
+            nativeRequestRef: null,
+            kind: "user_input",
+            status: "pending",
+            responseCapability: { type: "message" },
+            createdAt: nowIso,
+            resolvedAt: null,
+          }),
+        },
+        {
+          runtime_request_id: approvalRequestId,
+          thread_id: threadId,
+          node_id: approvalNodeId,
+          provider_turn_id: null,
+          kind: "command",
+          status: "pending",
+          created_at: nowIso,
+          resolved_at: null,
+          payload_json: encodeUnknownJsonString({
+            id: approvalRequestId,
+            nodeId: approvalNodeId,
+            providerTurnId: null,
+            nativeRequestRef: null,
+            kind: "command",
+            status: "pending",
+            responseCapability: { type: "not_resumable", reason: "windowed-test" },
+            createdAt: nowIso,
+            resolvedAt: null,
+          }),
+        },
+      ];
+      yield* sql`INSERT INTO orchestration_v2_projection_runtime_requests ${sql.insert(runtimeRequestRows)}`;
+
+      const windowed = yield* projectionStore.getThreadSnapshotWindow(threadId, {
+        rowLimit: THREAD_HISTORY_SNAPSHOT_ROW_LIMIT,
+        userTurnLimit: THREAD_HISTORY_PAGE_POLICY.maxUserTurns,
+      });
+      const windowedIds = new Set(windowed.projection.turnItems.map((item) => String(item.id)));
+      // The user-turn window drops early rows...
+      assert.isFalse(windowedIds.has("turn-item:pending-request-window:user:3"));
+      // ...but a still-pending request keeps its item so derivePendingThreadRequests can join it.
+      assert.isTrue(windowedIds.has(String(questionItemId)));
+      assert.isTrue(windowedIds.has(String(approvalItemId)));
+      assert.isTrue(
+        windowed.projection.runtimeRequests.some(
+          (request) => request.id === questionRequestId && request.status === "pending",
+        ),
+      );
+
+      const bounded = buildBoundedThreadProjection({
+        projection: windowed.projection,
+        snapshotSequence: windowed.snapshotSequence,
+      });
+      const boundedIds = new Set(bounded.projection.turnItems.map((item) => String(item.id)));
+      assert.isTrue(boundedIds.has(String(questionItemId)));
+      assert.isTrue(boundedIds.has(String(approvalItemId)));
+      // Retained as a dependency, not forced into the visible history window.
+      assert.isFalse(
+        bounded.projection.visibleTurnItems.some((row) => row.sourceItemId === questionItemId),
+      );
+
+      // Resolving the question drops its item; the still-pending approval stays.
+      yield* sql`
+        UPDATE orchestration_v2_projection_runtime_requests
+        SET status = 'resolved', resolved_at = ${nowIso},
+          payload_json = json_set(payload_json, '$.status', 'resolved', '$.resolvedAt', ${nowIso})
+        WHERE runtime_request_id = ${questionRequestId}
+      `;
+      const afterQuestion = yield* projectionStore.getThreadSnapshotWindow(threadId, {
+        rowLimit: THREAD_HISTORY_SNAPSHOT_ROW_LIMIT,
+        userTurnLimit: THREAD_HISTORY_PAGE_POLICY.maxUserTurns,
+      });
+      const afterQuestionIds = new Set(
+        afterQuestion.projection.turnItems.map((item) => String(item.id)),
+      );
+      assert.isFalse(afterQuestionIds.has(String(questionItemId)));
+      assert.isTrue(afterQuestionIds.has(String(approvalItemId)));
+
+      yield* sql`
+        UPDATE orchestration_v2_projection_runtime_requests
+        SET status = 'resolved', resolved_at = ${nowIso},
+          payload_json = json_set(payload_json, '$.status', 'resolved', '$.resolvedAt', ${nowIso})
+        WHERE runtime_request_id = ${approvalRequestId}
+      `;
+      const afterBoth = yield* projectionStore.getThreadSnapshotWindow(threadId, {
+        rowLimit: THREAD_HISTORY_SNAPSHOT_ROW_LIMIT,
+        userTurnLimit: THREAD_HISTORY_PAGE_POLICY.maxUserTurns,
+      });
+      const afterBothIds = new Set(afterBoth.projection.turnItems.map((item) => String(item.id)));
+      assert.isFalse(afterBothIds.has(String(questionItemId)));
+      assert.isFalse(afterBothIds.has(String(approvalItemId)));
     }),
   );
 
