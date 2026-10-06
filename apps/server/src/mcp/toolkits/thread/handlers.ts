@@ -153,10 +153,10 @@ export const ThreadToolkitHandlersLive = ThreadToolkit.toLayer({
             code: "invalid_request",
             message: `Adoption requires the task's current parent lead; ${organization.parentThreadId ?? "(none)"} could not be resolved.`,
           });
-        if (currentParent.archivedAt === null && currentParent.deletedAt === null)
+        if (currentParent.archivedAt === null)
           return yield* new OrchestratorMcpFailure({
             code: "invalid_request",
-            message: `Adoption requires the task's current parent lead to be archived or deleted; ${organization.parentThreadId ?? "(none)"} is still active.`,
+            message: `Adoption requires the task's current parent lead to be archived; ${organization.parentThreadId ?? "(none)"} is still active.`,
           });
         if (currentParent.organization?.parentThreadId !== caller.organization.parentThreadId)
           return yield* new OrchestratorMcpFailure({
