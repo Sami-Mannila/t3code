@@ -390,6 +390,8 @@ function commandThreadId(command: OrchestrationV2ServerCommand): ThreadId {
     case "thread.create":
     case "thread.archive":
     case "thread.unarchive":
+    case "thread.workstream.archive":
+    case "thread.workstream.unarchive":
     case "thread.delete":
     case "thread.settle":
     case "thread.auto-settle":
@@ -9925,6 +9927,14 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
           }),
         );
       }
+      case "thread.workstream.archive":
+      case "thread.workstream.unarchive":
+        // ThreadManagementService expands a workstream into per-thread commands.
+        return yield* new OrchestratorDispatchError({
+          commandId: command.commandId,
+          commandType: command.type,
+          cause: "Workstream commands are dispatched through thread management.",
+        });
       case "thread.archive":
       case "thread.unarchive":
       case "thread.settle":

@@ -16,10 +16,12 @@ import { useThreadShellsForProjectRefs } from "~/state/entities";
 import { CheckIcon } from "lucide-react";
 import { Button } from "~/components/ui/button";
 import { Tooltip, TooltipPopup, TooltipTrigger } from "~/components/ui/tooltip";
+import { canArchiveWorkstream } from "@t3tools/shared/organizationWorkstream";
 import {
   OrganizationAcceptDialog,
   type OrganizationAcceptTarget,
 } from "./OrganizationAcceptDialog";
+import { OrganizationArchiveDialog } from "./OrganizationArchiveDialog";
 import { fitOrganization, resizeOrganization, zoomOrganization } from "./organizationCamera";
 import {
   ROLE_LABELS,
@@ -283,6 +285,7 @@ function LeadCard(props: {
   highlightThreadId: string | null;
   onOpenThread: (thread: Shell) => void;
   onAccept: (target: OrganizationAcceptTarget) => void;
+  onArchive: (lead: Shell) => void;
   acceptDisabled: boolean;
 }) {
   const { card } = props;
@@ -336,6 +339,13 @@ function LeadCard(props: {
             onClick={() => props.onAccept({ threadId: lead.id, revision: outcome!.revision! })}
           >
             Accept reviewed outcome
+          </Button>
+        </div>
+      ) : null}
+      {canArchiveWorkstream(lead.source) ? (
+        <div className={styles["org-accept"]}>
+          <Button size="sm" variant="outline" onClick={() => props.onArchive(lead)}>
+            Archive workstream
           </Button>
         </div>
       ) : null}
@@ -406,6 +416,7 @@ export function OrganizationCanvas(props: {
     [threads, props.environmentId, props.projectId, props.workstream],
   );
   const [accepting, setAccepting] = useState<OrganizationAcceptTarget | null>(null);
+  const [archiving, setArchiving] = useState<Shell | null>(null);
   const highlight = props.highlightThreadId ?? null;
   // Up to three lead cards per row; more wrap onto the next.
   const columns = Math.min(3, Math.max(1, model.leads.length + (model.unassigned.length ? 1 : 0)));
@@ -438,6 +449,7 @@ export function OrganizationCanvas(props: {
             highlightThreadId={highlight}
             onOpenThread={props.onOpenThread}
             onAccept={setAccepting}
+            onArchive={setArchiving}
             acceptDisabled={props.acceptDisabled ?? false}
           />
         ))}
@@ -478,6 +490,11 @@ export function OrganizationCanvas(props: {
         target={accepting}
         threads={threads}
         onClose={() => setAccepting(null)}
+      />
+      <OrganizationArchiveDialog
+        lead={archiving}
+        threads={threads}
+        onClose={() => setArchiving(null)}
       />
     </div>
   );

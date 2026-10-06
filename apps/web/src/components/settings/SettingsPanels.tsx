@@ -47,6 +47,7 @@ import {
   SidebarProjectSortOrder,
 } from "@t3tools/contracts/settings";
 import { resolveServerBackgroundActivitySettings } from "@t3tools/shared/backgroundActivitySettings";
+import { canUnarchiveWorkstream } from "@t3tools/shared/organizationWorkstream";
 import { createModelSelection } from "@t3tools/shared/model";
 import * as Duration from "effect/Duration";
 import * as Equal from "effect/Equal";
@@ -3388,7 +3389,7 @@ export function GeneralSettingsPanel() {
 
 export function ArchivedThreadsPanel() {
   const { scope } = useSettingsScope();
-  const { unarchiveThread, confirmAndDeleteThread } = useThreadActions();
+  const { unarchiveThread, unarchiveWorkstream, confirmAndDeleteThread } = useThreadActions();
   const {
     snapshots: archivedSnapshots,
     error: archiveError,
@@ -3445,16 +3446,40 @@ export function ArchivedThreadsPanel() {
   }, [archivedSnapshots, scope]);
 
   const handleArchivedThreadContextMenu = useCallback(
-    async (threadRef: ScopedThreadRef, position: { x: number; y: number }) => {
+    async (
+      threadRef: ScopedThreadRef,
+      position: { x: number; y: number },
+      workstreamLead: boolean,
+    ) => {
       const api = readLocalApi();
       if (!api) return;
       const clicked = await api.contextMenu.show(
         [
           { id: "unarchive", label: "Unarchive" },
+          ...(workstreamLead
+            ? [{ id: "unarchive-workstream" as const, label: "Unarchive workstream" }]
+            : []),
           { id: "delete", label: "Delete", destructive: true },
         ],
         position,
       );
+
+      if (clicked === "unarchive-workstream") {
+        const result = await unarchiveWorkstream(threadRef);
+        if (result._tag === "Success") {
+          refreshArchivedThreads();
+        } else if (!isAtomCommandInterrupted(result)) {
+          const error = squashAtomCommandFailure(result);
+          toastManager.add(
+            stackedThreadToast({
+              type: "error",
+              title: "Failed to unarchive workstream",
+              description: error instanceof Error ? error.message : "An error occurred.",
+            }),
+          );
+        }
+        return;
+      }
 
       if (clicked === "unarchive") {
         const result = await unarchiveThread(threadRef);
@@ -3489,7 +3514,7 @@ export function ArchivedThreadsPanel() {
         }
       }
     },
-    [confirmAndDeleteThread, refreshArchivedThreads, unarchiveThread],
+    [confirmAndDeleteThread, refreshArchivedThreads, unarchiveThread, unarchiveWorkstream],
   );
 
   return (
@@ -3542,6 +3567,7 @@ export function ArchivedThreadsPanel() {
                           x: event.clientX,
                           y: event.clientY,
                         },
+                        canUnarchiveWorkstream(thread.source),
                       ),
                     );
                     if (result._tag === "Failure") {
@@ -3573,9 +3599,11 @@ export function ArchivedThreadsPanel() {
                     className="shrink-0"
                     onClick={() => {
                       void (async () => {
-                        const result = await unarchiveThread(
-                          scopeThreadRef(thread.environmentId, thread.id),
-                        );
+                        const ref = scopeThreadRef(thread.environmentId, thread.id);
+                        // An archived lead comes back with the executors and reviewers under it.
+                        const result = canUnarchiveWorkstream(thread.source)
+                          ? await unarchiveWorkstream(ref)
+                          : await unarchiveThread(ref);
                         if (result._tag === "Success") {
                           refreshArchivedThreads();
                           return;
@@ -3595,7 +3623,9 @@ export function ArchivedThreadsPanel() {
                     }}
                   >
                     <ArchiveX className="size-3.5" />
-                    <span>Unarchive</span>
+                    <span>
+                      {canUnarchiveWorkstream(thread.source) ? "Unarchive workstream" : "Unarchive"}
+                    </span>
                   </Button>
                 }
               />
