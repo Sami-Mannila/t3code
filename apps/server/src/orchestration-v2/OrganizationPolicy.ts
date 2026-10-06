@@ -79,6 +79,8 @@ export function organizationInstructionUnblock(input: {
     readonly notification?: unknown;
     readonly delegatedCompletion?: unknown;
     readonly scheduledTaskId?: unknown;
+    readonly usageLimitContinuationOfRunId?: unknown;
+    readonly restartContinuationOfRunId?: unknown;
   };
   readonly coordinatorLabel: string;
   readonly queued: boolean;
@@ -92,9 +94,14 @@ export function organizationInstructionUnblock(input: {
     isOrganizationNoticeMessageId(message.messageId) ||
     message.notification !== undefined ||
     message.delegatedCompletion !== undefined ||
-    message.scheduledTaskId !== undefined
+    message.scheduledTaskId !== undefined ||
+    // Recovery resumes the same work; it is not a new instruction.
+    message.usageLimitContinuationOfRunId !== undefined ||
+    message.restartContinuationOfRunId !== undefined
   )
     return null;
+  // An answer to the conversation's question unblocks only when the user gave it.
+  if (message.messageId.startsWith("async-answer:") && message.createdBy !== "user") return null;
   const fromUser = message.createdBy === "user";
   const fromCoordinator =
     message.createdBy === "agent" &&

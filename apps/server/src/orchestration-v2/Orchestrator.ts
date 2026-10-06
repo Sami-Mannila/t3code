@@ -7561,8 +7561,14 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
             messageId: MessageId.make(`async-answer:${command.requestId}`),
             text: replies.join("\n\n"),
             attachments: [],
-            createdBy: "user",
-            creationSource: "server",
+            // The answer is the responder's message: an agent's answer is not the user's.
+            ...(command.respondedByThreadId === undefined
+              ? { createdBy: "user" as const, creationSource: "server" as const }
+              : {
+                  createdBy: "agent" as const,
+                  creationSource: "mcp" as const,
+                  senderThreadId: command.respondedByThreadId,
+                }),
             dispatchMode,
           },
           events,

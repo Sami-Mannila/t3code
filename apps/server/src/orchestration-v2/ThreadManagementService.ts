@@ -61,6 +61,11 @@ export function withCreationProvenance(
       const { organizationActorThreadId: _actor, ...userCommand } = command;
       return userCommand;
     }
+    case "runtime-request.respond": {
+      if (provenance.createdBy !== "user") return command;
+      const { respondedByThreadId: _agent, ...userCommand } = command;
+      return userCommand;
+    }
     case "thread.create":
     case "message.dispatch":
     case "thread.fork":

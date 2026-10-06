@@ -406,6 +406,7 @@ export const ThreadToolkitHandlersLive = ThreadToolkit.toLayer({
           commandId: yield* newCommandId(),
           requestId: input.requestId,
           answers: input.answers,
+          respondedByThreadId: caller.id,
         })
         .pipe(Effect.mapError(unavailable));
       return { sequence: result.sequence };

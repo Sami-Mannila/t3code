@@ -2847,6 +2847,11 @@ export const OrchestrationV2Command = Schema.Union([
     decision: Schema.optional(ProviderApprovalDecision),
     answers: Schema.optional(ProviderUserInputAnswers),
     attachmentsByQuestionId: Schema.optional(UserInputAttachments),
+    /**
+     * The agent conversation that answered, set by the server for MCP answers; absent means the
+     * user. The user endpoint strips it, so clients cannot claim an agent answered.
+     */
+    respondedByThreadId: Schema.optional(ThreadId),
   }),
   Schema.Struct({
     type: Schema.Literal("thread.user-input.dismiss"),

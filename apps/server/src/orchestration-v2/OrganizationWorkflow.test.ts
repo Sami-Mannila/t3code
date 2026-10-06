@@ -1890,6 +1890,33 @@ it.effect("new instructions unblock a blocked executor at once; notices and its 
     });
     yield* send("own-status", { senderThreadId: executor });
     yield* send("chief-bypass", { senderThreadId: chief });
+    // Usage-limit recovery resumes the same work as the user, but is no new instruction.
+    yield* send("limit-resume", {
+      createdBy: "user",
+      creationSource: "server",
+      usageLimitContinuationOfRunId: RunId.make("run-limited"),
+    }).pipe(Effect.result);
+    // An agent's answer to the executor's question is the agent's message, not the user's.
+    yield* orchestrator.dispatch({
+      type: "thread.user-input.request",
+      commandId: CommandId.make("executor-question"),
+      threadId: executor,
+      requestId: RuntimeRequestId.make("server-question:executor-question"),
+      questions: [{ id: "pick", header: "Pick", question: "Option 1 or 2?", options: [] }],
+    });
+    yield* orchestrator.dispatch({
+      type: "runtime-request.respond",
+      commandId: CommandId.make("lead-answers-for-user"),
+      threadId: executor,
+      requestId: RuntimeRequestId.make("server-question:executor-question"),
+      answers: { pick: "2" },
+      respondedByThreadId: lead,
+    });
+    const agentAnswer = (yield* threads.getThreadProjection(executor)).messages.find(
+      (message) => message.id === "async-answer:server-question:executor-question",
+    );
+    assert.equal(agentAnswer?.createdBy, "agent");
+    assert.equal(agentAnswer?.senderThreadId, lead);
     assert.equal((yield* state(executor))?.state, "blocked");
 
     // Its lead's brief (t3_thread_send) unblocks it in the same command.
