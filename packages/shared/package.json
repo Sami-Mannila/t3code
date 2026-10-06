@@ -223,6 +223,10 @@
       "types": "./src/organizationWorkstream.ts",
       "import": "./src/organizationWorkstream.ts"
     },
+    "./organizationOutcome": {
+      "types": "./src/organizationOutcome.ts",
+      "import": "./src/organizationOutcome.ts"
+    },
     "./changeRequestUrl": {
       "types": "./src/changeRequestUrl.ts",
       "import": "./src/changeRequestUrl.ts"

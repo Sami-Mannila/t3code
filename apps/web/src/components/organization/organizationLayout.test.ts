@@ -7,11 +7,7 @@ import {
   type OrganizationThread,
 } from "@t3tools/contracts";
 import type { EnvironmentThreadShell } from "@t3tools/client-runtime/state/models";
-import {
-  canAcceptOrganizationOutcome,
-  organizationModel,
-  outcomeFileGroups,
-} from "./organizationLayout";
+import { organizationModel } from "./organizationLayout";
 const env = EnvironmentId.make("remote"),
   project = ProjectId.make("project");
 let created = 0;
@@ -219,15 +215,19 @@ describe("review lines", () => {
     ]);
   });
 
-  it("puts the outcome review on the lead card and offers acceptance once it is reviewed", () => {
+  it("puts the outcome review on the lead card and says what the reviewed outcome waits on", () => {
     const outcomeReviewer = reviewerOf("outcome-reviewer", "lead");
+    const executor = withTask(task("work", "work"), {
+      state: "accepted",
+      reviewedRevision: "r1",
+    });
     const reviewed = role("lead", {
       role: "lead",
       parentThreadId: chief.id,
       task: {
         title: "Outcome",
         ownerThreadId: ThreadId.make("lead"),
-        dependencyThreadIds: [],
+        dependencyThreadIds: [executor.id],
         state: "awaiting_review",
         revision: "04dc99",
         reviewedRevision: "04dc99",
@@ -236,74 +236,39 @@ describe("review lines", () => {
         files: [{ path: "work/file.ts", sha256: "abc", bytes: 1 }],
       },
     });
-    const card = model([chief, reviewed, outcomeReviewer]).leads[0]!;
-    expect(card.outcomeReview).toMatchObject({
+    const card = (threads: EnvironmentThreadShell[]) => model(threads).leads[0]!;
+    const reviewedCard = card([chief, reviewed, outcomeReviewer, executor]);
+    expect(reviewedCard.outcomeReview).toMatchObject({
       state: "accepted",
       reviewer: { id: "outcome-reviewer" },
     });
-    expect(card.canAccept).toBe(true);
-  });
-});
+    // No pull request: the server accepts it on the review.
+    expect(reviewedCard.outcomeWait).toBe("reviewed · accepting");
 
-describe("final outcome approval eligibility", () => {
-  it("requires a lead outcome and independently reviewed current files", () => {
-    const outcome = role("outcome", {
-      role: "lead",
-      parentThreadId: chief.id,
-      task: {
-        ...task("t", "reviewer", [], "awaiting_review").source.organization!.task!,
-        files: [{ path: "task/file.ts", sha256: "abc", bytes: 1 }],
-      },
+    const link = (number: number, linkedAt: string, state: "open" | "closed" | "merged") => ({
+      host: "github.com",
+      repository: "acme/app",
+      number,
+      url: `https://github.com/acme/app/pull/${number}`,
+      source: "agent" as const,
+      linkedAt,
+      snapshot: { state } as never,
+      stack: null,
     });
-    expect(canAcceptOrganizationOutcome(outcome)).toBe(true);
-    for (const changed of [
-      { role: "executor" as const },
-      { task: { ...outcome.source.organization!.task!, reviewedRevision: "stale" } },
-      { task: { ...outcome.source.organization!.task!, reviewerThreadId: outcome.id } },
-      { task: { ...outcome.source.organization!.task!, files: [] } },
-    ]) {
-      expect(
-        canAcceptOrganizationOutcome({
-          ...outcome,
-          source: {
-            ...outcome.source,
-            organization: { ...outcome.source.organization!, ...changed },
-          },
-        }),
-      ).toBe(false);
-    }
+    const withLinks = (thread: EnvironmentThreadShell, links: ReturnType<typeof link>[]) =>
+      ({ ...thread, source: { ...thread.source, pullRequests: links } }) as EnvironmentThreadShell;
+    const later = "2027-01-01T00:00:00.000Z";
+    // A link older than the executor was inherited from its parent and gates nothing.
+    const inherited = withLinks(executor, [link(7, "2025-01-01T00:00:00.000Z", "open")]);
+    expect(card([chief, reviewed, inherited]).outcomeWait).toBe("reviewed · accepting");
+    const open = withLinks(executor, [link(12, later, "open")]);
+    expect(card([chief, reviewed, open]).outcomeWait).toBe(
+      "reviewed · waiting for PR #12 to merge",
+    );
+    const closed = withLinks(executor, [link(12, later, "closed")]);
+    expect(card([chief, reviewed, closed]).outcomeWait).toBe("PR #12 closed without merging");
+    const working = withTask(executor, { state: "working" });
+    expect(card([chief, reviewed, working]).outcomeWait).toBe("reviewed · waiting for work work");
+    expect(card([chief, withTask(reviewed, { state: "accepted" })]).outcomeWait).toBeNull();
   });
-});
-
-it("groups a lead outcome's files by the executor whose branch the user merges", () => {
-  const base = task("executor-b", "executor-b");
-  const organization = base.source.organization!;
-  const executor = {
-    ...base,
-    branch: "t3/organization/abc",
-    worktreePath: "/worktrees/abc",
-    source: { organization: { ...organization, task: { ...organization.task!, repository: "b" } } },
-  } as unknown as EnvironmentThreadShell;
-  const file = (path: string) => ({ path, sha256: "hash", bytes: 1 });
-  expect(
-    outcomeFileGroups(
-      [file("executor-b/src/a.ts"), file("executor-b/README.md"), file("unknown/x.ts")],
-      [chief, lead, executor],
-    ),
-  ).toEqual([
-    {
-      child: executor,
-      repository: "b",
-      branch: "t3/organization/abc",
-      worktreePath: "/worktrees/abc",
-      files: [file("src/a.ts"), file("README.md")],
-    },
-    {
-      child: undefined,
-      repository: ".",
-      branch: null,
-      worktreePath: null,
-      files: [file("unknown/x.ts")],
-    },
-  ]);
 });

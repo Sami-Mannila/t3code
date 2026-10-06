@@ -56,6 +56,7 @@ import * as WorkspacePaths from "../workspace/WorkspacePaths.ts";
 import { CodexProviderCapabilitiesV2 } from "./Adapters/CodexAdapterV2.ts";
 import * as EventSink from "./EventSink.ts";
 import * as Orchestrator from "./Orchestrator.ts";
+import * as OrganizationOutcomeAcceptanceReactor from "./OrganizationOutcomeAcceptanceReactor.ts";
 import type { ProviderAdapterV2Shape } from "./ProviderAdapter.ts";
 import {
   OrchestrationV2EventSinkLayerLive,
@@ -188,7 +189,7 @@ const mcpClient = McpSchema.McpServerClient.of({
 });
 
 it.effect(
-  "reviews actual child artifacts, consolidates the outcome and reserves final acceptance for the user",
+  "reviews actual child artifacts, consolidates the outcome and accepts it once its pull requests merge",
   () =>
     Effect.gen(function* () {
       const orchestrator = yield* Orchestrator.OrchestratorV2;
@@ -392,10 +393,102 @@ it.effect(
         Effect.result,
       );
       assert.equal(forbidden._tag, "Failure");
-      yield* update(lead, "user-accept", { state: "accepted" });
-      assert.equal(
-        (yield* threads.getThreadProjection(lead)).thread.organization!.task!.state,
-        "accepted",
+
+      // The server accepts the outcome once the pull requests it owns merge.
+      const reactor = yield* OrganizationOutcomeAcceptanceReactor.make;
+      const leadTask = threads
+        .getThreadProjection(lead)
+        .pipe(Effect.map((projection) => projection.thread.organization!.task!));
+      const link = (number: number, linkedAt: string, state: "open" | "closed" | "merged") => ({
+        host: "github.com",
+        repository: "acme/app",
+        number,
+        url: `https://github.com/acme/app/pull/${number}`,
+        source: "agent" as const,
+        linkedAt,
+        snapshot: {
+          state,
+          title: "Work",
+          headBranch: "work",
+          baseBranch: "main",
+          isDraft: false,
+          updatedAt: null,
+          syncedAt: linkedAt,
+        },
+        stack: null,
+      });
+      const linkPullRequests = (id: ThreadId, key: string, links: ReturnType<typeof link>[]) =>
+        Effect.gen(function* () {
+          const thread = (yield* threads.getThreadProjection(id)).thread;
+          yield* sink.write({
+            commandId: CommandId.make(key),
+            events: [
+              {
+                id: EventId.make(key),
+                type: "thread.pull-request-synced",
+                threadId: id,
+                occurredAt: yield* DateTime.now,
+                payload: { ...thread, pullRequests: links },
+              },
+            ],
+          });
+        });
+      const linkedAt = DateTime.formatIso(yield* DateTime.now);
+      // A link older than the lead (test clocks start at the epoch) was inherited; it gates nothing.
+      yield* linkPullRequests(lead, "lead-inherited-pr", [
+        link(1, "1969-12-31T00:00:00.000Z", "open"),
+      ]);
+      yield* linkPullRequests(executor, "executor-pr-open", [link(12, linkedAt, "open")]);
+      // Work the lead starts after the review is separate scope.
+      yield* orchestrator.dispatch({
+        type: "thread.create",
+        commandId: CommandId.make("create-later-executor"),
+        threadId: ThreadId.make("later-executor"),
+        projectId,
+        title: "later-executor",
+        modelSelection,
+        runtimeMode: "full-access",
+        interactionMode: "default",
+        branch: null,
+        worktreePath: workspace,
+        createdBy: "user",
+        creationSource: "web",
+        organization: {
+          role: "executor",
+          parentThreadId: lead,
+          task: { ...task(ThreadId.make("later-executor")), state: "working" },
+        },
+      });
+      yield* reactor.sweep();
+      assert.equal((yield* leadTask).state, "awaiting_review");
+
+      const prNotices = threads
+        .getThreadProjection(chief)
+        .pipe(
+          Effect.map((projection) =>
+            projection.messages.filter((message) => message.id.startsWith("organization-pr:")),
+          ),
+        );
+      yield* linkPullRequests(executor, "executor-pr-closed", [link(12, linkedAt, "closed")]);
+      yield* reactor.sweep();
+      yield* reactor.sweep();
+      assert.equal((yield* leadTask).state, "awaiting_review");
+      const closedNotices = yield* prNotices;
+      assert.lengthOf(closedNotices, 1);
+      assert.include(closedNotices[0]?.text, "PR #12 closed without merging");
+
+      yield* linkPullRequests(executor, "executor-pr-merged", [link(12, linkedAt, "merged")]);
+      // A restarted server's startup sweep finds the merge.
+      const restarted = yield* OrganizationOutcomeAcceptanceReactor.make;
+      yield* restarted.start();
+      yield* restarted.drain;
+      const accepted = yield* leadTask;
+      assert.equal(accepted.state, "accepted");
+      assert.equal(accepted.notes, "Accepted after merge of #12.");
+      assert.isTrue(
+        (yield* chiefNotices).some((message) =>
+          message.text.includes(`[${lead}] accepted: lead work. Accepted after merge of #12.`),
+        ),
       );
       yield* fs.writeFileString(`${workspace}/result.txt`, "changed after review");
       const changed = yield* update(lead, "stale-accept", { state: "accepted" }).pipe(
@@ -478,6 +571,41 @@ it.effect(
         creationSource: "web",
       });
       const parent = yield* orchestrator.getThreadProjection(chief);
+      // The Chief's own pull request must not become the lead's.
+      const chiefLink = {
+        projectId,
+        repository: "acme/app",
+        number: 28064,
+        url: "https://github.com/acme/app/pull/28064",
+      };
+      yield* (yield* EventSink.EventSinkV2).write({
+        commandId: CommandId.make("native-chief-pr"),
+        events: [
+          {
+            id: EventId.make("native-chief-pr"),
+            type: "thread.pull-request-synced",
+            threadId: chief,
+            occurredAt: yield* DateTime.now,
+            payload: {
+              ...parent.thread,
+              linkedPullRequest: chiefLink,
+              branchPullRequest: chiefLink,
+              pullRequests: [
+                {
+                  host: "github.com",
+                  repository: "acme/app",
+                  number: 28064,
+                  url: chiefLink.url,
+                  source: "agent",
+                  linkedAt: DateTime.formatIso(yield* DateTime.now),
+                  snapshot: null,
+                  stack: null,
+                },
+              ],
+            },
+          },
+        ],
+      });
       const run = parent.runs[0]!;
       const command = {
         type: "delegated_task.request" as const,
@@ -501,6 +629,10 @@ it.effect(
       assert.equal(child.thread.organization?.parentThreadId, chief);
       assert.equal(child.thread.worktreePath, null);
       assert.equal(child.runs[0]?.status, "preparing");
+      assert.equal((yield* orchestrator.getThreadProjection(chief)).thread.pullRequests?.length, 1);
+      assert.deepEqual(child.thread.pullRequests ?? [], []);
+      assert.equal(child.thread.linkedPullRequest ?? null, null);
+      assert.equal(child.thread.branchPullRequest ?? null, null);
       const replay = yield* orchestrator.dispatch(command);
       assert.equal(replay.sequence, result.sequence);
       assert.equal(
@@ -1153,7 +1285,7 @@ it.effect(
         { state: "accepted", reviewedRevision: submitted.revision, reviewerThreadId: reviewer.id },
         reviewer.id,
       );
-      // The lead submits and the user accepts its outcome without a lead worktree.
+      // The lead submits its outcome without a lead worktree.
       yield* metadata(lead.id, "repositories-outcome", { state: "awaiting_review" }, lead.id);
       const outcome = (yield* threads.getThreadProjection(lead.id)).thread.organization!.task!;
       assert.equal(outcome.files?.[0]?.path, `${executor.id}/result.txt`);
@@ -1174,10 +1306,13 @@ it.effect(
         { reviewedRevision: outcome.revision, reviewerThreadId: outcomeReviewer.id },
         outcomeReviewer.id,
       );
-      yield* metadata(lead.id, "repositories-user-accept", { state: "accepted" });
+      // No pull request was opened: the server accepts the outcome on its review.
+      yield* (yield* OrganizationOutcomeAcceptanceReactor.make).sweep();
+      const accepted = (yield* threads.getThreadProjection(lead.id)).thread.organization!.task!;
+      assert.equal(accepted.state, "accepted");
       assert.equal(
-        (yield* threads.getThreadProjection(lead.id)).thread.organization!.task!.state,
-        "accepted",
+        accepted.notes,
+        "Accepted after independent review; no pull request was opened.",
       );
     }).pipe(
       Effect.provide(

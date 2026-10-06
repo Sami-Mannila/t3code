@@ -6816,6 +6816,11 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
               },
               branch: null,
               worktreePath: null,
+              // A role owns only the pull requests it opens; its parent's would gate its
+              // outcome and hold it open for settling.
+              pullRequests: [],
+              linkedPullRequest: null,
+              branchPullRequest: null,
             }
           : {}),
         runtimeMode: command.runtimeMode,

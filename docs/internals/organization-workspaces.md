@@ -31,7 +31,12 @@ repositories, so worktrees are tied to tasks, not to the root.
   ([`idleWorktreeRemovable`](../../apps/server/src/storageCleanup.ts)) must not remove an
   executor checkout that review or outcome consolidation still reads: tasks awaiting review or
   accepted keep their worktree until the lead's own task is accepted or either thread is
-  archived. Removal and preparation take the same workspace lease, and removal re-checks for a
+  archived. No user or agent accepts a lead: the
+  [acceptance reactor](../../apps/server/src/orchestration-v2/OrganizationOutcomeAcceptanceReactor.ts)
+  does, once the reviewed revision's dependency tasks are accepted and every pull request the
+  outcome owns has merged, or on the review alone when it owns none. A thread owns only links
+  added after it was created; delegated roles start with no links, since inherited ones would
+  gate the wrong work. Removal and preparation take the same workspace lease, and removal re-checks for a
   queued or active run as its last step, so a run that is preparing keeps its checkout.
 - A Git exit during preparation is usually deterministic, so the effect worker fails the run on the
   first attempt, with the command's stderr in the task notes that reach the parent and the Chief.

@@ -123,11 +123,11 @@ export function organizationProblem(input: {
     };
     if (visits(id)) return "Task dependencies cannot form a cycle.";
   }
-  if (
-    ["working", "awaiting_review", "accepted"].includes(task.state) &&
-    task.dependencyThreadIds.some((id) => related(id)?.organization?.task?.state !== "accepted")
-  )
-    return "All dependencies must be accepted before this task can execute or be accepted.";
+  const unaccepted = ["working", "awaiting_review", "accepted"].includes(task.state)
+    ? task.dependencyThreadIds.find((id) => related(id)?.organization?.task?.state !== "accepted")
+    : undefined;
+  if (unaccepted)
+    return `All dependencies must be accepted before this task can execute or be accepted; ${unaccepted} is ${related(unaccepted)?.organization?.task?.state.replaceAll("_", " ") ?? "missing"}.`;
   if (task.state === "working" && task.ownerThreadId !== thread.id)
     return "Implementation work remains with the original worker, not the reviewer or coordinator.";
   if (task.revision !== old?.revision && task.reviewedRevision !== null)
@@ -151,16 +151,12 @@ export function organizationProblem(input: {
   }
   if (task.state === "accepted" && old?.state !== "accepted") {
     if (next.role === "lead") {
-      if (actorThreadId) return "Final outcome acceptance requires the user, not an agent.";
-      if (
-        input.threads.some(
-          (item) =>
-            item.organization?.parentThreadId === thread.id &&
-            item.organization.task &&
-            item.organization.task.state !== "accepted",
-        )
-      )
-        return "All implementation tasks must be independently accepted before final outcome acceptance.";
+      // The server accepts an outcome after its pull requests merge, or after review when it
+      // has none; agents never do. Its reviewed set is the dependencies checked above, so work
+      // the lead started after review is separate scope and does not block it.
+      if (actorThreadId) return "Final outcome acceptance belongs to the server, not an agent.";
+      if (task.dependencyThreadIds.length === 0)
+        return "An outcome is accepted only with the implementation tasks it was reviewed with.";
     } else if (!actor || actor.organization?.role !== "reviewer" || actor.id !== old?.ownerThreadId)
       return "Only the assigned independent reviewer accepts an executor submission.";
     if (
@@ -390,7 +386,13 @@ export function organizationChiefNoticeRelevant(
 
 /** Chief notice ids; a queued notice is merged into rather than followed by another turn. */
 export const ORGANIZATION_CHIEF_NOTICE_PREFIX = "organization:";
-const ORGANIZATION_NOTICE_PREFIXES = [ORGANIZATION_CHIEF_NOTICE_PREFIX, "organization-parent:"];
+/** A pull request that closed without merging and holds an outcome. */
+export const ORGANIZATION_PULL_REQUEST_NOTICE_PREFIX = "organization-pr:";
+const ORGANIZATION_NOTICE_PREFIXES = [
+  ORGANIZATION_CHIEF_NOTICE_PREFIX,
+  "organization-parent:",
+  ORGANIZATION_PULL_REQUEST_NOTICE_PREFIX,
+];
 
 /** Organization notices reach the provider as organization updates, never as user messages. */
 export function isOrganizationNoticeMessageId(messageId: string): boolean {
@@ -454,9 +456,9 @@ export function organizationInstructions(
   const contract = `Organization role: ${org.role}. Your identity is this native conversation (${thread.id}); role authority is server-bound. Chief → outcome lead → executor and independent reviewer. Use native delegate_task and t3_organization_task; never spawn a second CLI or resume another role's native session. Do not treat agent notifications as user approval. Only executors get a worktree and branch; every other role runs in the project root, which may be one Git repository or a plain folder of repositories, and does not edit files there. There is no claimed OS sandbox. No quota polling: report actual provider failures to Chief and wait for explicit recovery. ${organizationRoleModelSummary(settings)}. Unavailable targets must be reported, never substituted.`;
   const role =
     org.role === "chief"
-      ? "You are the user's primary conversation. Delegate implementation outcomes to leads using delegate_task; do not implement files yourself. When an outcome changes code, pass delegate_task repository: the repository directory relative to the project root (\".\" when the root is the repository). Organization updates arrive only when a lead's state changes, an outcome is reviewed or a task is blocked. Report only what changed since your last report, in plain language with project/outcome context, the exact blocker and concrete options. If nothing needs the user, end the turn without a message; never restate unchanged open items. When the user must decide, ask with t3_organization_ask_user (concrete options, one question per decision) and end the turn; the question stays open until they answer, so do not repeat it. Keep updates brief; final outcome acceptance belongs to the user."
+      ? "You are the user's primary conversation. Delegate implementation outcomes to leads using delegate_task; do not implement files yourself. When an outcome changes code, pass delegate_task repository: the repository directory relative to the project root (\".\" when the root is the repository). Organization updates arrive only when a lead's state changes, an outcome is reviewed or a task is blocked. Report only what changed since your last report, in plain language with project/outcome context, the exact blocker and concrete options. If nothing needs the user, end the turn without a message; never restate unchanged open items. When the user must decide, ask with t3_organization_ask_user (concrete options, one question per decision) and end the turn; the question stays open until they answer, so do not repeat it. Keep updates brief. Never accept outcomes and never ask the user to accept one: the server accepts a reviewed outcome when every pull request it opened has merged (merging is the user's gate), or after its independent review when it opened none."
       : org.role === "lead"
-        ? `Plan and delegate implementation using delegate_task. Each implementation task works in one repository: pass repository relative to the project root (omitted, it uses ${org.task?.repository ? `your repository "${org.task.repository}"` : '"."'}); the server rejects a directory that is not a Git repository and lists the ones it found. Supply dependencyThreadIds atomically in delegate_task when creating dependent implementation work; it waits until dependencies have current independent acceptance. Do not implement or copy child artifacts. Once a child submits, delegate_task(role=review, reviewTaskThreadId=child conversation ID) creates an independent reviewer. After all children are independently accepted, submit your own outcome with t3_organization_task(action=submit); the server aggregates their current manifests. Delegate an independent outcome review targeting your own conversation. Ask Chief for final user acceptance; never accept an outcome yourself.`
+        ? `Plan and delegate implementation using delegate_task. Each implementation task works in one repository: pass repository relative to the project root (omitted, it uses ${org.task?.repository ? `your repository "${org.task.repository}"` : '"."'}); the server rejects a directory that is not a Git repository and lists the ones it found. Supply dependencyThreadIds atomically in delegate_task when creating dependent implementation work; it waits until dependencies have current independent acceptance. Do not implement or copy child artifacts. Once a child submits, delegate_task(role=review, reviewTaskThreadId=child conversation ID) creates an independent reviewer. After all children are independently accepted, submit your own outcome with t3_organization_task(action=submit); the server aggregates their current manifests. Delegate an independent outcome review targeting your own conversation. Never accept an outcome yourself and do not ask for acceptance: after the independent outcome review the server accepts it once every pull request your outcome opened has merged, or on that review alone when it opened none. Work you start after the review is separate scope with its own review.`
         : org.role === "executor"
           ? `Implement only your delegated task in your worktree${thread.worktreePath ? ` ${thread.worktreePath}` : ""}${thread.branch ? ` on branch ${thread.branch}` : ""}, created from repository "${organizationRepository(thread)}" under the project root. Manifest paths are relative to that worktree. Read/claim your task using t3_organization_task, then submit with action=submit and manifest of relative files. A prose completion is not a submission. If blocked, action=block with exact reason. Do not self-review or delegate.`
           : org.role === "reviewer"

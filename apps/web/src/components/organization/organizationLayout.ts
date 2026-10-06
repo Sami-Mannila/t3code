@@ -4,8 +4,12 @@ import type {
   ProjectId,
   OrganizationRole,
   OrganizationTask,
-  OrganizationThread,
 } from "@t3tools/contracts";
+import {
+  organizationOutcomeGate,
+  type OrganizationOutcomeGate,
+  type OutcomeThread,
+} from "@t3tools/shared/organizationOutcome";
 
 export const ROLE_LABELS: Record<OrganizationRole, string> = {
   advisor: "Advisor",
@@ -64,7 +68,8 @@ export interface OrganizationLeadCard {
   readonly outcomeReview: OrganizationReview | null;
   readonly outcomeEarlierRounds: ReadonlyArray<OrganizationReviewRound>;
   readonly subtasks: ReadonlyArray<OrganizationSubtask>;
-  readonly canAccept: boolean;
+  /** What a reviewed outcome still waits on before the server accepts it; null otherwise. */
+  readonly outcomeWait: string | null;
 }
 
 export interface OrganizationModel {
@@ -86,6 +91,33 @@ export const threadActivity = (thread: Shell) =>
 export const threadIsActive = (thread: Shell) => thread.runtime?.activeRunId != null;
 export const threadModelLabel = (thread: Shell) =>
   `${thread.modelSelection.instanceId} · ${thread.modelSelection.model}`;
+
+const outcomeThread = (thread: Shell): OutcomeThread => ({
+  id: thread.id,
+  title: thread.title,
+  organization: thread.source.organization,
+  pullRequests: thread.source.pullRequests,
+  createdAtMs: Date.parse(thread.createdAt),
+});
+
+const pullRequestNumbers = (pullRequests: ReadonlyArray<{ readonly number: number }>) =>
+  pullRequests.map((pullRequest) => `#${pullRequest.number}`).join(", ");
+
+/** The server accepts outcomes; the card says what a reviewed one is waiting for. */
+export function outcomeWaitLabel(gate: OrganizationOutcomeGate): string | null {
+  switch (gate.kind) {
+    case "waiting_for_task":
+      return `reviewed · waiting for ${gate.title}`;
+    case "waiting_for_pull_requests":
+      return `reviewed · waiting for PR ${pullRequestNumbers(gate.pullRequests)} to merge`;
+    case "closed_pull_request":
+      return `PR #${gate.pullRequest.number} closed without merging`;
+    case "ready":
+      return "reviewed · accepting";
+    default:
+      return null;
+  }
+}
 
 /**
  * The organization of one project as cards: Chief and Advisor, then one card per project lead
@@ -240,6 +272,7 @@ export function organizationModel(
     list.push(t);
     executorsByLead.set(parent!.id, list);
   }
+  const outcomeThreads = threads.map(outcomeThread);
   const leads = threads
     .filter((t) => role(t) === "lead" && (!workstream || t.id === workstream))
     .sort(createdOrder)
@@ -251,7 +284,7 @@ export function organizationModel(
         outcomeReview: review,
         outcomeEarlierRounds: earlier,
         subtasks: checklist(executorsByLead.get(lead.id) ?? []),
-        canAccept: canAcceptOrganizationOutcome(lead),
+        outcomeWait: outcomeWaitLabel(organizationOutcomeGate(outcomeThread(lead), outcomeThreads)),
       };
     });
   const roots = threads
@@ -265,52 +298,4 @@ export function organizationModel(
     warnings: [...warnings],
     empty: roots.length === 0 && leads.length === 0 && unassigned.length === 0,
   };
-}
-
-/** Presentation eligibility only; the authenticated server revalidates the current artifact manifest. */
-export function canAcceptOrganizationOutcome(thread: EnvironmentThreadShell): boolean {
-  const organization = thread.source.organization;
-  const task = organization?.task;
-  return (
-    organization?.role === "lead" &&
-    task?.state === "awaiting_review" &&
-    !!task.revision &&
-    task.revision === task.reviewedRevision &&
-    !!task.reviewerThreadId &&
-    task.reviewerThreadId !== thread.id &&
-    !!task.files?.length
-  );
-}
-
-type OutcomeFile = NonNullable<NonNullable<OrganizationThread["task"]>["files"]>[number];
-
-/**
- * Splits a lead outcome's aggregate files (`<child thread ID>/<path>`) by the executor that
- * produced them, so each group shows the repository and branch the user merges.
- */
-export function outcomeFileGroups(
-  files: readonly OutcomeFile[],
-  threads: readonly EnvironmentThreadShell[],
-) {
-  const groups = new Map<
-    string,
-    { child: EnvironmentThreadShell | undefined; files: Array<OutcomeFile> }
-  >();
-  if (files.length === 0) return [];
-  const byId = new Map<string, EnvironmentThreadShell>(threads.map((t) => [t.id, t]));
-  for (const file of files) {
-    const slash = file.path.indexOf("/");
-    const child = slash > 0 ? byId.get(file.path.slice(0, slash)) : undefined;
-    const key = child ? child.id : "";
-    const group = groups.get(key) ?? { child, files: [] };
-    group.files.push(child ? { ...file, path: file.path.slice(slash + 1) } : file);
-    groups.set(key, group);
-  }
-  return [...groups.values()].map(({ child, files }) => ({
-    child,
-    repository: child?.source.organization?.task?.repository ?? ".",
-    branch: child?.branch ?? null,
-    worktreePath: child?.worktreePath ?? null,
-    files,
-  }));
 }
