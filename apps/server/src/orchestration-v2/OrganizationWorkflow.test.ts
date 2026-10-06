@@ -1,11 +1,14 @@
 import { organizationTaskContext } from "./OrganizationTaskContext.ts";
+import * as NodeCrypto from "node:crypto";
 import {
   organizationInstructions,
   organizationPreparationBlock,
   organizationPreparationUnblock,
   organizationExtendedTask,
   organizationChiefNotice,
+  organizationFailedRunTaskUpdate,
   organizationIdleLeadBlock,
+  organizationProblem,
 } from "./OrganizationPolicy.ts";
 import { McpSchema, McpServer } from "effect/unstable/ai";
 import * as McpHttpServer from "../mcp/McpHttpServer.ts";
@@ -22,6 +25,7 @@ import {
   EnvironmentId,
   MessageId,
   OrchestrationV2Command,
+  type OrchestrationV2AppThread,
   type ModelSelection,
   NodeId,
   ProjectId,
@@ -36,6 +40,7 @@ import {
 } from "@t3tools/contracts";
 import * as DateTime from "effect/DateTime";
 import * as Effect from "effect/Effect";
+import * as Fiber from "effect/Fiber";
 import * as Layer from "effect/Layer";
 import * as Schema from "effect/Schema";
 import * as Stream from "effect/Stream";
@@ -46,7 +51,6 @@ import * as EffectOutbox from "./EffectOutbox.ts";
 import * as FileSystem from "effect/FileSystem";
 import * as ThreadManagement from "./ThreadManagementService.ts";
 import type { OrganizationThread, OrganizationTask } from "@t3tools/contracts";
-
 import * as CheckpointStore from "../checkpointing/CheckpointStore.ts";
 import * as ServerConfig from "../config.ts";
 import * as McpSessionRegistryTestkit from "../mcp/McpSessionRegistry.testkit.ts";
@@ -1038,6 +1042,252 @@ it.effect(
 );
 
 it.effect(
+  "a research-only lead outcome is submitted as findings, independently reviewed and accepted without a worktree",
+  () =>
+    Effect.gen(function* () {
+      const orchestrator = yield* Orchestrator.OrchestratorV2;
+      const threads = yield* ThreadManagement.ThreadManagementService;
+      const projects = yield* ProjectService.ProjectService;
+      const sink = yield* EventSink.EventSinkV2;
+      const fs = yield* FileSystem.FileSystem;
+      const workspace = yield* fs.makeTempDirectoryScoped();
+      const projectId = ProjectId.make("research-outcome-project");
+      yield* projects.create({
+        commandId: CommandId.make("research-outcome-project"),
+        projectId,
+        title: "Research outcome",
+        workspaceRoot: workspace,
+      });
+      const chief = ThreadId.make("research-chief");
+      const lead = ThreadId.make("research-lead");
+      const gateLead = ThreadId.make("research-gate-lead");
+      const gateExecutor = ThreadId.make("research-gate-executor");
+      const emptyTask = (id: ThreadId): OrganizationTask => ({
+        title: `${id} work`,
+        ownerThreadId: id,
+        dependencyThreadIds: [],
+        state: "queued",
+        revision: null,
+        reviewedRevision: null,
+        reviewerThreadId: null,
+        notes: null,
+      });
+      const create = (id: ThreadId, organization: OrganizationThread) =>
+        orchestrator.dispatch({
+          type: "thread.create",
+          commandId: CommandId.make(`research-create-${id}`),
+          threadId: id,
+          projectId,
+          title: id,
+          modelSelection,
+          runtimeMode: "full-access",
+          interactionMode: "default",
+          branch: null,
+          worktreePath: null,
+          createdBy: "user",
+          creationSource: "web",
+          organization,
+        });
+      yield* create(chief, { role: "chief", parentThreadId: null });
+      yield* create(lead, { role: "lead", parentThreadId: chief, task: emptyTask(lead) });
+      yield* create(gateLead, { role: "lead", parentThreadId: chief, task: emptyTask(gateLead) });
+      yield* create(gateExecutor, {
+        role: "executor",
+        parentThreadId: gateLead,
+        task: emptyTask(gateExecutor),
+      });
+      // A lead run is required to delegate its own outcome review.
+      yield* orchestrator.dispatch({
+        type: "message.dispatch",
+        commandId: CommandId.make("research-lead-run"),
+        threadId: lead,
+        messageId: MessageId.make("research-lead-run"),
+        text: "Research the question and submit findings",
+        attachments: [],
+        dispatchMode: { type: "start_immediately" },
+        createdBy: "user",
+        creationSource: "web",
+      });
+      const server = yield* McpServer.McpServer;
+      const invoke = (args: Record<string, unknown>, actorId: ThreadId) =>
+        server.callTool({ name: "t3_organization_task", arguments: args }).pipe(
+          Effect.provideService(McpInvocationContext.McpInvocationContext, {
+            environmentId: EnvironmentId.make("organization-test"),
+            threadId: actorId,
+            providerSessionId: `research-${actorId}-session`,
+            providerInstanceId: modelSelection.instanceId,
+            capabilities: new Set(["orchestration"] as const),
+            issuedAt: 1,
+          }),
+          Effect.provideService(McpSchema.McpServerClient, mcpClient),
+        );
+
+      // A lead with no children and no findings is rejected with a message that says to pass them.
+      const noFindings = yield* invoke(
+        { action: "submit", clientRequestId: "research-submit-empty" },
+        lead,
+      );
+      assert.equal((noFindings.structuredContent as { code?: string }).code, "orchestration_error");
+      assert.include(
+        (noFindings.structuredContent as { message?: string }).message ?? "",
+        "submits its findings",
+      );
+      assert.equal(
+        (yield* threads.getThreadProjection(lead)).thread.organization!.task!.state,
+        "queued",
+      );
+
+      // A lead with an unaccepted executor child is still refused by the children gate, even
+      // when it passes findings.
+      const gated = yield* threads
+        .dispatch({
+          type: "thread.metadata.update",
+          commandId: CommandId.make("research-gate-submit"),
+          threadId: gateLead,
+          organizationActorThreadId: gateLead,
+          organization: {
+            ...(yield* threads.getThreadProjection(gateLead)).thread.organization!,
+            task: {
+              ...emptyTask(gateLead),
+              findings: "Findings that do not bypass the children gate.",
+              state: "awaiting_review",
+            },
+          },
+        })
+        .pipe(Effect.result);
+      assert.equal(gated._tag, "Failure");
+      if (gated._tag === "Failure" && gated.failure._tag === "OrchestratorDispatchError")
+        assert.include(
+          String(gated.failure.cause),
+          "independently accepted implementation artifacts",
+        );
+      else assert.fail("Expected the children gate to refuse a lead with an unaccepted executor");
+
+      const findings = "The answer is 42.\n\nEvidence: the linked report, sections 2 and 3.";
+      const submitted = yield* invoke(
+        { action: "submit", findings, clientRequestId: "research-submit" },
+        lead,
+      );
+      assert.equal((submitted.structuredContent as { threadId?: string }).threadId, lead);
+      const afterSubmit = (yield* threads.getThreadProjection(lead)).thread.organization!.task!;
+      assert.equal(afterSubmit.state, "awaiting_review");
+      assert.equal(afterSubmit.findings, findings);
+      assert.equal(afterSubmit.revision?.length, 64);
+      assert.deepEqual(afterSubmit.dependencyThreadIds, []);
+      assert.deepEqual(afterSubmit.files ?? [], []);
+      assert.equal(
+        afterSubmit.revision,
+        NodeCrypto.createHash("sha256")
+          .update("research-findings\0")
+          .update(findings)
+          .digest("hex"),
+      );
+
+      // The lead dispatches an independent outcome review targeting itself.
+      const parent = yield* orchestrator.getThreadProjection(lead);
+      const run = parent.runs[0]!;
+      const reviewResult = yield* orchestrator.dispatch({
+        type: "delegated_task.request",
+        commandId: CommandId.make("research-review"),
+        parentThreadId: lead,
+        parentRunId: run.id,
+        parentNodeId: run.rootNodeId!,
+        task: "Independently review the research findings",
+        title: "Research review",
+        modelSelection,
+        runtimeMode: "full-access",
+        interactionMode: "default",
+        createdBy: "agent",
+        creationSource: "mcp",
+        organizationReview: true,
+        organizationReviewTaskThreadId: lead,
+      });
+      const reviewerId = reviewResult.storedEvents.find(
+        (event) => event.event.type === "thread.created",
+      )!.event.threadId;
+      // The reviewer must be a distinct recorded native provider conversation.
+      const now = yield* DateTime.now;
+      for (const [id, nativeId] of [
+        [lead, "research-native-lead"],
+        [reviewerId, "research-native-reviewer"],
+      ] as const) {
+        yield* sink.write({
+          commandId: CommandId.make(`research-native-${id}`),
+          events: [
+            {
+              id: EventId.make(`research-native-${id}`),
+              type: "provider-thread.updated",
+              threadId: id,
+              driver,
+              providerInstanceId: modelSelection.instanceId,
+              occurredAt: now,
+              payload: {
+                id: ProviderThreadId.make(`research-provider-${id}`),
+                driver,
+                providerInstanceId: modelSelection.instanceId,
+                providerSessionId: null,
+                appThreadId: id,
+                ownerNodeId: NodeId.make(`research-node-${id}`),
+                nativeThreadRef: { driver, nativeId, strength: "strong" },
+                nativeConversationHeadRef: null,
+                status: "active",
+                firstRunOrdinal: 1,
+                lastRunOrdinal: 1,
+                handoffIds: [],
+                forkedFrom: null,
+                createdAt: now,
+                updatedAt: now,
+              },
+            },
+          ],
+        });
+      }
+
+      const read = yield* invoke({ action: "read", clientRequestId: "research-read" }, reviewerId);
+      const context = read.structuredContent as {
+        threadId: string;
+        organization: OrganizationThread;
+      } & ReturnType<typeof organizationTaskContext>;
+      assert.equal(context.threadId, lead);
+      assert.equal(context.organization.task?.findings, findings);
+      assert.equal(context.reviewAssignment?.reviewerThreadId, reviewerId);
+      assert.equal(context.reviewAssignment?.revision, afterSubmit.revision);
+      assert.deepEqual(context.artifactSources, []);
+
+      const acceptedReview = yield* invoke(
+        {
+          action: "accept_review",
+          revision: afterSubmit.revision,
+          notes: "Reviewed the findings independently.",
+          clientRequestId: "research-accept-review",
+        },
+        reviewerId,
+      );
+      assert.equal((acceptedReview.structuredContent as { threadId?: string }).threadId, lead);
+      const reviewed = (yield* threads.getThreadProjection(lead)).thread.organization!.task!;
+      assert.equal(reviewed.state, "awaiting_review");
+      assert.equal(reviewed.reviewedRevision, afterSubmit.revision);
+      assert.equal(reviewed.reviewerThreadId, reviewerId);
+
+      // The server accepts the reviewed outcome on its review alone: it opened no pull request.
+      const reactor = yield* makeReactor;
+      yield* reactor.sweep();
+      const accepted = (yield* threads.getThreadProjection(lead)).thread.organization!.task!;
+      assert.equal(accepted.state, "accepted");
+      assert.equal(
+        accepted.notes,
+        "Accepted after independent review; no pull request was opened.",
+      );
+    }).pipe(
+      Effect.provide(
+        Layer.mergeAll(ProcessRunner.layer, NativeToolkitLayer).pipe(
+          Layer.provideMerge(NodeServices.layer),
+        ),
+      ),
+    ),
+);
+
+it.effect(
   "all worker follow-ups reserve through durable admission and an eleventh waits without consuming a command receipt",
   () =>
     Effect.gen(function* () {
@@ -1593,6 +1843,195 @@ it.effect("retrying a failed organization preparation runs the organization prep
       ),
     ),
   ),
+);
+
+it.effect(
+  "an adopting lead recovers an executor submission left blocked by a failed reviewer and re-reviews it",
+  () =>
+    Effect.gen(function* () {
+      const orchestrator = yield* Orchestrator.OrchestratorV2;
+      const threads = yield* ThreadManagement.ThreadManagementService;
+      const projects = yield* ProjectService.ProjectService;
+      const fs = yield* FileSystem.FileSystem;
+      const workspace = yield* fs.makeTempDirectoryScoped();
+      yield* fs.writeFileString(`${workspace}/result.txt`, "adopted review proof\n");
+      const projectId = ProjectId.make("adopted-review-project");
+      yield* projects.create({
+        commandId: CommandId.make("adopted-review-project"),
+        projectId,
+        title: "Adopted review",
+        workspaceRoot: workspace,
+      });
+      const chief = ThreadId.make("adopted-review-chief");
+      const retiredLead = ThreadId.make("adopted-review-retired-lead");
+      const adoptingLead = ThreadId.make("adopted-review-adopting-lead");
+      const executor = ThreadId.make("adopted-review-executor");
+      const reviewer = ThreadId.make("adopted-review-reviewer");
+      const task = (id: ThreadId): OrganizationTask => ({
+        title: `${id} work`,
+        ownerThreadId: id,
+        dependencyThreadIds: [],
+        state: "queued",
+        revision: null,
+        reviewedRevision: null,
+        reviewerThreadId: null,
+        notes: null,
+      });
+      const create = (
+        id: ThreadId,
+        organization: OrganizationThread,
+        worktreePath: string | null = workspace,
+      ) =>
+        orchestrator.dispatch({
+          type: "thread.create",
+          commandId: CommandId.make(`adopted-review-create-${id}`),
+          threadId: id,
+          projectId,
+          title: id,
+          modelSelection,
+          runtimeMode: "full-access",
+          interactionMode: "default",
+          branch: null,
+          worktreePath,
+          createdBy: "user",
+          creationSource: "web",
+          organization,
+        });
+      yield* create(chief, { role: "chief", parentThreadId: null }, null);
+      yield* create(
+        retiredLead,
+        { role: "lead", parentThreadId: chief, task: task(retiredLead) },
+        null,
+      );
+      yield* create(
+        adoptingLead,
+        { role: "lead", parentThreadId: chief, task: task(adoptingLead) },
+        null,
+      );
+      yield* create(executor, {
+        role: "executor",
+        parentThreadId: retiredLead,
+        task: task(executor),
+      });
+      yield* create(
+        reviewer,
+        { role: "reviewer", parentThreadId: retiredLead, reviewTaskThreadId: executor },
+        null,
+      );
+      const update = (
+        id: ThreadId,
+        key: string,
+        patch: Partial<OrganizationTask>,
+        actor?: ThreadId,
+      ) =>
+        Effect.gen(function* () {
+          const org = (yield* threads.getThreadProjection(id)).thread.organization!;
+          return yield* threads.dispatch({
+            type: "thread.metadata.update",
+            commandId: CommandId.make(key),
+            threadId: id,
+            organization: { ...org, task: { ...org.task!, ...patch } },
+            ...(actor ? { organizationActorThreadId: actor } : {}),
+          });
+        });
+      // The executor submits under lead A.
+      yield* update(
+        executor,
+        "adopted-review-submit",
+        { state: "awaiting_review", manifest: ["result.txt"] },
+        executor,
+      );
+      const submitted = (yield* threads.getThreadProjection(executor)).thread.organization!.task!;
+      assert.equal(submitted.revision?.length, 64);
+      // Its reviewer's run failed, leaving this legacy task blocked and owned by that dead reviewer.
+      yield* update(
+        executor,
+        "adopted-review-block",
+        { state: "blocked", ownerThreadId: reviewer },
+        retiredLead,
+      );
+      // Lead A is archived, stranding the submission.
+      yield* orchestrator.dispatch({
+        type: "thread.archive",
+        commandId: CommandId.make("adopted-review-archive"),
+        threadId: retiredLead,
+      });
+      // Lead B, under the same Chief, is a live thread.
+      yield* orchestrator.dispatch({
+        type: "message.dispatch",
+        commandId: CommandId.make("adopted-review-lead-run"),
+        threadId: adoptingLead,
+        messageId: MessageId.make("adopted-review-lead-run"),
+        text: "Recover the stranded submission",
+        attachments: [],
+        dispatchMode: { type: "start_immediately" },
+        createdBy: "user",
+        creationSource: "web",
+      });
+      // Lead B adopts the executor through the t3_organization_task handler.
+      const server = yield* McpServer.McpServer;
+      const invoke = (args: Record<string, unknown>, actorId: ThreadId) =>
+        server.callTool({ name: "t3_organization_task", arguments: args }).pipe(
+          Effect.provideService(McpInvocationContext.McpInvocationContext, {
+            environmentId: EnvironmentId.make("adopted-review"),
+            threadId: actorId,
+            providerSessionId: "adopted-review-session",
+            providerInstanceId: modelSelection.instanceId,
+            capabilities: new Set(["orchestration"] as const),
+            issuedAt: 1,
+          }),
+          Effect.provideService(McpSchema.McpServerClient, mcpClient),
+        );
+      const adopted = yield* invoke(
+        { action: "adopt", threadId: executor, clientRequestId: "adopted-review-adopt" },
+        adoptingLead,
+      );
+      assert.isFalse(adopted.isError);
+      const adoptedTask = (yield* threads.getThreadProjection(executor)).thread.organization!;
+      assert.equal(adoptedTask.parentThreadId, adoptingLead);
+      assert.equal(adoptedTask.task?.state, "blocked");
+      assert.equal(adoptedTask.task?.revision, submitted.revision);
+      // Lead B dispatches a review delegation; the legacy block returns to awaiting review.
+      const parent = yield* orchestrator.getThreadProjection(adoptingLead);
+      const parentRun = parent.runs[0]!;
+      const review = yield* orchestrator.dispatch({
+        type: "delegated_task.request",
+        commandId: CommandId.make("adopted-review-delegation"),
+        parentThreadId: adoptingLead,
+        parentRunId: parentRun.id,
+        parentNodeId: parentRun.rootNodeId!,
+        task: "Independently review the adopted submission",
+        title: "Review",
+        modelSelection,
+        runtimeMode: "full-access",
+        interactionMode: "default",
+        createdBy: "agent",
+        creationSource: "mcp",
+        organizationReview: true,
+        organizationReviewTaskThreadId: executor,
+      });
+      const newReviewer = review.storedEvents.find(
+        (event) => event.event.type === "thread.created",
+      )!.event.threadId;
+      assert.notEqual(newReviewer, reviewer);
+      const recovered = (yield* threads.getThreadProjection(executor)).thread.organization!.task!;
+      assert.equal(recovered.state, "awaiting_review");
+      assert.equal(recovered.ownerThreadId, newReviewer);
+      assert.equal(recovered.revision, submitted.revision);
+      const snapshot = yield* threads.getShellSnapshot();
+      const assignment = organizationTaskContext(
+        (yield* threads.getThreadProjection(executor)).thread,
+        snapshot.threads,
+      ).reviewAssignment;
+      assert.equal(assignment?.reviewerThreadId, newReviewer);
+      assert.equal(assignment?.revision, submitted.revision);
+    }).pipe(
+      Effect.provide(
+        Layer.mergeAll(ProcessRunner.layer, NativeToolkitLayer).pipe(
+          Layer.provideMerge(NodeServices.layer),
+        ),
+      ),
+    ),
 );
 
 it("a preparation failure blocks only work about to run, and its retry restores that work", () => {
@@ -2838,4 +3277,675 @@ it.effect(
         ),
       );
     }).pipe(Effect.provide(NativeToolkitLayer.pipe(Layer.provideMerge(taskNoticeLayer)))),
+);
+
+it("a failed reviewer leaves the submission awaiting review while an executor failure blocks its task", () => {
+  const task = (state: OrganizationTask["state"]): OrganizationTask => ({
+    title: "Work",
+    ownerThreadId: ThreadId.make("failed-run-executor"),
+    dependencyThreadIds: [],
+    state,
+    revision: "a".repeat(64),
+    reviewedRevision: null,
+    reviewerThreadId: null,
+    notes: null,
+  });
+  assert.isNull(
+    organizationFailedRunTaskUpdate({
+      role: "reviewer",
+      task: task("awaiting_review"),
+      failureMessage: "boom",
+    }),
+  );
+  const blocked = organizationFailedRunTaskUpdate({
+    role: "executor",
+    task: task("working"),
+    failureMessage: "boom",
+  })!;
+  assert.equal(blocked.state, "blocked");
+  assert.equal(blocked.notes, "boom");
+  assert.isNull(
+    organizationFailedRunTaskUpdate({
+      role: "executor",
+      task: task("accepted"),
+      failureMessage: "boom",
+    }),
+  );
+});
+
+it("a lead may adopt an executor task only from a retired parent lead under the same Chief", () => {
+  const projectId = ProjectId.make("adopt-project");
+  const chief = ThreadId.make("adopt-chief");
+  const otherChief = ThreadId.make("adopt-other-chief");
+  const retiredLead = ThreadId.make("adopt-retired-lead");
+  const activeLead = ThreadId.make("adopt-active-lead");
+  const otherChiefLead = ThreadId.make("adopt-other-chief-lead");
+  const executor = ThreadId.make("adopt-executor");
+  const reviewer = ThreadId.make("adopt-reviewer");
+  const task = (state: OrganizationTask["state"], ownerThreadId: ThreadId): OrganizationTask => ({
+    title: "Work",
+    ownerThreadId,
+    dependencyThreadIds: [],
+    state,
+    revision: "a".repeat(64),
+    reviewedRevision: null,
+    reviewerThreadId: null,
+    notes: null,
+  });
+  const thread = (
+    id: ThreadId,
+    organization: OrganizationThread | null,
+    archivedAt: string | null = null,
+  ) =>
+    ({
+      id,
+      projectId,
+      organization,
+      archivedAt,
+      deletedAt: null,
+    }) as unknown as OrchestrationV2AppThread;
+  const threads = [
+    thread(chief, { role: "chief", parentThreadId: null }),
+    thread(otherChief, { role: "chief", parentThreadId: null }),
+    thread(
+      retiredLead,
+      { role: "lead", parentThreadId: chief, task: task("accepted", retiredLead) },
+      "2026-01-01T00:00:00.000Z",
+    ),
+    thread(activeLead, { role: "lead", parentThreadId: chief, task: task("working", activeLead) }),
+    thread(otherChiefLead, {
+      role: "lead",
+      parentThreadId: otherChief,
+      task: task("working", otherChiefLead),
+    }),
+    thread(reviewer, {
+      role: "reviewer",
+      parentThreadId: retiredLead,
+      reviewTaskThreadId: executor,
+    }),
+  ];
+  const executorOrg = (
+    parentThreadId: ThreadId,
+    ownerThreadId = executor,
+    state: OrganizationTask["state"] = "awaiting_review",
+  ): OrganizationThread => ({
+    role: "executor",
+    parentThreadId,
+    task: task(state, ownerThreadId),
+  });
+  const adopt = (
+    previousParent: ThreadId,
+    actorThreadId: ThreadId,
+    previousOrg?: OrganizationThread,
+  ) =>
+    organizationProblem({
+      thread: thread(executor, previousOrg ?? executorOrg(previousParent)),
+      next: executorOrg(actorThreadId),
+      threads,
+      actorThreadId,
+    });
+  const adoptWith = (
+    previousOrg: OrganizationThread,
+    nextOrg: OrganizationThread,
+    actorThreadId: ThreadId,
+  ) =>
+    organizationProblem({
+      thread: thread(executor, previousOrg),
+      next: nextOrg,
+      threads,
+      actorThreadId,
+    });
+  assert.isNull(adopt(retiredLead, activeLead));
+  assert.include(adopt(activeLead, retiredLead)!, "cannot be reassigned");
+  assert.include(adopt(retiredLead, otherChiefLead)!, "cannot be reassigned");
+  assert.include(
+    adopt(retiredLead, activeLead, { role: "lead", parentThreadId: retiredLead })!,
+    "cannot be reassigned",
+  );
+  // A parent that cannot be resolved cannot be adopted from.
+  assert.include(adopt(ThreadId.make("adopt-ghost-lead"), activeLead)!, "cannot be reassigned");
+  // A submission owned by a dead reviewer is adoptable without changing its evidence.
+  const blockedByReviewer = executorOrg(retiredLead, reviewer, "blocked");
+  assert.isNull(
+    adoptWith(blockedByReviewer, { ...blockedByReviewer, parentThreadId: activeLead }, activeLead),
+  );
+  // Adoption moves only the parent: a revision, state or owner change alongside it is rejected.
+  const unchanged = executorOrg(retiredLead);
+  for (const changed of [
+    { ...unchanged.task!, revision: "b".repeat(64) },
+    { ...unchanged.task!, state: "blocked" as const },
+    { ...unchanged.task!, ownerThreadId: reviewer },
+  ])
+    assert.include(
+      adoptWith(
+        unchanged,
+        { ...unchanged, parentThreadId: activeLead, task: changed },
+        activeLead,
+      )!,
+      "cannot be reassigned",
+    );
+});
+
+it.effect("t3_organization_task adopt moves an executor task off a retired parent lead", () =>
+  Effect.gen(function* () {
+    const orchestrator = yield* Orchestrator.OrchestratorV2;
+    const threads = yield* ThreadManagement.ThreadManagementService;
+    const projects = yield* ProjectService.ProjectService;
+    const sink = yield* EventSink.EventSinkV2;
+    const fs = yield* FileSystem.FileSystem;
+    const root = yield* fs.makeTempDirectoryScoped();
+    const projectId = ProjectId.make("adopt-tool-project");
+    yield* projects.create({
+      commandId: CommandId.make("adopt-tool-project"),
+      projectId,
+      title: "Adoption",
+      workspaceRoot: root,
+    });
+    const chief = ThreadId.make("adopt-tool-chief");
+    const retiredLead = ThreadId.make("adopt-tool-retired-lead");
+    const adoptingLead = ThreadId.make("adopt-tool-adopting-lead");
+    const peerLead = ThreadId.make("adopt-tool-peer-lead");
+    const executor = ThreadId.make("adopt-tool-executor");
+    const activeExecutor = ThreadId.make("adopt-tool-active-executor");
+    const ghostExecutor = ThreadId.make("adopt-tool-ghost-executor");
+    const task = (id: ThreadId): OrganizationTask => ({
+      title: `${id} work`,
+      ownerThreadId: id,
+      dependencyThreadIds: [],
+      state: "queued",
+      revision: null,
+      reviewedRevision: null,
+      reviewerThreadId: null,
+      notes: null,
+    });
+    const create = (id: ThreadId, organization: OrganizationThread) =>
+      orchestrator.dispatch({
+        type: "thread.create",
+        commandId: CommandId.make(`adopt-tool-create-${id}`),
+        threadId: id,
+        projectId,
+        title: id,
+        modelSelection,
+        runtimeMode: "full-access",
+        interactionMode: "default",
+        branch: null,
+        worktreePath: root,
+        createdBy: "user",
+        creationSource: "web",
+        organization,
+      });
+    yield* create(chief, { role: "chief", parentThreadId: null });
+    yield* create(retiredLead, { role: "lead", parentThreadId: chief, task: task(retiredLead) });
+    yield* create(adoptingLead, {
+      role: "lead",
+      parentThreadId: chief,
+      task: task(adoptingLead),
+    });
+    yield* create(peerLead, { role: "lead", parentThreadId: chief, task: task(peerLead) });
+    yield* create(executor, {
+      role: "executor",
+      parentThreadId: retiredLead,
+      task: task(executor),
+    });
+    yield* create(activeExecutor, {
+      role: "executor",
+      parentThreadId: adoptingLead,
+      task: task(activeExecutor),
+    });
+    yield* create(ghostExecutor, {
+      role: "executor",
+      parentThreadId: retiredLead,
+      task: task(ghostExecutor),
+    });
+    yield* orchestrator.dispatch({
+      type: "thread.archive",
+      commandId: CommandId.make("adopt-tool-archive"),
+      threadId: retiredLead,
+    });
+    // A preparing run is enough for the caller to be a live thread.
+    yield* orchestrator.dispatch({
+      type: "message.dispatch",
+      commandId: CommandId.make("adopt-tool-lead-run"),
+      threadId: adoptingLead,
+      messageId: MessageId.make("adopt-tool-lead-run"),
+      text: "Coordinate the outcome",
+      attachments: [],
+      dispatchMode: { type: "start_immediately" },
+      createdBy: "user",
+      creationSource: "web",
+    });
+    // Point one executor at a lead whose record cannot be resolved.
+    const ghostThread = (yield* threads.getThreadProjection(ghostExecutor)).thread;
+    yield* sink.write({
+      commandId: CommandId.make("adopt-tool-ghost-parent"),
+      events: [
+        {
+          id: EventId.make("adopt-tool-ghost-parent"),
+          type: "thread.metadata-updated",
+          threadId: ghostExecutor,
+          occurredAt: yield* DateTime.now,
+          payload: {
+            ...ghostThread,
+            organization: {
+              ...ghostThread.organization!,
+              parentThreadId: ThreadId.make("adopt-tool-missing-lead"),
+            },
+          },
+        },
+      ],
+    });
+    const server = yield* McpServer.McpServer;
+    const invoke = (args: Record<string, unknown>, actorId: ThreadId) =>
+      server.callTool({ name: "t3_organization_task", arguments: args }).pipe(
+        Effect.provideService(McpInvocationContext.McpInvocationContext, {
+          environmentId: EnvironmentId.make("adopt-tool"),
+          threadId: actorId,
+          providerSessionId: "adopt-tool-session",
+          providerInstanceId: modelSelection.instanceId,
+          capabilities: new Set(["orchestration"] as const),
+          issuedAt: 1,
+        }),
+        Effect.provideService(McpSchema.McpServerClient, mcpClient),
+      );
+    const adopted = yield* invoke(
+      { action: "adopt", threadId: executor, clientRequestId: "adopt-tool-1" },
+      adoptingLead,
+    );
+    assert.isFalse(adopted.isError);
+    assert.isUndefined((adopted.structuredContent as { code?: string }).code);
+    const adoptedOrg = (yield* threads.getThreadProjection(executor)).thread.organization!;
+    assert.equal(adoptedOrg.parentThreadId, adoptingLead);
+    assert.isNull(adoptedOrg.task?.revision);
+    // An active parent lead cannot be adopted away.
+    const activeRefusal = yield* invoke(
+      { action: "adopt", threadId: activeExecutor, clientRequestId: "adopt-tool-active" },
+      adoptingLead,
+    );
+    const activeContent = activeRefusal.structuredContent as { code?: string; message?: string };
+    assert.equal(activeContent.code, "invalid_request");
+    assert.include(activeContent.message, "still active");
+    // Adoption applies to executor tasks only.
+    const leadRefusal = yield* invoke(
+      { action: "adopt", threadId: peerLead, clientRequestId: "adopt-tool-lead" },
+      adoptingLead,
+    );
+    const leadContent = leadRefusal.structuredContent as { code?: string; message?: string };
+    assert.equal(leadContent.code, "invalid_request");
+    assert.include(leadContent.message, "executor task");
+    // A parent lead whose record cannot be resolved cannot be adopted from.
+    const ghostRefusal = yield* invoke(
+      { action: "adopt", threadId: ghostExecutor, clientRequestId: "adopt-tool-ghost" },
+      adoptingLead,
+    );
+    const ghostContent = ghostRefusal.structuredContent as { code?: string; message?: string };
+    assert.equal(ghostContent.code, "invalid_request");
+    assert.include(ghostContent.message, "could not be resolved");
+  }).pipe(
+    Effect.provide(
+      Layer.mergeAll(ProcessRunner.layer, NativeToolkitLayer).pipe(
+        Layer.provideMerge(NodeServices.layer),
+      ),
+    ),
+  ),
+);
+
+it.effect(
+  "recovers a submission blocked by a failed reviewer and reports why a review delegation is refused",
+  () =>
+    Effect.gen(function* () {
+      const orchestrator = yield* Orchestrator.OrchestratorV2;
+      const threads = yield* ThreadManagement.ThreadManagementService;
+      const projects = yield* ProjectService.ProjectService;
+      const fs = yield* FileSystem.FileSystem;
+      const workspace = yield* fs.makeTempDirectoryScoped();
+      yield* fs.writeFileString(`${workspace}/result.txt`, "recovered proof\n");
+      const projectId = ProjectId.make("review-recovery-project");
+      yield* projects.create({
+        commandId: CommandId.make("review-recovery-project"),
+        projectId,
+        title: "Review recovery",
+        workspaceRoot: workspace,
+      });
+      const chief = ThreadId.make("recovery-chief");
+      const lead = ThreadId.make("recovery-lead");
+      const executor = ThreadId.make("recovery-executor");
+      const queued = ThreadId.make("recovery-queued");
+      const reviewer = ThreadId.make("recovery-reviewer");
+      const task = (id: ThreadId): OrganizationTask => ({
+        title: `${id} work`,
+        ownerThreadId: id,
+        dependencyThreadIds: [],
+        state: "queued",
+        revision: null,
+        reviewedRevision: null,
+        reviewerThreadId: null,
+        notes: null,
+      });
+      const create = (
+        id: ThreadId,
+        organization: OrganizationThread,
+        worktreePath: string | null = workspace,
+      ) =>
+        orchestrator.dispatch({
+          type: "thread.create",
+          commandId: CommandId.make(`recovery-create-${id}`),
+          threadId: id,
+          projectId,
+          title: id,
+          modelSelection,
+          runtimeMode: "full-access",
+          interactionMode: "default",
+          branch: null,
+          worktreePath,
+          createdBy: "user",
+          creationSource: "web",
+          organization,
+        });
+      yield* create(chief, { role: "chief", parentThreadId: null }, null);
+      yield* create(lead, { role: "lead", parentThreadId: chief, task: task(lead) }, null);
+      yield* create(executor, { role: "executor", parentThreadId: lead, task: task(executor) });
+      yield* create(queued, { role: "executor", parentThreadId: lead, task: task(queued) });
+      yield* create(
+        reviewer,
+        { role: "reviewer", parentThreadId: lead, reviewTaskThreadId: executor },
+        null,
+      );
+      yield* orchestrator.dispatch({
+        type: "message.dispatch",
+        commandId: CommandId.make("recovery-lead-run"),
+        threadId: lead,
+        messageId: MessageId.make("recovery-lead-run"),
+        text: "Coordinate the outcome",
+        attachments: [],
+        dispatchMode: { type: "start_immediately" },
+        createdBy: "user",
+        creationSource: "web",
+      });
+      const update = (
+        id: ThreadId,
+        key: string,
+        patch: Partial<OrganizationTask>,
+        actor?: ThreadId,
+      ) =>
+        Effect.gen(function* () {
+          const org = (yield* threads.getThreadProjection(id)).thread.organization!;
+          return yield* threads.dispatch({
+            type: "thread.metadata.update",
+            commandId: CommandId.make(key),
+            threadId: id,
+            organization: { ...org, task: { ...org.task!, ...patch } },
+            ...(actor ? { organizationActorThreadId: actor } : {}),
+          });
+        });
+      yield* update(
+        executor,
+        "recovery-submit",
+        { state: "awaiting_review", manifest: ["result.txt"] },
+        executor,
+      );
+      const submitted = (yield* threads.getThreadProjection(executor)).thread.organization!.task!;
+      assert.equal(submitted.revision?.length, 64);
+      // The failed-reviewer bug left this valid submission blocked, owned by the dead reviewer.
+      yield* update(
+        executor,
+        "recovery-legacy-block",
+        { state: "blocked", ownerThreadId: reviewer },
+        lead,
+      );
+      const delegateReview = (key: string, target: ThreadId) =>
+        Effect.gen(function* () {
+          const parent = yield* orchestrator.getThreadProjection(lead);
+          const run = parent.runs[0]!;
+          return yield* orchestrator.dispatch({
+            type: "delegated_task.request",
+            commandId: CommandId.make(key),
+            parentThreadId: lead,
+            parentRunId: run.id,
+            parentNodeId: run.rootNodeId!,
+            task: "Independently review the recovered submission",
+            title: "Review",
+            modelSelection,
+            runtimeMode: "full-access",
+            interactionMode: "default",
+            createdBy: "agent",
+            creationSource: "mcp",
+            organizationReview: true,
+            organizationReviewTaskThreadId: target,
+          });
+        });
+      const first = yield* delegateReview("recovery-review-1", executor);
+      const firstReviewer = first.storedEvents.find(
+        (event) => event.event.type === "thread.created",
+      )!.event.threadId;
+      const recovered = (yield* threads.getThreadProjection(executor)).thread.organization!.task!;
+      assert.equal(recovered.state, "awaiting_review");
+      assert.equal(recovered.ownerThreadId, firstReviewer);
+      assert.equal(recovered.revision, submitted.revision);
+      const snapshot = yield* threads.getShellSnapshot();
+      const assignment = organizationTaskContext(
+        (yield* threads.getThreadProjection(executor)).thread,
+        snapshot.threads,
+      ).reviewAssignment;
+      assert.equal(assignment?.reviewerThreadId, firstReviewer);
+      assert.equal(assignment?.revision, submitted.revision);
+      // A second review delegation on the awaiting-review submission succeeds too.
+      const second = yield* delegateReview("recovery-review-2", executor);
+      const secondReviewer = second.storedEvents.find(
+        (event) => event.event.type === "thread.created",
+      )!.event.threadId;
+      assert.equal(
+        (yield* threads.getThreadProjection(executor)).thread.organization!.task!.ownerThreadId,
+        secondReviewer,
+      );
+      // A review delegation on a task that is not awaiting review reports that state.
+      const refused = yield* delegateReview("recovery-review-refused", queued).pipe(Effect.result);
+      assert.equal(refused._tag, "Failure");
+      if (refused._tag === "Failure" && refused.failure._tag === "OrchestratorDispatchError")
+        assert.include(String(refused.failure.cause), "queued");
+      else assert.fail("Expected a specific review-delegation refusal");
+      // A missing target names the missing conversation.
+      const missing = yield* delegateReview(
+        "recovery-review-missing",
+        ThreadId.make("recovery-missing"),
+      ).pipe(Effect.result);
+      assert.equal(missing._tag, "Failure");
+      if (missing._tag === "Failure" && missing.failure._tag === "OrchestratorDispatchError")
+        assert.include(String(missing.failure.cause), "was not found");
+      else assert.fail("Expected a missing-target refusal");
+      // A blocked task owned by its own failed executor is not a recoverable reviewer block.
+      yield* update(queued, "recovery-executor-blocked", { state: "blocked" }, queued);
+      const blockedRefusal = yield* delegateReview("recovery-review-blocked", queued).pipe(
+        Effect.result,
+      );
+      assert.equal(blockedRefusal._tag, "Failure");
+      if (
+        blockedRefusal._tag === "Failure" &&
+        blockedRefusal.failure._tag === "OrchestratorDispatchError"
+      )
+        assert.include(String(blockedRefusal.failure.cause), "is blocked");
+      else assert.fail("Expected the blocked-state refusal");
+    }).pipe(
+      Effect.provide(
+        ThreadManagement.layer.pipe(
+          Layer.provideMerge(TestLayer),
+          Layer.provideMerge(NodeServices.layer),
+        ),
+      ),
+    ),
+);
+
+it.effect(
+  "a failed reviewer leaves its submission awaiting review while a failed executor blocks its own task",
+  () =>
+    Effect.gen(function* () {
+      const orchestrator = yield* Orchestrator.OrchestratorV2;
+      const threads = yield* ThreadManagement.ThreadManagementService;
+      const projects = yield* ProjectService.ProjectService;
+      const sink = yield* EventSink.EventSinkV2;
+      const fs = yield* FileSystem.FileSystem;
+      const workspace = yield* fs.makeTempDirectoryScoped();
+      yield* fs.writeFileString(`${workspace}/result.txt`, "reviewer failure proof\n");
+      const projectId = ProjectId.make("failure-recovery-project");
+      yield* projects.create({
+        commandId: CommandId.make("failure-recovery-project"),
+        projectId,
+        title: "Failure recovery",
+        workspaceRoot: workspace,
+      });
+      const chief = ThreadId.make("failure-chief");
+      const lead = ThreadId.make("failure-lead");
+      const executor = ThreadId.make("failure-executor");
+      const failedExecutor = ThreadId.make("failure-failed-executor");
+      const reviewer = ThreadId.make("failure-reviewer");
+      const task = (
+        id: ThreadId,
+        state: OrganizationTask["state"] = "queued",
+      ): OrganizationTask => ({
+        title: `${id} work`,
+        ownerThreadId: id,
+        dependencyThreadIds: [],
+        state,
+        revision: null,
+        reviewedRevision: null,
+        reviewerThreadId: null,
+        notes: null,
+      });
+      const create = (
+        id: ThreadId,
+        organization: OrganizationThread,
+        worktreePath: string | null = workspace,
+      ) =>
+        orchestrator.dispatch({
+          type: "thread.create",
+          commandId: CommandId.make(`failure-create-${id}`),
+          threadId: id,
+          projectId,
+          title: id,
+          modelSelection,
+          runtimeMode: "full-access",
+          interactionMode: "default",
+          branch: null,
+          worktreePath,
+          createdBy: "user",
+          creationSource: "web",
+          organization,
+        });
+      yield* create(chief, { role: "chief", parentThreadId: null }, null);
+      yield* create(lead, { role: "lead", parentThreadId: chief, task: task(lead) }, null);
+      yield* create(executor, { role: "executor", parentThreadId: lead, task: task(executor) });
+      yield* create(failedExecutor, {
+        role: "executor",
+        parentThreadId: lead,
+        task: task(failedExecutor, "working"),
+      });
+      yield* create(
+        reviewer,
+        { role: "reviewer", parentThreadId: lead, reviewTaskThreadId: executor },
+        null,
+      );
+      const update = (
+        id: ThreadId,
+        key: string,
+        patch: Partial<OrganizationTask>,
+        actor?: ThreadId,
+      ) =>
+        Effect.gen(function* () {
+          const org = (yield* threads.getThreadProjection(id)).thread.organization!;
+          return yield* threads.dispatch({
+            type: "thread.metadata.update",
+            commandId: CommandId.make(key),
+            threadId: id,
+            organization: { ...org, task: { ...org.task!, ...patch } },
+            ...(actor ? { organizationActorThreadId: actor } : {}),
+          });
+        });
+      yield* update(
+        executor,
+        "failure-submit",
+        { state: "awaiting_review", manifest: ["result.txt"] },
+        executor,
+      );
+      const submitted = (yield* threads.getThreadProjection(executor)).thread.organization!.task!;
+      assert.equal(submitted.revision?.length, 64);
+      yield* update(executor, "failure-assign", { ownerThreadId: reviewer }, lead);
+      // Give the reviewer and the failing executor active runs to fail.
+      for (const id of [reviewer, failedExecutor])
+        yield* orchestrator.dispatch({
+          type: "message.dispatch",
+          commandId: CommandId.make(`failure-run-${id}`),
+          threadId: id,
+          messageId: MessageId.make(`failure-run-${id}`),
+          text: "Continue",
+          attachments: [],
+          dispatchMode: { type: "start_immediately" },
+          createdBy: "user",
+          creationSource: "web",
+        });
+      const reviewerRun = (yield* threads.getThreadProjection(reviewer)).runs[0]!;
+      const failedRun = (yield* threads.getThreadProjection(failedExecutor)).runs[0]!;
+      const now = yield* DateTime.now;
+      // A reviewer failure persists no metadata event, so awaiting the executor failure's
+      // blocked event (processed later on the same serialized stream) also proves the reviewer
+      // failure was processed.
+      const blocked = yield* orchestrator.streamDomainEvents.pipe(
+        Stream.filter(
+          (event) =>
+            event.type === "thread.metadata-updated" &&
+            event.threadId === failedExecutor &&
+            event.payload.organization?.task?.state === "blocked",
+        ),
+        Stream.take(1),
+        Stream.runDrain,
+        Effect.forkScoped,
+      );
+      yield* sink.write({
+        commandId: CommandId.make("failure-reviewer-run"),
+        events: [
+          {
+            id: EventId.make("failure-reviewer-run"),
+            type: "run.updated",
+            threadId: reviewer,
+            runId: reviewerRun.id,
+            occurredAt: now,
+            payload: { ...reviewerRun, status: "failed", completedAt: now },
+          },
+        ],
+      });
+      yield* sink.write({
+        commandId: CommandId.make("failure-executor-run"),
+        events: [
+          {
+            id: EventId.make("failure-executor-run"),
+            type: "run.updated",
+            threadId: failedExecutor,
+            runId: failedRun.id,
+            occurredAt: now,
+            payload: { ...failedRun, status: "failed", completedAt: now },
+          },
+        ],
+      });
+      yield* Fiber.join(blocked);
+      const reviewed = (yield* threads.getThreadProjection(executor)).thread.organization!.task!;
+      assert.equal(reviewed.state, "awaiting_review");
+      assert.equal(reviewed.ownerThreadId, reviewer);
+      assert.equal(reviewed.revision, submitted.revision);
+      const snapshot = yield* threads.getShellSnapshot();
+      const assignment = organizationTaskContext(
+        (yield* threads.getThreadProjection(executor)).thread,
+        snapshot.threads,
+      ).reviewAssignment;
+      assert.equal(assignment?.reviewerThreadId, reviewer);
+      assert.equal(assignment?.revision, submitted.revision);
+      assert.equal(
+        (yield* threads.getThreadProjection(failedExecutor)).thread.organization!.task!.state,
+        "blocked",
+      );
+    }).pipe(
+      Effect.provide(
+        ThreadManagement.layer.pipe(
+          Layer.provideMerge(TestLayer),
+          Layer.provideMerge(NodeServices.layer),
+        ),
+      ),
+    ),
 );

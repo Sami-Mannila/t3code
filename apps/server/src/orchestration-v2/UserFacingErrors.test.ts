@@ -65,4 +65,14 @@ describe("userFacingDispatchErrorMessage", () => {
       "Claude provider thread provider-thread-1 has no live query.",
     );
   });
+
+  it("surfaces a string guard reason carried as the dispatch cause", () => {
+    assert.equal(
+      userFacingDispatchErrorMessage({
+        message: "Failed to dispatch orchestration command delegated_task.request (command-1).",
+        cause: "Review delegation requires an awaiting-review task; executor-1 is queued.",
+      }),
+      "Review delegation requires an awaiting-review task; executor-1 is queued.",
+    );
+  });
 });
