@@ -10,6 +10,7 @@ import {
   organizationExecutionProblem,
   organizationRepository,
   organizationPreparationUnblock,
+  organizationFailedRunTaskUpdate,
   organizationPreparesRuns,
   organizationChiefNoticeRelevant,
   organizationChiefNotice,
@@ -6805,25 +6806,43 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
       const reviewTarget = command.organizationReviewTaskThreadId
         ? yield* projectionStore
             .getThread(command.organizationReviewTaskThreadId)
-            .pipe(mapDispatchError(command))
+            .pipe(Effect.option, Effect.map(Option.getOrNull))
         : null;
-      if (
-        parentProjection.thread.organization &&
-        command.organizationReview &&
-        (!reviewTarget ||
-          reviewTarget.projectId !== parentProjection.thread.projectId ||
-          reviewTarget.organization?.task?.state !== "awaiting_review" ||
-          !(
-            reviewTarget.organization.parentThreadId === parentProjection.thread.id ||
-            reviewTarget.id === parentProjection.thread.id
-          ))
-      )
-        return yield* new OrchestratorDispatchError({
-          commandId: command.commandId,
-          commandType: command.type,
-          cause:
-            "Review delegation requires an awaiting-review task owned by this lead or its outcome.",
-        });
+      if (parentProjection.thread.organization && command.organizationReview) {
+        const targetTask = reviewTarget?.organization?.task;
+        const targetOwner = targetTask
+          ? yield* projectionStore
+              .getThread(targetTask.ownerThreadId)
+              .pipe(mapDispatchError(command))
+          : null;
+        // A task left blocked by a reviewer whose run failed before this rule existed is still
+        // recoverable: a new review delegation returns it to awaiting review under the new reviewer.
+        const recoverableLegacyBlock =
+          targetTask?.state === "blocked" &&
+          targetTask.revision !== null &&
+          targetOwner?.organization?.role === "reviewer" &&
+          targetOwner.organization.reviewTaskThreadId === reviewTarget?.id;
+        const reviewReason = !reviewTarget
+          ? `Review delegation target ${command.organizationReviewTaskThreadId ?? "(none)"} was not found.`
+          : reviewTarget.projectId !== parentProjection.thread.projectId
+            ? `Review delegation target ${reviewTarget.id} belongs to another project.`
+            : !targetTask
+              ? `Review delegation target ${reviewTarget.id} has no organization task.`
+              : targetTask.state !== "awaiting_review" && !recoverableLegacyBlock
+                ? `Review delegation requires an awaiting-review task; ${reviewTarget.id} is ${targetTask.state}.`
+                : !(
+                      reviewTarget.organization?.parentThreadId === parentProjection.thread.id ||
+                      reviewTarget.id === parentProjection.thread.id
+                    )
+                  ? `Review delegation target ${reviewTarget.id} belongs to lead ${reviewTarget.organization?.parentThreadId ?? "none"}, not this lead.`
+                  : null;
+        if (reviewReason)
+          return yield* new OrchestratorDispatchError({
+            commandId: command.commandId,
+            commandType: command.type,
+            cause: reviewReason,
+          });
+      }
       const targetAdapter = yield* providerAdapters.get(command.modelSelection.instanceId).pipe(
         Effect.mapError(
           (cause) =>
@@ -7038,7 +7057,14 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
             ...reviewTarget,
             organization: {
               ...reviewTarget.organization,
-              task: { ...reviewTarget.organization.task, ownerThreadId: childThreadId },
+              task: {
+                ...reviewTarget.organization.task,
+                ownerThreadId: childThreadId,
+                // A recoverable legacy block returns to awaiting review under the new reviewer.
+                ...(reviewTarget.organization.task.state === "blocked"
+                  ? { state: "awaiting_review" as const }
+                  : {}),
+              },
             },
             updatedAt: now,
           },
@@ -10623,30 +10649,24 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
       if (stored.event.type === "run.updated" && stored.event.payload.status === "failed") {
         const failed = yield* projectionStore.getThreadRecords(threadId, ["runs", "turnItems"]);
         const org = failed.thread.organization;
-        const targetId =
-          org?.role === "reviewer" ? org.reviewTaskThreadId : org?.task ? threadId : undefined;
-        if (targetId) {
-          const target =
-            targetId === threadId ? failed.thread : yield* projectionStore.getThread(targetId);
-          if (target.organization?.task && target.organization.task.state !== "accepted") {
-            const failure = latestRootProviderFailure(stored.event.payload, failed.turnItems);
-            yield* dispatchWithReceipt({
-              type: "thread.metadata.update",
-              commandId: CommandId.make(`organization:failed:${stored.event.payload.id}`),
-              threadId: targetId,
-              organization: {
-                ...target.organization,
-                task: {
-                  ...target.organization.task,
-                  state: "blocked",
-                  notes:
-                    failure?.message ??
-                    "The native worker failed before finishing this task. Inspect its conversation and choose an explicit recovery.",
-                },
-              },
-            });
-          }
-        }
+        // A failed reviewer leaves the submission it was reviewing awaiting review, owned by that
+        // reviewer, so the lead can resume it or delegate a new review. Executor and lead failures
+        // block their own task as before.
+        const nextTask = org?.task
+          ? organizationFailedRunTaskUpdate({
+              role: org.role,
+              task: org.task,
+              failureMessage: latestRootProviderFailure(stored.event.payload, failed.turnItems)
+                ?.message,
+            })
+          : null;
+        if (nextTask)
+          yield* dispatchWithReceipt({
+            type: "thread.metadata.update",
+            commandId: CommandId.make(`organization:failed:${stored.event.payload.id}`),
+            threadId,
+            organization: { ...org!, task: nextTask },
+          });
       }
       const parentThreadId = yield* appOwnedSubagentParentThreadId(threadId);
       if (parentThreadId !== undefined) {

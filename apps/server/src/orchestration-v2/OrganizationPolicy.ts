@@ -147,15 +147,43 @@ export function organizationProblem(input: {
   const actor = actorThreadId ? related(actorThreadId) : undefined;
   if (actorThreadId && !actor?.organization)
     return "The acting conversation has no organization role in this project.";
+  const parent = next?.parentThreadId ? related(next.parentThreadId) : undefined;
+  // A lead may adopt an executor task from a retired parent lead under the same Chief. The task
+  // itself is unchanged: only its reporting parent moves to the adopting lead. A parent absent
+  // from the active snapshot is a deleted lead; the caller checks the Chief before dispatching.
+  const previousParent = previous?.parentThreadId
+    ? threads.get(previous.parentThreadId)
+    : undefined;
+  const previousParentRetired =
+    previousParent === undefined ||
+    previousParent.archivedAt !== null ||
+    previousParent.deletedAt !== null;
+  const previousParentChief =
+    previousParent === undefined
+      ? parent?.organization?.parentThreadId
+      : previousParent.organization?.parentThreadId;
+  const adopting =
+    previous?.role === "executor" &&
+    next?.role === "executor" &&
+    next.parentThreadId !== previous.parentThreadId &&
+    next.parentThreadId === actorThreadId &&
+    actor?.organization?.role === "lead" &&
+    previousParentRetired &&
+    (previousParent === undefined ||
+      (previousParent.organization?.role === "lead" &&
+        previousParent.projectId === thread.projectId)) &&
+    previousParentChief === parent?.organization?.parentThreadId;
   if (!next)
     return previous
       ? "Organization identity is retained for its recorded work; archive the conversation instead."
       : null;
-  if (previous && (previous.role !== next.role || previous.parentThreadId !== next.parentThreadId))
+  if (
+    previous &&
+    (previous.role !== next.role || (previous.parentThreadId !== next.parentThreadId && !adopting))
+  )
     return "A recorded role and its reporting parent cannot be reassigned.";
   if (!previous && actorThreadId)
     return "Only the user can enroll existing conversations; delegate_task creates agent roles.";
-  const parent = next.parentThreadId ? related(next.parentThreadId) : undefined;
   const requiredParent =
     next.role === "lead" ? "chief" : ["executor", "reviewer"].includes(next.role) ? "lead" : null;
   if (requiredParent ? parent?.organization?.role !== requiredParent : next.parentThreadId !== null)
@@ -238,6 +266,7 @@ export function organizationProblem(input: {
     return "Task owner must be an organization conversation in this project.";
   if (
     task.ownerThreadId !== thread.id &&
+    !adopting &&
     !(task.ownerThreadId === next.parentThreadId && ["queued", "blocked"].includes(task.state)) &&
     !(
       owner.organization.role === "reviewer" &&
@@ -271,6 +300,7 @@ export function organizationProblem(input: {
     return "A new submission invalidates the previous review.";
   if (
     ["awaiting_review", "accepted"].includes(task.state) &&
+    !adopting &&
     (!task.revision || !input.checkpointRefs?.includes(task.revision))
   )
     return "Submit and verify actual manifest files before review or acceptance.";
@@ -403,6 +433,27 @@ export function organizationPreparationUnblock(task: OrganizationTask): Organiza
         ? "changes_requested"
         : "queued",
     notes: null,
+  };
+}
+
+/**
+ * The task update for a failed worker run. A failed reviewer must not block the submission it
+ * was reviewing: it stays awaiting review, owned by that reviewer, so the lead can resume it or
+ * delegate a new review. A failed executor or lead blocks its own task as before; accepted
+ * evidence is immutable.
+ */
+export function organizationFailedRunTaskUpdate(input: {
+  readonly role: OrganizationRole | undefined;
+  readonly task: OrganizationTask;
+  readonly failureMessage: string | undefined;
+}): OrganizationTask | null {
+  if (input.role === "reviewer" || input.task.state === "accepted") return null;
+  return {
+    ...input.task,
+    state: "blocked",
+    notes:
+      input.failureMessage ??
+      "The native worker failed before finishing this task. Inspect its conversation and choose an explicit recovery.",
   };
 }
 
@@ -600,7 +651,7 @@ export function organizationInstructions(
     org.role === "chief"
       ? "You are the user's primary conversation. Delegate implementation outcomes to leads using delegate_task; do not implement files yourself. When an outcome changes code, pass delegate_task repository: the repository directory relative to the project root (\".\" when the root is the repository). When new work continues an existing workstream, or a lead's scope turned out too narrow, extend that lead with organization_extend_lead instead of delegating another lead; delegate a new lead only for unrelated work. When a lead's provider is unavailable, extend it with a different target rather than replacing it. Organization updates arrive only when a lead's state changes, an outcome is reviewed or a task is blocked. Report only what changed since your last report, in plain language with project/outcome context, the exact blocker and concrete options. If nothing needs the user, end the turn without a message; never restate unchanged open items. When the user must decide, ask with t3_organization_ask_user (concrete options, one question per decision) and end the turn; the question stays open until they answer, so do not repeat it. Keep updates brief. Never accept outcomes and never ask the user to accept one: the server accepts a reviewed outcome when every pull request it opened has merged (merging is the user's gate), or after its independent review when it opened none."
       : org.role === "lead"
-        ? `Plan and delegate implementation using delegate_task. Each implementation task works in one repository: pass repository relative to the project root (omitted, it uses ${org.task?.repository ? `your repository "${org.task.repository}"` : '"."'}); the server rejects a directory that is not a Git repository and lists the ones it found. Supply dependencyThreadIds atomically in delegate_task when creating dependent implementation work; it waits until dependencies have current independent acceptance. Do not implement or copy child artifacts. Once a child submits, delegate_task(role=review, reviewTaskThreadId=child conversation ID) creates an independent reviewer. After all children are independently accepted, submit your own outcome with t3_organization_task(action=submit); the server aggregates their current manifests. Delegate an independent outcome review targeting your own conversation. Never accept an outcome yourself and do not ask for acceptance: after the independent outcome review the server accepts it once every pull request your outcome opened has merged, or on that review alone when it opened none. Work you start after the review is separate scope with its own review. Your Chief may extend you with a new round and brief: plan and delegate new executors for it; earlier rounds' accepted work stays as it is.`
+        ? `Plan and delegate implementation using delegate_task. Each implementation task works in one repository: pass repository relative to the project root (omitted, it uses ${org.task?.repository ? `your repository "${org.task.repository}"` : '"."'}); the server rejects a directory that is not a Git repository and lists the ones it found. Supply dependencyThreadIds atomically in delegate_task when creating dependent implementation work; it waits until dependencies have current independent acceptance. Do not implement or copy child artifacts. Once a child submits, delegate_task(role=review, reviewTaskThreadId=child conversation ID) creates an independent reviewer. After all children are independently accepted, submit your own outcome with t3_organization_task(action=submit); the server aggregates their current manifests. Delegate an independent outcome review targeting your own conversation. Never accept an outcome yourself and do not ask for acceptance: after the independent outcome review the server accepts it once every pull request your outcome opened has merged, or on that review alone when it opened none. Work you start after the review is separate scope with its own review. Your Chief may extend you with a new round and brief: plan and delegate new executors for it; earlier rounds' accepted work stays as it is. If a parent lead was archived or deleted under the same Chief, adopt its executor task with t3_organization_task(action=adopt) so you can review it and add it to your plan; its submission and review evidence stay as they are.`
         : org.role === "executor"
           ? `Implement only your delegated task in your worktree${thread.worktreePath ? ` ${thread.worktreePath}` : ""}${thread.branch ? ` on branch ${thread.branch}` : ""}, created from repository "${organizationRepository(thread)}" under the project root. Manifest paths are relative to that worktree. Read/claim your task using t3_organization_task, then submit with action=submit and manifest of relative files. A prose completion is not a submission. If blocked, action=block with exact reason. Do not self-review or delegate.`
           : org.role === "reviewer"

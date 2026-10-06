@@ -78,6 +78,7 @@ import * as Path from "effect/Path";
 import * as ChildProcessSpawner from "effect/unstable/process/ChildProcessSpawner";
 
 import * as ProcessRunner from "../processRunner.ts";
+import { userFacingDispatchErrorMessage } from "../orchestration-v2/UserFacingErrors.ts";
 import * as OrganizationWorkspace from "../orchestration-v2/OrganizationWorkspace.ts";
 import * as ProjectStore from "../orchestration-v2/ProjectStore.ts";
 import * as ProviderAdapterRegistry from "../orchestration-v2/ProviderAdapterRegistry.ts";
@@ -1581,7 +1582,9 @@ const make = Effect.gen(function* () {
             Effect.mapError((error) =>
               failure(
                 "orchestration_error",
-                `Unable to create delegated task: ${errorMessage(error)}`,
+                `Unable to create delegated task: ${
+                  userFacingDispatchErrorMessage(error) ?? errorMessage(error)
+                }`,
               ),
             ),
           );

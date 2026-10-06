@@ -1,4 +1,5 @@
 import { organizationTaskContext } from "../../../orchestration-v2/OrganizationTaskContext.ts";
+import { userFacingDispatchErrorMessage } from "../../../orchestration-v2/UserFacingErrors.ts";
 import {
   isServerUserInputRequest,
   SERVER_QUESTION_ID_PREFIX,
@@ -84,12 +85,7 @@ const readQuestion = Effect.fn("mcp.readQuestion")(function* (
 const orchestrationFailure = (error: { readonly message: string; readonly cause?: unknown }) =>
   new OrchestratorMcpFailure({
     code: "orchestration_error",
-    message:
-      typeof error.cause === "string"
-        ? error.cause
-        : error.cause instanceof Error
-          ? error.cause.message
-          : error.message,
+    message: userFacingDispatchErrorMessage(error) ?? error.message,
   });
 
 export const ThreadToolkitHandlersLive = ThreadToolkit.toLayer({
@@ -129,6 +125,61 @@ export const ThreadToolkitHandlersLive = ThreadToolkit.toLayer({
           organization,
           workspace: projection.thread.worktreePath,
           ...organizationTaskContext(projection.thread, snapshot.threads),
+        };
+      }
+      if (input.action === "adopt") {
+        if (caller.organization?.role !== "lead")
+          return yield* new OrchestratorMcpFailure({
+            code: "capability_denied",
+            message: "Only a lead can adopt an executor task.",
+          });
+        if (organization.role !== "executor")
+          return yield* new OrchestratorMcpFailure({
+            code: "invalid_request",
+            message: `Adoption applies to an executor task; this conversation is a ${organization.role}.`,
+          });
+        if (projection.thread.id === caller.id)
+          return yield* new OrchestratorMcpFailure({
+            code: "invalid_request",
+            message: "A lead cannot adopt its own task.",
+          });
+        const currentParent = organization.parentThreadId
+          ? yield* threads
+              .getThreadShell(organization.parentThreadId)
+              .pipe(Effect.mapError(unavailable))
+          : null;
+        if (currentParent?.archivedAt === null && currentParent?.deletedAt === null)
+          return yield* new OrchestratorMcpFailure({
+            code: "invalid_request",
+            message: `Adoption requires the task's current parent lead to be archived or deleted; ${organization.parentThreadId ?? "(none)"} is still active.`,
+          });
+        if (
+          currentParent !== null &&
+          currentParent.organization?.parentThreadId !== caller.organization.parentThreadId
+        )
+          return yield* new OrchestratorMcpFailure({
+            code: "invalid_request",
+            message:
+              "Adoption requires the retired lead and the adopting lead to report to the same Chief.",
+          });
+        yield* threads
+          .dispatch({
+            type: "thread.metadata.update",
+            commandId: CommandId.make(`organization:${caller.id}:${input.clientRequestId}`),
+            threadId: projection.thread.id,
+            organizationActorThreadId: caller.id,
+            organization: { ...organization, parentThreadId: caller.id },
+          })
+          .pipe(Effect.mapError(orchestrationFailure));
+        const adopted = yield* threads
+          .getThreadShell(projection.thread.id)
+          .pipe(Effect.mapError(unavailable));
+        const snapshot = yield* threads.getShellSnapshot().pipe(Effect.mapError(unavailable));
+        return {
+          ...organizationTaskContext(adopted ?? projection.thread, snapshot.threads),
+          threadId: projection.thread.id,
+          organization: adopted?.organization ?? null,
+          workspace: projection.thread.worktreePath,
         };
       }
       const old = organization.task;
