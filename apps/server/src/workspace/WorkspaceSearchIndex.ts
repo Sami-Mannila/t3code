@@ -1,4 +1,7 @@
+// @effect-diagnostics nodeBuiltinImport:off
 import * as NodeModule from "node:module";
+import * as NodeOS from "node:os";
+import * as NodePath from "node:path";
 
 import type {
   DirItem,
@@ -301,6 +304,24 @@ function withDirectoryAncestors(entries: ReadonlyArray<ProjectEntry>): ProjectEn
   return [...entryByPath.values()];
 }
 
+/**
+ * fff refuses to index the filesystem root or the home directory unless asked,
+ * because a watcher over either floods the process with unrelated fs events.
+ * Projects rooted there still get an index, without a watcher: refreshes after
+ * turns and file writes rescan it lazily instead.
+ */
+export function finderScanOptions(cwd: string, homeDir: string) {
+  const resolved = NodePath.resolve(cwd);
+  const isFsRoot = NodePath.parse(resolved).root === resolved;
+  const isHomeDir = resolved === NodePath.resolve(homeDir);
+  if (!isFsRoot && !isHomeDir) return {};
+  return {
+    ...(isFsRoot ? { enableFsRootScanning: true } : {}),
+    ...(isHomeDir ? { enableHomeDirScanning: true } : {}),
+    disableWatch: true,
+  };
+}
+
 const createFinder = Effect.fn("WorkspaceSearchIndex.createFinder")(function* (
   cwd: string,
   variant: WorkspaceSearchIndexVariant,
@@ -315,8 +336,7 @@ const createFinder = Effect.fn("WorkspaceSearchIndex.createFinder")(function* (
         // composer path search, file picker) keep the lightweight index.
         disableContentIndexing: variant !== "content",
         aiMode: false,
-        // Root and home directory scanning stay at fff's default (off): a
-        // watcher over either floods the server with unrelated fs events.
+        ...finderScanOptions(cwd, NodeOS.homedir()),
       }),
     catch: (cause) =>
       new WorkspaceSearchIndexCreateFailed({

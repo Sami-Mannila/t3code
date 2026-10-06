@@ -430,7 +430,7 @@ it.layer(TestLayer, { excludeTestServices: true })("WorkspaceEntries", (it) => {
       }),
     );
 
-    it.effect("defers the rescan after refresh to the next read of a live index", () =>
+    it.effect("answers stale reads at once and rescans once in the background", () =>
       Effect.gen(function* () {
         const cwd = yield* makeTempDir({ prefix: "t3code-workspace-lazy-refresh-" });
         yield* writeTextFile(cwd, "src/index.ts", "export {};\n");
@@ -449,12 +449,29 @@ it.layer(TestLayer, { excludeTestServices: true })("WorkspaceEntries", (it) => {
         yield* workspaceEntries.refresh(cwd);
         expect(scanSpy).not.toHaveBeenCalled();
 
-        const listed = yield* workspaceEntries.list({ cwd });
+        // Hold the rescan open: reads must not wait for it, and must not start another.
+        let releaseScan!: () => void;
+        const scanHeld = new Promise<void>((resolve) => {
+          releaseScan = resolve;
+        });
+        const waitForIndexReady = FileFinder.prototype.waitForIndexReady;
+        vi.spyOn(FileFinder.prototype, "waitForIndexReady").mockImplementationOnce(async function (
+          this: FileFinder,
+          timeoutMs?: number,
+        ) {
+          await scanHeld;
+          return waitForIndexReady.call(this, timeoutMs);
+        });
+        yield* workspaceEntries.list({ cwd });
+        yield* workspaceEntries.search({ cwd, query: "added", limit: 10 });
         expect(scanSpy).toHaveBeenCalledTimes(1);
+
+        releaseScan();
+        yield* workspaceEntries.drainRescans;
+        const listed = yield* workspaceEntries.list({ cwd });
         expect(listed.entries).toEqual(
           expect.arrayContaining([{ path: "src/added.ts", kind: "file" }]),
         );
-        yield* workspaceEntries.search({ cwd, query: "added", limit: 10 });
         expect(scanSpy).toHaveBeenCalledTimes(1);
 
         // Invalidation drops the index; the next read builds a new one.
@@ -480,6 +497,9 @@ it.layer(TestLayer, { excludeTestServices: true })("WorkspaceEntries", (it) => {
         });
         yield* workspaceEntries.refresh(cwd);
 
+        // The stale read starts the rescan; its failure drops the index.
+        yield* workspaceEntries.list({ cwd });
+        yield* workspaceEntries.drainRescans;
         yield* workspaceEntries.list({ cwd });
         expect(createSpy).toHaveBeenCalledTimes(2);
       }),

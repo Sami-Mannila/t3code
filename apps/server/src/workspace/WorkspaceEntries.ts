@@ -2,6 +2,7 @@
 import * as NodeFSP from "node:fs/promises";
 
 import * as Context from "effect/Context";
+import * as Deferred from "effect/Deferred";
 import * as Effect from "effect/Effect";
 import * as Layer from "effect/Layer";
 import * as Path from "effect/Path";
@@ -102,10 +103,19 @@ export class WorkspaceEntries extends Context.Service<
     readonly searchContents: (
       input: ProjectSearchContentsInput,
     ) => Effect.Effect<ProjectSearchContentsResult, WorkspaceEntriesError>;
-    /** Marks the workspace's live indexes stale; the next read rescans them. */
-    readonly refresh: (cwd: string) => Effect.Effect<void>;
+    /**
+     * Marks the workspace's live indexes stale; the next read starts a
+     * background rescan. `immediate` rescans live indexes now instead, for a
+     * write the same user is about to read back.
+     */
+    readonly refresh: (
+      cwd: string,
+      options?: { readonly immediate?: boolean },
+    ) => Effect.Effect<void>;
     /** Releases the workspace's indexes and their watchers, e.g. after its checkout is removed. */
     readonly invalidate: (cwd: string) => Effect.Effect<void>;
+    /** Waits for background rescans started by reads of stale indexes. */
+    readonly drainRescans: Effect.Effect<void>;
   }
 >()("t3/workspace/WorkspaceEntries") {}
 
@@ -147,19 +157,25 @@ export const make = Effect.gen(function* () {
     return yield* workspacePaths.normalizeWorkspaceRoot(cwd);
   });
 
-  // Turns and file writes only mark an index stale. The rescan waits for the
-  // next read, so finished turns in workspaces nobody is browsing cost nothing
-  // and do not keep their index alive past its idle TTL.
+  // Turns and file writes only mark an index stale. The next read answers from
+  // the current index and starts one background rescan, so finished turns in
+  // workspaces nobody is browsing cost nothing and do not keep their index
+  // alive past its idle TTL, and no read waits for a scan.
   const staleIndexKeys = new Set<string>();
+  const rescans = new Map<string, Deferred.Deferred<void>>();
+  const rescanScope = yield* Effect.scope;
 
   const refresh: WorkspaceEntries["Service"]["refresh"] = Effect.fn("WorkspaceEntries.refresh")(
-    function* (cwd) {
+    function* (cwd, options) {
       const normalizedCwd = yield* normalizeWorkspaceRoot(cwd).pipe(
         Effect.orElseSucceed(() => cwd),
       );
       for (const variant of WorkspaceSearchIndex.WORKSPACE_SEARCH_INDEX_VARIANTS) {
         const indexKey = WorkspaceSearchIndex.workspaceSearchIndexKey(normalizedCwd, variant);
-        if (yield* RcMap.has(workspaceSearchIndexes.rcMap, indexKey)) {
+        if (options?.immediate) {
+          staleIndexKeys.delete(indexKey);
+          yield* rescan(indexKey);
+        } else if (yield* RcMap.has(workspaceSearchIndexes.rcMap, indexKey)) {
           staleIndexKeys.add(indexKey);
         }
       }
@@ -176,8 +192,7 @@ export const make = Effect.gen(function* () {
     }
   });
 
-  const rescanIfStale = Effect.fn("WorkspaceEntries.rescanIfStale")(function* (indexKey: string) {
-    if (!staleIndexKeys.delete(indexKey)) return;
+  const rescan = Effect.fn("WorkspaceEntries.rescan")(function* (indexKey: string) {
     if (!(yield* RcMap.has(workspaceSearchIndexes.rcMap, indexKey))) return;
     const recoverRefreshFailure = (
       cause:
@@ -187,7 +202,7 @@ export const make = Effect.gen(function* () {
     ) =>
       Effect.gen(function* () {
         yield* Effect.logWarning("Failed to refresh workspace search index", { indexKey, cause });
-        // The read that follows builds a fresh index.
+        // The next read builds a fresh index.
         yield* workspaceSearchIndexes.invalidate(indexKey);
       });
     yield* Effect.gen(function* () {
@@ -203,16 +218,36 @@ export const make = Effect.gen(function* () {
     );
   });
 
+  /** One rescan per index at a time; staleness marked during it waits for the next read. */
+  const startRescanIfStale = (indexKey: string) =>
+    Effect.suspend(() => {
+      if (rescans.has(indexKey) || !staleIndexKeys.delete(indexKey)) return Effect.void;
+      const done = Deferred.makeUnsafe<void>();
+      rescans.set(indexKey, done);
+      return rescan(indexKey).pipe(
+        Effect.ensuring(
+          Effect.sync(() => rescans.delete(indexKey)).pipe(
+            Effect.andThen(Deferred.succeed(done, undefined)),
+          ),
+        ),
+        Effect.forkIn(rescanScope),
+        Effect.asVoid,
+      );
+    });
+
+  const drainRescans: WorkspaceEntries["Service"]["drainRescans"] = Effect.suspend(() =>
+    Effect.forEach([...rescans.values()], Deferred.await, { discard: true }),
+  );
+
   const withIndex = <A, E>(
     indexKey: string,
     use: (searchIndex: WorkspaceSearchIndex.WorkspaceSearchIndex["Service"]) => Effect.Effect<A, E>,
   ) =>
-    rescanIfStale(indexKey).pipe(
-      Effect.andThen(
-        Effect.gen(function* () {
-          return yield* use(yield* WorkspaceSearchIndex.WorkspaceSearchIndex);
-        }).pipe(Effect.provide(workspaceSearchIndexes.get(indexKey))),
-      ),
+    Effect.gen(function* () {
+      return yield* use(yield* WorkspaceSearchIndex.WorkspaceSearchIndex);
+    }).pipe(
+      Effect.provide(workspaceSearchIndexes.get(indexKey)),
+      Effect.tap(() => startRescanIfStale(indexKey)),
     );
 
   const browse: WorkspaceEntries["Service"]["browse"] = Effect.fn("WorkspaceEntries.browse")(
@@ -370,7 +405,15 @@ export const make = Effect.gen(function* () {
     },
   );
 
-  return WorkspaceEntries.of({ browse, invalidate, list, refresh, search, searchContents });
+  return WorkspaceEntries.of({
+    browse,
+    drainRescans,
+    invalidate,
+    list,
+    refresh,
+    search,
+    searchContents,
+  });
 });
 
 export const layer = Layer.effect(WorkspaceEntries, make).pipe(
