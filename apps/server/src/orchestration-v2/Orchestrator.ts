@@ -390,6 +390,8 @@ function commandThreadId(command: OrchestrationV2ServerCommand): ThreadId {
     case "thread.create":
     case "thread.archive":
     case "thread.unarchive":
+    case "thread.workstream.archive":
+    case "thread.workstream.unarchive":
     case "thread.delete":
     case "thread.settle":
     case "thread.auto-settle":
@@ -2287,6 +2289,9 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
     const movesForward =
       thread.lastVisitedAt === null ||
       DateTime.toEpochMillis(visitedAt.value) > DateTime.toEpochMillis(thread.lastVisitedAt);
+    // A watermark at or behind the stored one (a woke-at acknowledgement, a
+    // stale device) changes nothing, so it records only its receipt.
+    if (!movesForward) return;
     // Viewing a thread changes read state only. Loading its transcript (or
     // bumping updatedAt) makes a routine read receipt scale with its history.
     yield* emit(
@@ -2297,7 +2302,7 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
       threadId: command.threadId,
       providerInstanceId: thread.providerInstanceId,
       occurredAt: yield* DateTime.now,
-      payload: movesForward ? { ...thread, lastVisitedAt: visitedAt.value } : thread,
+      payload: { ...thread, lastVisitedAt: visitedAt.value },
     });
   });
 
@@ -9925,6 +9930,14 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
           }),
         );
       }
+      case "thread.workstream.archive":
+      case "thread.workstream.unarchive":
+        // ThreadManagementService expands a workstream into per-thread commands.
+        return yield* new OrchestratorDispatchError({
+          commandId: command.commandId,
+          commandType: command.type,
+          cause: "Workstream commands are dispatched through thread management.",
+        });
       case "thread.archive":
       case "thread.unarchive":
       case "thread.settle":
@@ -10171,9 +10184,12 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
 
     const plan = yield* dispatchOnce(command).pipe(
       Effect.flatMap((planned) =>
-        // A settle that finds the provider already ended everything has
-        // nothing to record, which is its expected outcome, not a failure.
-        planned.events.length > 0 || command.type === "thread.background-work.settle"
+        // A settle that finds the provider already ended everything, or a
+        // visit behind the stored watermark, has nothing to record, which is
+        // its expected outcome, not a failure.
+        planned.events.length > 0 ||
+        command.type === "thread.background-work.settle" ||
+        command.type === "thread.visit"
           ? Effect.succeed(planned)
           : Effect.fail(
               new OrchestratorDispatchError({

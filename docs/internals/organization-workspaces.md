@@ -27,6 +27,12 @@ repositories, so worktrees are tied to tasks, not to the root.
   without deleting. A folder with other contents is never deleted;
   preparation fails and names it. Git runs in the C locale so its output can be matched. `worktree add` gets five minutes, since a
   large repository's checkout can take longer than the other Git commands' 30 seconds.
+- Storage cleanup's idle-worktree pass
+  ([`idleWorktreeRemovable`](../../apps/server/src/storageCleanup.ts)) must not remove an
+  executor checkout that review or outcome consolidation still reads: tasks awaiting review or
+  accepted keep their worktree until the lead's own task is accepted or either thread is
+  archived. Removal and preparation take the same workspace lease, and removal re-checks for a
+  queued or active run as its last step, so a run that is preparing keeps its checkout.
 - A Git exit during preparation is usually deterministic, so the effect worker fails the run on the
   first attempt, with the command's stderr in the task notes that reach the parent and the Chief.
   Lock contention (`index.lock`, `could not lock`, `cannot lock ref`), typically from another

@@ -2515,6 +2515,17 @@ export const OrchestrationV2Command = Schema.Union([
     commandId: CommandId,
     threadId: ThreadId,
   }),
+  /**
+   * Archives or restores a lead whose outcome the user accepted, together with
+   * every executor and reviewer reporting to it. User-only.
+   */
+  Schema.Struct({
+    type: Schema.Literals(["thread.workstream.archive", "thread.workstream.unarchive"]),
+    commandId: CommandId,
+    threadId: ThreadId,
+    /** Set when an organization agent issues the command; always refused. */
+    organizationActorThreadId: Schema.optional(ThreadId),
+  }),
   Schema.Struct({
     type: Schema.Literal("thread.delete"),
     commandId: CommandId,

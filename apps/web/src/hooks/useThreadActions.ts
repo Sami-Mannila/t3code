@@ -254,6 +254,12 @@ export function useThreadActions() {
   const deleteThreadMutation = useAtomCommand(threadEnvironment.delete, {
     reportFailure: false,
   });
+  const archiveWorkstreamMutation = useAtomCommand(threadEnvironment.archiveWorkstream, {
+    reportFailure: false,
+  });
+  const unarchiveWorkstreamMutation = useAtomCommand(threadEnvironment.unarchiveWorkstream, {
+    reportFailure: false,
+  });
   const settleThreadMutation = useAtomCommand(threadEnvironment.settle, {
     reportFailure: false,
   });
@@ -344,6 +350,32 @@ export function useThreadActions() {
       return result;
     },
     [router, unarchiveThreadMutation],
+  );
+
+  /** Archives an accepted lead with its executors and reviewers. */
+  const archiveWorkstream = useCallback(
+    async (lead: ScopedThreadRef) => {
+      const result = await archiveWorkstreamMutation({
+        environmentId: lead.environmentId,
+        input: { threadId: lead.threadId },
+      });
+      if (result._tag === "Success") refreshArchivedThreadsForEnvironment(lead.environmentId);
+      return result;
+    },
+    [archiveWorkstreamMutation],
+  );
+
+  /** Restores an archived lead with its executors and reviewers. */
+  const unarchiveWorkstream = useCallback(
+    async (lead: ScopedThreadRef) => {
+      const result = await unarchiveWorkstreamMutation({
+        environmentId: lead.environmentId,
+        input: { threadId: lead.threadId },
+      });
+      if (result._tag === "Success") refreshArchivedThreadsForEnvironment(lead.environmentId);
+      return result;
+    },
+    [unarchiveWorkstreamMutation],
   );
 
   const archiveThread = useCallback(
@@ -961,6 +993,8 @@ export function useThreadActions() {
     () => ({
       archiveThread,
       unarchiveThread,
+      archiveWorkstream,
+      unarchiveWorkstream,
       deleteThread,
       confirmAndDeleteThread,
       settleThread,
@@ -977,6 +1011,8 @@ export function useThreadActions() {
     }),
     [
       archiveThread,
+      archiveWorkstream,
+      unarchiveWorkstream,
       confirmAndDeleteThread,
       confirmAndUnpinThread,
       deleteThread,

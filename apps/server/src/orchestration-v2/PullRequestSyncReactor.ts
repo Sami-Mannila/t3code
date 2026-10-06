@@ -84,6 +84,55 @@ function snapshotFieldsEqual(left: SnapshotFields, right: SnapshotFields): boole
   );
 }
 
+/** The picture a host serves at `/<login>.png` when its API named no avatar. */
+function isLoginFallbackAvatar(url: string, login: string): boolean {
+  try {
+    return new URL(url).pathname === `/${login}.png`;
+  } catch {
+    return false;
+  }
+}
+
+function withoutQuery(url: string): string {
+  const index = url.indexOf("?");
+  return index === -1 ? url : url.slice(0, index);
+}
+
+/**
+ * Fields a read could not answer keep what the link already holds, so a sync writes only what
+ * the host actually changed. GitHub reports mergeability as unknown until it has computed it,
+ * and its read paths disagree on an author's avatar: one re-signs the URL, another falls back
+ * to `/<login>.png`. None of that is news about the pull request.
+ */
+function reconcileSnapshotFields(
+  previous: ThreadPullRequestSnapshot | null,
+  fields: SnapshotFields,
+): SnapshotFields {
+  if (previous === null) return fields;
+  let next = fields;
+  if (
+    (next.mergeability === undefined || next.mergeability === "unknown") &&
+    previous.mergeability !== undefined &&
+    previous.mergeability !== "unknown"
+  ) {
+    next = { ...next, mergeability: previous.mergeability };
+  }
+  const previousAvatar = previous.author?.avatarUrl ?? null;
+  const author = next.author;
+  if (
+    author != null &&
+    previousAvatar !== null &&
+    previous.author?.login === author.login &&
+    author.avatarUrl !== previousAvatar &&
+    (author.avatarUrl === null ||
+      withoutQuery(author.avatarUrl) === withoutQuery(previousAvatar) ||
+      isLoginFallbackAvatar(author.avatarUrl, author.login))
+  ) {
+    next = { ...next, author: { ...author, avatarUrl: previousAvatar } };
+  }
+  return next;
+}
+
 function stacksEqual(
   left: ThreadPullRequestStack | null,
   right: ThreadPullRequestStack | null,
@@ -191,9 +240,10 @@ export const make = Effect.gen(function* () {
     ) {
       const { thread, link } = entry;
       const nextStack = fetchedStack === null ? link.stack : fetchedStack.stack;
+      const nextFields = reconcileSnapshotFields(link.snapshot, fields);
       const changed =
         link.snapshot === null ||
-        !snapshotFieldsEqual(link.snapshot, fields) ||
+        !snapshotFieldsEqual(link.snapshot, nextFields) ||
         !stacksEqual(link.stack, nextStack);
       // Persist discovered siblings before a terminal snapshot can trigger settlement.
       for (const layer of fetchedStack?.stack?.layers ?? []) {
@@ -234,7 +284,7 @@ export const make = Effect.gen(function* () {
           host: normalizeThreadPullRequestKey(link).host,
           repository: link.repository,
           number: link.number,
-          snapshot: { ...fields, syncedAt: nowIso },
+          snapshot: { ...nextFields, syncedAt: nowIso },
           stack: nextStack,
         });
       }
@@ -261,7 +311,10 @@ export const make = Effect.gen(function* () {
         entries.some(
           (entry) =>
             entry.link.snapshot === null ||
-            !snapshotFieldsEqual(entry.link.snapshot, fields) ||
+            !snapshotFieldsEqual(
+              entry.link.snapshot,
+              reconcileSnapshotFields(entry.link.snapshot, fields),
+            ) ||
             (summary.stack !== undefined &&
               (entry.link.stack?.number ?? null) !== (summary.stack?.number ?? null)),
         );

@@ -97,6 +97,65 @@ export function storageCleanupThreadIdle(thread: OrchestrationV2ThreadShell, now
   );
 }
 
+/**
+ * Owner policy: an idle worktree is removed once its thread has been quiet this
+ * long, for organization threads and for settled ordinary threads. The branch
+ * stays, and the next turn checks the worktree out again (ProviderTurnStartService
+ * for ordinary threads, OrganizationWorkspace.prepare for organization executors).
+ */
+export const IDLE_WORKTREE_RETENTION_MS = 60 * 60_000;
+const IDLE_WORKTREE_SWEEP_INTERVAL = "10 minutes";
+const IDLE_WORKTREE_REMOVALS_PER_PASS = 3;
+/** Ignored directories a reinstall reproduces; any other ignored output keeps the worktree. */
+const REPRODUCIBLE_IGNORED_PATH = /(^|\/)(node_modules|__pycache__|\.venv)\/$/;
+
+/**
+ * Whether an idle thread may lose its worktree. Unsettled ordinary threads keep
+ * theirs. Reviewers and leads never need one. An executor keeps its worktree
+ * while its task is being worked on, and while a submitted or accepted task can
+ * still be reviewed or consolidated from it: until its lead's outcome is
+ * accepted, or the lead or executor is archived. `threads` resolves the lead.
+ */
+export function idleWorktreeRemovable(
+  thread: OrchestrationV2ThreadShell,
+  now: number,
+  threads: ReadonlyMap<string, OrchestrationV2ThreadShell>,
+): boolean {
+  if (!storageCleanupThreadIdle(thread, now)) return false;
+  if (storageCleanupActivityAt(thread) > now - IDLE_WORKTREE_RETENTION_MS) return false;
+  const organization = thread.organization;
+  if (organization == null)
+    return thread.settledOverride === "settled" || thread.settledAt !== null;
+  if (organization.role === "reviewer" || organization.role === "lead") return true;
+  if (organization.role !== "executor") return false;
+  const state = organization.task?.state;
+  if (state === "working") return false;
+  if (state !== "awaiting_review" && state !== "accepted") return true;
+  if (thread.archivedAt !== null) return true;
+  const lead =
+    organization.parentThreadId === null ? undefined : threads.get(organization.parentThreadId);
+  return (
+    lead !== undefined &&
+    (lead.archivedAt !== null || lead.organization?.task?.state === "accepted")
+  );
+}
+
+/**
+ * Entries of `git status --porcelain=v1 -z --ignored` that are not reproducible
+ * caches: modified or untracked files and ignored build output.
+ */
+const threadsById = (threads: ReadonlyArray<OrchestrationV2ThreadShell>) =>
+  new Map<string, OrchestrationV2ThreadShell>(threads.map((thread) => [thread.id, thread]));
+
+export function unsavedWorktreeEntries(porcelain: string): ReadonlyArray<string> {
+  return porcelain
+    .split("\0")
+    .filter((entry) => entry.length > 3)
+    .filter(
+      (entry) => !(entry.startsWith("!! ") && REPRODUCIBLE_IGNORED_PATH.test(entry.slice(3))),
+    );
+}
+
 /** PR metadata refreshes must not reset the inactivity clock. */
 export function storageCleanupActivityAt(thread: OrchestrationV2ThreadShell): number {
   return Math.max(
@@ -398,6 +457,133 @@ export const make = Effect.gen(function* () {
     }
   });
 
+  const unsavedEntries = (worktreePath: string) =>
+    git
+      .execute({
+        operation: "StorageCleanup.idleWorktreeStatus",
+        cwd: worktreePath,
+        args: ["status", "--porcelain=v1", "-z", "--ignored", "--untracked-files=normal"],
+        maxOutputBytes: 64 * 1024,
+      })
+      .pipe(
+        Effect.map((result) =>
+          result.stdoutTruncated ? ["<truncated>"] : unsavedWorktreeEntries(result.stdout),
+        ),
+      );
+
+  /**
+   * Removes the worktree of one idle thread when nothing in it would be lost:
+   * the checkout is clean and holds no untracked files or ignored output beyond
+   * reproducible caches. Never forces; the branch is kept.
+   */
+  const removeIdleWorktree = Effect.fn("StorageCleanup.removeIdleWorktree")(function* (
+    thread: OrchestrationV2ThreadShell,
+    root: string,
+    now: number,
+  ) {
+    const worktreePath = path.resolve(thread.worktreePath!);
+    const snapshot = yield* readThreads();
+    const project = snapshot.projects.find((entry) => entry.id === thread.projectId);
+    if (project === undefined || thread.branch === null) return false;
+    if (!inside(root, worktreePath) || !(yield* fs.exists(worktreePath))) return false;
+    if ((yield* fs.realPath(worktreePath)) !== worktreePath) return false;
+    if (yield* containsProjectRoot(worktreePath, snapshot.projects)) return false;
+    // A linked worktree has a .git file. Never remove a main checkout.
+    if ((yield* fs.stat(path.join(worktreePath, ".git"))).type !== "File") return false;
+    if (hasTerminal(worktreePath)) return false;
+    const status = yield* git.statusDetailsLocal(worktreePath);
+    if (!status.isRepo || status.branch !== thread.branch) return false;
+    if ((yield* unsavedEntries(worktreePath)).length > 0) return false;
+    const head = yield* git.resolveCommit({ cwd: worktreePath, revision: "HEAD" });
+    const sessionRows = yield* sql<{ payload_json: string }>`
+      SELECT payload_json FROM orchestration_v2_projection_provider_sessions
+      WHERE status != 'stopped'
+    `;
+    const sessions = yield* Effect.forEach(sessionRows, (row) =>
+      decodeCleanupSession(row.payload_json),
+    );
+    if (
+      sessions.some((session) => {
+        const cwd = path.resolve(session.cwd);
+        return cwd === worktreePath || inside(worktreePath, cwd);
+      })
+    )
+      return false;
+    // Re-read after the Git calls so a queued turn or a new thread on this path cancels it.
+    const latestThreads = (yield* readThreads()).threads;
+    const latest = latestThreads.filter(
+      (entry) => entry.worktreePath !== null && path.resolve(entry.worktreePath) === worktreePath,
+    );
+    if (
+      latest.length !== 1 ||
+      latest[0]!.id !== thread.id ||
+      !idleWorktreeRemovable(latest[0]!, now, threadsById(latestThreads)) ||
+      storageCleanupActivityAt(latest[0]!) !== storageCleanupActivityAt(thread) ||
+      hasTerminal(worktreePath)
+    )
+      return false;
+    if ((yield* unsavedEntries(worktreePath)).length > 0) return false;
+    if (
+      (yield* git.resolveCommit({ cwd: worktreePath, revision: "HEAD" })).commitSha !==
+      head.commitSha
+    )
+      return false;
+    // Last step under the lease: turn starts and organization preparation take the
+    // same lease to ensure the checkout, and their run is persisted before they do.
+    const busy = yield* sql`
+      SELECT 1 FROM orchestration_v2_projection_runs
+      WHERE thread_id = ${thread.id}
+        AND status IN ('queued', 'preparing', 'starting', 'running', 'waiting')
+      UNION ALL
+      SELECT 1 FROM orchestration_v2_projection_runtime_requests
+      WHERE thread_id = ${thread.id} AND status = 'pending'
+      LIMIT 1
+    `;
+    if (busy.length > 0) return false;
+    const repositoryRoot = organizationRepositoryRoot(project.workspaceRoot, thread);
+    yield* git.removeWorktree({ cwd: repositoryRoot, path: worktreePath, force: false });
+    yield* gitManager.invalidateStatus(repositoryRoot);
+    yield* workspaceEntries.invalidate(worktreePath);
+    yield* Effect.logInfo("storage cleanup removed idle worktree", {
+      threadId: thread.id,
+      worktreePath,
+      branch: thread.branch,
+    });
+    return true;
+  });
+
+  /** One pass: a few idle worktrees, one at a time. */
+  const cleanIdleWorktrees = Effect.fn("StorageCleanup.cleanIdleWorktrees")(function* (
+    now: number,
+  ) {
+    if (!(yield* fs.exists(config.worktreesDir))) return 0;
+    const root = yield* fs.realPath(config.worktreesDir);
+    const { threads } = yield* readThreads();
+    const byId = threadsById(threads);
+    const sharedPaths = Map.groupBy(
+      threads.filter((thread) => thread.worktreePath !== null),
+      (thread) => path.resolve(thread.worktreePath!),
+    );
+    let removed = 0;
+    for (const group of sharedPaths.values()) {
+      if (removed >= IDLE_WORKTREE_REMOVALS_PER_PASS) break;
+      const thread = group[0]!;
+      if (group.length !== 1 || !idleWorktreeRemovable(thread, now, byId)) continue;
+      const worktreePath = path.resolve(thread.worktreePath!);
+      const didRemove = yield* removeIdleWorktree(thread, root, now).pipe(
+        (effect) => withWorkspaceLease(worktreePath, effect),
+        Effect.catch((error) =>
+          Effect.logDebug("storage cleanup kept idle worktree", {
+            threadId: thread.id,
+            error,
+          }).pipe(Effect.as(false)),
+        ),
+      );
+      if (didRemove) removed += 1;
+    }
+    return removed;
+  });
+
   const cleanFiles = Effect.fn("StorageCleanup.cleanFiles")(function* (
     root: string,
     days: number | null,
@@ -487,6 +673,18 @@ export const make = Effect.gen(function* () {
         ),
     );
     yield* forkParked(
+      Clock.currentTimeMillis.pipe(
+        Effect.flatMap(cleanIdleWorktrees),
+        Effect.catchCause((cause) =>
+          Cause.hasInterruptsOnly(cause)
+            ? Effect.failCause(cause)
+            : Effect.logWarning("idle worktree cleanup failed", { cause }),
+        ),
+        Effect.repeat(Schedule.spaced(IDLE_WORKTREE_SWEEP_INTERVAL)),
+        Effect.asVoid,
+      ),
+    );
+    yield* forkParked(
       Stream.runForEach(changes, (settings) => {
         if (
           Equal.equals(settings.storageCleanup, lastSettings.storageCleanup) &&
@@ -511,5 +709,5 @@ export const make = Effect.gen(function* () {
       ),
     );
   });
-  return { start, drain: worker.drain };
+  return { start, drain: worker.drain, cleanIdleWorktrees };
 });

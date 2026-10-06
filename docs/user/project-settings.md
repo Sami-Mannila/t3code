@@ -105,6 +105,13 @@ prevent removal. Branches and thread history stay; starting another turn recreat
 Merge cleanup requires the commits to be included in the remote default branch, so squash merges
 may need the inactivity rule instead.
 
+Separately from these policies, the server removes a worktree after an hour without activity
+when its thread is settled, or when it belongs to an organization reviewer, lead, or executor
+whose task is not in progress. An executor's submitted or accepted work stays until its lead's
+outcome is accepted or either thread is archived. Unsettled threads keep their worktrees, and
+the same safety checks apply: uncommitted changes, untracked files, and ignored output other
+than `node_modules`, `__pycache__`, or `.venv` keep the checkout.
+
 Enable **Delete worktrees with deleted threads** to remove safe worktrees after their last
 thread is deleted, including archived threads and worktrees left by earlier deletions. The
 server waits for sessions and terminals to stop and retries skipped worktrees after restart.

@@ -9,7 +9,7 @@ import type {
 } from "./ProjectionStore.ts";
 import {
   type ChatAttachment,
-  type CommandId,
+  CommandId,
   MessageId,
   type ModelSelection,
   type OrchestrationV2Actor,
@@ -38,10 +38,13 @@ import * as Option from "effect/Option";
 import * as Schema from "effect/Schema";
 
 import * as Orchestrator from "./Orchestrator.ts";
+import { workstreamThreads } from "@t3tools/shared/organizationWorkstream";
 import { projectTurnItemForDetail } from "./WireProjection.ts";
 import * as LegacyV1ThreadImporter from "./legacy/LegacyV1ThreadImporter.ts";
 
 export type ThreadManagementSendMode = "auto" | "queue" | "steer" | "restart";
+
+const WORKSTREAM_BUSY_STATUSES = new Set(["queued", "preparing", "starting", "running", "waiting"]);
 
 export interface ThreadManagementProvenance {
   readonly createdBy: OrchestrationV2Actor;
@@ -466,8 +469,77 @@ const make = Effect.gen(function* () {
       Effect.andThen(orchestrator.getThreadSnapshotWindow(threadId, options)),
     );
 
+  /**
+   * Archives or restores a lead together with every executor and reviewer
+   * reporting to it, through the ordinary per-thread archive commands, deepest
+   * threads first and the lead last in both directions, so an interrupted
+   * restore leaves the lead archived and restoring the workstream stays
+   * offered. Restoring re-derives the subtree, so threads archived on their own
+   * beforehand come back with it. Each per-thread command id derives from the workstream
+   * command, and threads already in the target state are skipped, so a retry
+   * finishes an interrupted run without replaying anything.
+   */
+  const dispatchWorkstream = (
+    command: Extract<
+      OrchestrationV2ServerCommand,
+      { readonly type: "thread.workstream.archive" | "thread.workstream.unarchive" }
+    >,
+  ) =>
+    Effect.gen(function* () {
+      const reject = (cause: string) =>
+        new Orchestrator.OrchestratorDispatchError({
+          commandId: command.commandId,
+          commandType: command.type,
+          cause,
+        });
+      if (command.organizationActorThreadId !== undefined)
+        return yield* reject("Only the user can archive or restore a workstream.");
+      const [active, archived] = yield* Effect.all([
+        orchestrator.getShellSnapshot(),
+        orchestrator.getShellSnapshot({ location: "archive" }),
+      ]);
+      const threads = [...active.threads, ...archived.threads];
+      const lead = threads.find((thread) => thread.id === command.threadId);
+      const archiving = command.type === "thread.workstream.archive";
+      if (lead?.organization?.role !== "lead")
+        return yield* reject("Only a lead's workstream can be archived or restored.");
+      if (archiving && lead.organization.task?.state !== "accepted")
+        return yield* reject("Archive a workstream once the user has accepted its lead's outcome.");
+      const subtree = workstreamThreads(lead.id, threads);
+      if (archiving) {
+        const busy = subtree.find(
+          (thread) =>
+            thread.activeRunId !== null ||
+            thread.pendingRuntimeRequest !== null ||
+            WORKSTREAM_BUSY_STATUSES.has(thread.status),
+        );
+        if (busy !== undefined)
+          return yield* reject(
+            `"${busy.title}" still has work in progress; finish or stop it before archiving the workstream.`,
+          );
+      }
+      let result: Orchestrator.OrchestratorV2DispatchResult = {
+        sequence: Math.max(active.snapshotSequence, archived.snapshotSequence),
+        storedEvents: [],
+      };
+      for (const thread of subtree) {
+        if ((thread.archivedAt !== null) === archiving) continue;
+        result = yield* orchestrator.dispatch({
+          type: archiving ? "thread.archive" : "thread.unarchive",
+          commandId: CommandId.make(`${command.commandId}:${thread.id}`),
+          threadId: thread.id,
+        });
+      }
+      return result;
+    });
+
   const dispatch: ThreadManagementServiceShape["dispatch"] = (command) =>
     Effect.gen(function* () {
+      if (
+        command.type === "thread.workstream.archive" ||
+        command.type === "thread.workstream.unarchive"
+      )
+        return yield* dispatchWorkstream(command);
       yield* ensureCommandTranscripts(command);
       if (
         command.type === "thread.metadata.update" &&

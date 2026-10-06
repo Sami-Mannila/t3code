@@ -219,6 +219,10 @@
       "types": "./src/threadPullRequests.ts",
       "import": "./src/threadPullRequests.ts"
     },
+    "./organizationWorkstream": {
+      "types": "./src/organizationWorkstream.ts",
+      "import": "./src/organizationWorkstream.ts"
+    },
     "./changeRequestUrl": {
       "types": "./src/changeRequestUrl.ts",
       "import": "./src/changeRequestUrl.ts"

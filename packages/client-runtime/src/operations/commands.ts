@@ -85,6 +85,9 @@ export interface ThreadCommandInput extends CommandMetadata {
 export type DeleteThreadInput = ThreadCommandInput;
 export type ArchiveThreadInput = ThreadCommandInput;
 export type UnarchiveThreadInput = ThreadCommandInput;
+/** `threadId` is the lead; its executors and reviewers move with it. */
+export type ArchiveWorkstreamInput = ThreadCommandInput;
+export type UnarchiveWorkstreamInput = ThreadCommandInput;
 export type SettleThreadInput = ThreadCommandInput;
 
 export interface UnsettleThreadInput extends ThreadCommandInput {
@@ -417,6 +420,8 @@ function simpleThreadCommand(
     | "thread.delete"
     | "thread.archive"
     | "thread.unarchive"
+    | "thread.workstream.archive"
+    | "thread.workstream.unarchive"
     | "thread.settle"
     | "thread.pin"
     | "thread.unpin",
@@ -443,6 +448,18 @@ export const unarchiveThread = Effect.fn("EnvironmentCommands.unarchiveThread")(
   input: UnarchiveThreadInput,
 ) {
   return yield* simpleThreadCommand("thread.unarchive", input);
+});
+
+export const archiveWorkstream = Effect.fn("EnvironmentCommands.archiveWorkstream")(function* (
+  input: ArchiveWorkstreamInput,
+) {
+  return yield* simpleThreadCommand("thread.workstream.archive", input);
+});
+
+export const unarchiveWorkstream = Effect.fn("EnvironmentCommands.unarchiveWorkstream")(function* (
+  input: UnarchiveWorkstreamInput,
+) {
+  return yield* simpleThreadCommand("thread.workstream.unarchive", input);
 });
 
 export const settleThread = Effect.fn("EnvironmentCommands.settleThread")(function* (

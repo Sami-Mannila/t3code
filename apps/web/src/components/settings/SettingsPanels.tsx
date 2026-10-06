@@ -47,6 +47,9 @@ import {
   SidebarProjectSortOrder,
 } from "@t3tools/contracts/settings";
 import { resolveServerBackgroundActivitySettings } from "@t3tools/shared/backgroundActivitySettings";
+import { canUnarchiveWorkstream } from "@t3tools/shared/organizationWorkstream";
+import type { EnvironmentThreadShell } from "@t3tools/client-runtime/state/models";
+import { OrganizationUnarchiveDialog } from "../organization/OrganizationUnarchiveDialog";
 import { createModelSelection } from "@t3tools/shared/model";
 import * as Duration from "effect/Duration";
 import * as Equal from "effect/Equal";
@@ -3395,6 +3398,8 @@ export function ArchivedThreadsPanel() {
     isLoading: isLoadingArchive,
     refresh: refreshArchivedThreads,
   } = useArchivedThreadSnapshots(scope.environmentIds);
+  // The archived lead whose workstream the user asked to restore, awaiting confirmation.
+  const [unarchivingLead, setUnarchivingLead] = useState<EnvironmentThreadShell | null>(null);
 
   const archivedGroups = useMemo(() => {
     const selectedProjectKeys =
@@ -3445,16 +3450,28 @@ export function ArchivedThreadsPanel() {
   }, [archivedSnapshots, scope]);
 
   const handleArchivedThreadContextMenu = useCallback(
-    async (threadRef: ScopedThreadRef, position: { x: number; y: number }) => {
+    async (
+      threadRef: ScopedThreadRef,
+      position: { x: number; y: number },
+      workstreamLead: EnvironmentThreadShell | null,
+    ) => {
       const api = readLocalApi();
       if (!api) return;
       const clicked = await api.contextMenu.show(
         [
           { id: "unarchive", label: "Unarchive" },
+          ...(workstreamLead !== null
+            ? [{ id: "unarchive-workstream" as const, label: "Unarchive workstream" }]
+            : []),
           { id: "delete", label: "Delete", destructive: true },
         ],
         position,
       );
+
+      if (clicked === "unarchive-workstream") {
+        setUnarchivingLead(workstreamLead);
+        return;
+      }
 
       if (clicked === "unarchive") {
         const result = await unarchiveThread(threadRef);
@@ -3542,6 +3559,7 @@ export function ArchivedThreadsPanel() {
                           x: event.clientX,
                           y: event.clientY,
                         },
+                        canUnarchiveWorkstream(thread.source) ? thread : null,
                       ),
                     );
                     if (result._tag === "Failure") {
@@ -3572,6 +3590,12 @@ export function ArchivedThreadsPanel() {
                     size="xs"
                     className="shrink-0"
                     onClick={() => {
+                      // An archived lead comes back with the executors and reviewers under it,
+                      // once the user confirms the list.
+                      if (canUnarchiveWorkstream(thread.source)) {
+                        setUnarchivingLead(thread);
+                        return;
+                      }
                       void (async () => {
                         const result = await unarchiveThread(
                           scopeThreadRef(thread.environmentId, thread.id),
@@ -3595,7 +3619,9 @@ export function ArchivedThreadsPanel() {
                     }}
                   >
                     <ArchiveX className="size-3.5" />
-                    <span>Unarchive</span>
+                    <span>
+                      {canUnarchiveWorkstream(thread.source) ? "Unarchive workstream" : "Unarchive"}
+                    </span>
                   </Button>
                 }
               />
@@ -3603,6 +3629,18 @@ export function ArchivedThreadsPanel() {
           </SettingsSection>
         ))
       )}
+      <OrganizationUnarchiveDialog
+        lead={unarchivingLead}
+        archivedThreads={
+          unarchivingLead === null
+            ? []
+            : archivedSnapshots.flatMap(({ environmentId, snapshot }) =>
+                snapshot.threads.map((thread) => presentThreadShell(environmentId, thread)),
+              )
+        }
+        onClose={() => setUnarchivingLead(null)}
+        onRestored={refreshArchivedThreads}
+      />
     </SettingsPageContainer>
   );
 }
