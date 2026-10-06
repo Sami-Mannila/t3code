@@ -52,6 +52,8 @@ export class OrganizationOutcomeAcceptanceReactor extends Context.Service<
   }
 >()("t3/orchestration-v2/OrganizationOutcomeAcceptanceReactor") {}
 
+/** How often reviewed leads waiting on pull requests or a failed lookup are re-checked. */
+const PERIODIC_SWEEP = Duration.minutes(5);
 /** Bursts of task and pull request updates in one project are swept once. */
 const SWEEP_DEBOUNCE = Duration.seconds(3);
 /** A refused acceptance whose inputs did not change is retried once per this window. */
@@ -66,7 +68,7 @@ interface SweepRequest {
   readonly projectId?: ProjectId | undefined;
   /** Only these leads; all leads in scope when absent. */
   readonly leadIds?: ReadonlySet<ThreadId> | undefined;
-  readonly trigger: "startup" | "event" | "manual";
+  readonly trigger: "startup" | "event" | "manual" | "periodic";
 }
 
 const outcomeThread = (thread: OrchestrationV2ThreadShell): OutcomeThread => ({
@@ -345,6 +347,15 @@ export const make = Effect.gen(function* () {
   const start = Effect.fn("OrganizationOutcomeAcceptanceReactor.start")(function* () {
     // Startup sweep: pull requests may have merged while the server was down.
     yield* worker.enqueue({ trigger: "startup" });
+    // Some changes raise no event: a pull request merged from an executor branch nobody linked,
+    // or a host that starts answering again. Reviewed leads are re-checked on a schedule; the
+    // gate skips every other lead before any lookup, and branch lookups stay cached.
+    yield* forkParked(
+      Effect.sleep(PERIODIC_SWEEP).pipe(
+        Effect.andThen(worker.enqueue({ trigger: "periodic" })),
+        Effect.forever,
+      ),
+    );
     yield* forkParked(
       Stream.runForEach(orchestrator.streamDomainEvents, (event) => {
         switch (event.type) {

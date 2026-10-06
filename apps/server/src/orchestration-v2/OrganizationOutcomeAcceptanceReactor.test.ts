@@ -10,6 +10,7 @@ import * as DateTime from "effect/DateTime";
 import * as Effect from "effect/Effect";
 import * as Layer from "effect/Layer";
 import * as Schema from "effect/Schema";
+import * as Stream from "effect/Stream";
 import * as TestClock from "effect/testing/TestClock";
 
 import * as GitManager from "../git/GitManager.ts";
@@ -83,7 +84,7 @@ const harness = (input: {
     const reactor = yield* OrganizationOutcomeAcceptanceReactor.make.pipe(
       Effect.provide(
         Layer.mergeAll(
-          Layer.mock(Orchestrator.OrchestratorV2)({}),
+          Layer.mock(Orchestrator.OrchestratorV2)({ streamDomainEvents: Stream.never }),
           Layer.mock(GitManager.GitManager)({
             branchPullRequest: () => input.branchLookup() as never,
           }),
@@ -160,6 +161,58 @@ it.effect("tells the Chief when an executor branch has failed to be checked for 
     yield* reactor.sweep();
     assert.lengthOf(of("message.dispatch"), 1);
   }),
+);
+
+it.effect("accepts on a periodic sweep when an unlinked executor-branch PR merges", () =>
+  Effect.gen(function* () {
+    let state: "open" | "merged" = "open";
+    const { reactor, of } = yield* harness({
+      branchLookup: () =>
+        Effect.succeed({
+          number: 41,
+          state,
+          title: "Work",
+          url: "https://github.com/acme/app/pull/41",
+          baseRef: "main",
+          headRef: "t3/organization/work",
+          repositoryKey: "github.com/acme/app",
+          updatedAt: null,
+        } as unknown as GitManager.GitBranchPullRequest),
+      accept: () => Effect.void,
+    });
+    yield* reactor.start();
+    yield* reactor.drain;
+    assert.lengthOf(of("thread.metadata.update"), 0);
+    // The merge raises no event; the schedule finds it once the cached lookup expires.
+    state = "merged";
+    yield* TestClock.adjust("5 minutes");
+    yield* reactor.drain;
+    const accepted = of("thread.metadata.update");
+    assert.lengthOf(accepted, 1);
+    assert.equal(
+      (accepted[0] as Extract<OrchestrationV2ServerCommand, { type: "thread.metadata.update" }>)
+        .organization?.task?.notes,
+      "Accepted after merge of #41.",
+    );
+  }).pipe(Effect.scoped),
+);
+
+it.effect("advances failed branch checks on periodic sweeps until the Chief is told", () =>
+  Effect.gen(function* () {
+    const { reactor, of } = yield* harness({
+      branchLookup: () => Effect.fail(new TestFailure({ reason: "host unreachable" })),
+      accept: () => Effect.void,
+    });
+    yield* reactor.start();
+    yield* reactor.drain;
+    yield* TestClock.adjust("5 minutes");
+    yield* reactor.drain;
+    assert.lengthOf(of("message.dispatch"), 0);
+    yield* TestClock.adjust("5 minutes");
+    yield* reactor.drain;
+    assert.lengthOf(of("message.dispatch"), 1);
+    assert.lengthOf(of("thread.metadata.update"), 0);
+  }).pipe(Effect.scoped),
 );
 
 it.effect("retries an acceptance the orchestrator refused under its command id", () =>
