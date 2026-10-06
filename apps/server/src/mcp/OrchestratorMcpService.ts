@@ -54,6 +54,12 @@ import {
   ThreadId,
 } from "@t3tools/contracts";
 import { runRanAfter } from "@t3tools/shared/orchestrationV2ThreadError";
+import { modelSelectionCommandType, modelSelectionsEqual } from "@t3tools/shared/model";
+import { ownedOutcomePullRequests } from "@t3tools/shared/organizationOutcome";
+import {
+  ORGANIZATION_EXTENDABLE_STATES,
+  organizationExtendedTask,
+} from "../orchestration-v2/OrganizationPolicy.ts";
 import {
   type OrganizationRoleModel,
   resolveOrganizationRoleModelSelection,
@@ -156,7 +162,29 @@ export interface OrchestratorMcpServiceShape {
     scope: McpInvocationScope,
     input: OrchestratorMcpThreadInterruptInput,
   ) => Effect.Effect<OrchestratorMcpThreadInterruptResult, OrchestratorMcpFailure>;
+  /** The Chief gives an idle lead a new round of work instead of creating another lead. */
+  readonly extendLead: (
+    scope: McpInvocationScope,
+    input: OrganizationExtendLeadInput,
+  ) => Effect.Effect<OrganizationExtendLeadResult, OrchestratorMcpFailure>;
 }
+
+export interface OrganizationExtendLeadInput {
+  readonly threadId: ThreadId;
+  readonly brief: string;
+  readonly target?: OrchestratorMcpTarget | undefined;
+  readonly clientRequestId: string;
+}
+
+export interface OrganizationExtendLeadResult {
+  readonly threadId: ThreadId;
+  readonly round: number;
+  readonly modelSelection: ModelSelection;
+  readonly runId: RunId;
+  readonly delivery: string;
+}
+
+const LEAD_BUSY_STATUSES = new Set(["queued", "preparing", "starting", "running", "waiting"]);
 
 export class OrchestratorMcpService extends Context.Service<
   OrchestratorMcpService,
@@ -2046,6 +2074,128 @@ const make = Effect.gen(function* () {
           status: result.run?.status ?? "idle",
           timedOut: result.timedOut,
         } satisfies OrchestratorMcpThreadWaitResult;
+      }),
+    extendLead: (scope, input) =>
+      Effect.gen(function* () {
+        const snapshot = yield* threadManagement
+          .getShellSnapshot()
+          .pipe(Effect.mapError(threadManagementFailure));
+        const caller = snapshot.threads.find((thread) => thread.id === scope.threadId);
+        if (caller?.organization?.role !== "chief")
+          return yield* failure("capability_denied", "Only the Chief can extend a lead.");
+        const lead = snapshot.threads.find(
+          (thread) =>
+            thread.id === input.threadId &&
+            thread.projectId === caller.projectId &&
+            thread.deletedAt === null,
+        );
+        if (lead === undefined) {
+          const archived = yield* threadManagement
+            .getShellSnapshot({ location: "archive" })
+            .pipe(Effect.mapError(threadManagementFailure));
+          return yield* archived.threads.some((thread) => thread.id === input.threadId)
+            ? failure(
+                "invalid_request",
+                `Lead ${input.threadId} is archived; ask the user to restore its workstream first.`,
+              )
+            : failure("thread_not_found", `Lead ${input.threadId} is not in this project.`);
+        }
+        const task = lead.organization?.task;
+        if (lead.organization?.role !== "lead" || lead.organization.parentThreadId !== caller.id)
+          return yield* failure("capability_denied", "A Chief extends only its own leads.");
+        if (!task) return yield* failure("invalid_request", "This lead has no task to extend.");
+        if (
+          lead.activeRunId !== null ||
+          lead.pendingRuntimeRequest !== null ||
+          LEAD_BUSY_STATUSES.has(lead.status)
+        )
+          return yield* failure(
+            "invalid_request",
+            `"${lead.title}" is still busy; wait until it is idle, or send it the brief with t3_thread_send.`,
+          );
+        const round = (task.rounds?.at(-1)?.round ?? 0) + 1;
+        if (!ORGANIZATION_EXTENDABLE_STATES.has(task.state))
+          return yield* failure(
+            "invalid_request",
+            `"${lead.title}" is still ${task.state.replaceAll("_", " ")} in round ${round}; send it the brief with t3_thread_send instead.`,
+          );
+        const key = yield* requestKey(input.clientRequestId);
+        // An explicit target switches the lead's own provider, validated like delegate_task.
+        let modelSelection = lead.modelSelection;
+        if (input.target !== undefined) {
+          const resolved = yield* resolveTarget({
+            parent: yield* threadManagement
+              .getProjectThreadRecords({ projectId: lead.projectId, threadId: lead.id }, [])
+              .pipe(Effect.mapError(threadManagementFailure)),
+            target: input.target,
+            providers: yield* loadProviders,
+          });
+          if (!modelSelectionsEqual(resolved.modelSelection, lead.modelSelection)) {
+            modelSelection = resolved.modelSelection;
+            yield* threadManagement
+              .dispatch({
+                type: modelSelectionCommandType(lead.providerInstanceId, modelSelection),
+                commandId: stableCommandId({ scope, requestKey: key, operation: "extend-model" }),
+                threadId: lead.id,
+                modelSelection,
+              })
+              .pipe(Effect.mapError(threadManagementFailure));
+          }
+        }
+        const now = DateTime.formatIso(yield* DateTime.now);
+        const outcomeThread = (thread: OrchestrationV2ThreadShell) => ({
+          id: thread.id,
+          title: thread.title,
+          organization: thread.organization,
+          pullRequests: thread.pullRequests,
+          createdAtMs: DateTime.toEpochMillis(thread.createdAt),
+        });
+        const brief = input.brief.trim();
+        yield* threadManagement
+          .dispatch({
+            type: "thread.metadata.update",
+            commandId: stableCommandId({ scope, requestKey: key, operation: "extend-lead" }),
+            threadId: lead.id,
+            organizationActorThreadId: caller.id,
+            organization: {
+              ...lead.organization,
+              task: organizationExtendedTask(task, {
+                leadThreadId: lead.id,
+                brief,
+                now,
+                pullRequests: ownedOutcomePullRequests(
+                  outcomeThread(lead),
+                  snapshot.threads.map(outcomeThread),
+                ).map((pullRequest) => pullRequest.number),
+              }),
+            },
+          })
+          .pipe(Effect.mapError(threadManagementFailure));
+        const sent = yield* threadManagement
+          .sendToThread({
+            projectId: lead.projectId,
+            commandId: stableCommandId({ scope, requestKey: key, operation: "extend-send" }),
+            threadId: lead.id,
+            senderThreadId: caller.id,
+            messageId: stableOperationMessageId({
+              scope,
+              requestKey: key,
+              operation: "extend-send",
+            }),
+            text: `Round ${round + 1} from your Chief: ${brief}\n\nPlan and delegate new executors for this round. Earlier rounds' accepted work and pull requests stay as they are; this round is reviewed and accepted on its own.`,
+            attachments: [],
+            mode: "auto",
+            createdBy: "agent",
+            creationSource: "mcp",
+          })
+          .pipe(Effect.mapError(threadManagementFailure));
+        return {
+          threadId: lead.id,
+          round: round + 1,
+          modelSelection,
+          runId: sent.run.id,
+          delivery: sent.delivery,
+        } satisfies OrganizationExtendLeadResult;
       }),
     interruptThread: (scope, input) =>
       Effect.gen(function* () {

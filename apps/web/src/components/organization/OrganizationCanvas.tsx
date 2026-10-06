@@ -306,7 +306,9 @@ function LeadCard(props: {
       </button>
       {outcome ? (
         <div className={styles["org-outcome"]}>
-          Outcome
+          {outcome.rounds?.length
+            ? `Outcome · round ${outcome.rounds.at(-1)!.round + 1}`
+            : "Outcome"}
           <Pill state={outcome.state} {...(card.outcomeWait ? { label: card.outcomeWait } : {})} />
           {outcome.title !== lead.title ? (
             <Truncated className={styles["org-outcome-title"]} text={outcome.title} />
@@ -322,6 +324,25 @@ function LeadCard(props: {
         />
       ) : null}
       <EarlierRounds rounds={card.outcomeEarlierRounds} onOpenThread={props.onOpenThread} />
+      {outcome?.rounds?.length ? (
+        <details className={styles["org-rounds"]}>
+          <summary>
+            {outcome.rounds.length === 1
+              ? "1 earlier round"
+              : `${outcome.rounds.length} earlier rounds`}
+          </summary>
+          {outcome.rounds.map((round) => (
+            <div key={round.round} className={styles["org-review"]}>
+              <span className={styles["org-sub-truncate"]}>
+                round {round.round} · {round.state.replaceAll("_", " ")}
+                {round.pullRequests.length
+                  ? ` · ${round.pullRequests.map((number) => `#${number}`).join(", ")}`
+                  : ""}
+              </span>
+            </div>
+          ))}
+        </details>
+      ) : null}
       {canArchiveWorkstream(lead.source) ? (
         <div className={styles["org-accept"]}>
           <Button size="sm" variant="outline" onClick={() => props.onArchive(lead)}>

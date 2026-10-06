@@ -55,9 +55,15 @@ export function ownedOutcomePullRequests(
     }),
   ];
   const pullRequests = new Map<string, OutcomePullRequest>();
+  // A lead extended with a new round owns only what it linked during that round.
+  const roundStartedAt = lead.organization?.task?.roundStartedAt;
+  const since = (owner: OutcomeThread) =>
+    owner === lead && roundStartedAt
+      ? Math.max(owner.createdAtMs, Date.parse(roundStartedAt))
+      : owner.createdAtMs;
   for (const owner of owners)
     for (const link of visibleThreadPullRequests(owner.pullRequests ?? [])) {
-      if (Date.parse(link.linkedAt) < owner.createdAtMs) continue;
+      if (Date.parse(link.linkedAt) < since(owner)) continue;
       const key = threadPullRequestKeyOf(link);
       if (!pullRequests.has(key))
         pullRequests.set(key, {

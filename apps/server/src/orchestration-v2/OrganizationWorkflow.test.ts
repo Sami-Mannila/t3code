@@ -3,6 +3,7 @@ import {
   organizationInstructions,
   organizationPreparationBlock,
   organizationPreparationUnblock,
+  organizationExtendedTask,
 } from "./OrganizationPolicy.ts";
 import { McpSchema, McpServer } from "effect/unstable/ai";
 import * as McpHttpServer from "../mcp/McpHttpServer.ts";
@@ -495,6 +496,132 @@ it.effect(
         Effect.result,
       );
       assert.equal(changed._tag, "Failure");
+
+      // The Chief extends the accepted lead with a second round of work.
+      const extend = (key: string, actor: ThreadId) =>
+        Effect.gen(function* () {
+          const organization = (yield* threads.getThreadProjection(lead)).thread.organization!;
+          return yield* threads.dispatch({
+            type: "thread.metadata.update",
+            commandId: CommandId.make(key),
+            threadId: lead,
+            organizationActorThreadId: actor,
+            organization: {
+              ...organization,
+              task: organizationExtendedTask(organization.task!, {
+                leadThreadId: lead,
+                brief: "Also cover the stocks dataset.",
+                now: DateTime.formatIso(yield* DateTime.now),
+                pullRequests: [12],
+              }),
+            },
+          });
+        });
+      assert.equal(
+        (yield* extend("lead-extends-itself", lead).pipe(Effect.result))._tag,
+        "Failure",
+      );
+      yield* extend("chief-extends-lead", chief);
+      const round2 = yield* leadTask;
+      assert.equal(round2.state, "working");
+      assert.equal(round2.notes, "Round 2: Also cover the stocks dataset.");
+      assert.isNull(round2.revision);
+      assert.deepEqual(round2.dependencyThreadIds, []);
+      assert.deepEqual(
+        round2.rounds?.map((round) => [
+          round.round,
+          round.state,
+          round.revision,
+          round.dependencyThreadIds,
+          round.pullRequests,
+        ]),
+        [[1, "accepted", accepted.revision, [executor], [12]]],
+      );
+      const round1Executor = (yield* threads.getThreadProjection(executor)).thread.organization!
+        .task!;
+      assert.equal(round1Executor.state, "accepted");
+      // Earlier rounds are not rewritten afterwards.
+      assert.equal(
+        (yield* update(lead, "rewrite-rounds", { rounds: [] }, chief).pipe(Effect.result))._tag,
+        "Failure",
+      );
+
+      // Round 2 consolidates only its own executor: round 1's changed file is not re-read.
+      const laterExecutor = ThreadId.make("later-executor");
+      yield* sink.write({
+        commandId: CommandId.make("native-later-executor"),
+        events: [
+          {
+            id: EventId.make("native-later-executor"),
+            type: "provider-thread.updated",
+            threadId: laterExecutor,
+            driver,
+            providerInstanceId: modelSelection.instanceId,
+            occurredAt: now,
+            payload: {
+              id: ProviderThreadId.make("provider-later-executor"),
+              driver,
+              providerInstanceId: modelSelection.instanceId,
+              providerSessionId: null,
+              appThreadId: laterExecutor,
+              ownerNodeId: NodeId.make("node-later-executor"),
+              nativeThreadRef: { driver, nativeId: "native-later-executor", strength: "strong" },
+              nativeConversationHeadRef: null,
+              status: "active",
+              firstRunOrdinal: 1,
+              lastRunOrdinal: 1,
+              handoffIds: [],
+              forkedFrom: null,
+              createdAt: now,
+              updatedAt: now,
+            },
+          },
+        ],
+      });
+      yield* fs.writeFileString(`${workspace}/round2.txt`, "round two\n");
+      yield* update(
+        laterExecutor,
+        "round2-submit",
+        { state: "awaiting_review", manifest: ["round2.txt"] },
+        laterExecutor,
+      );
+      yield* update(laterExecutor, "round2-assign", { ownerThreadId: reviewer }, lead);
+      const round2Submission = (yield* threads.getThreadProjection(laterExecutor)).thread
+        .organization!.task!;
+      yield* update(
+        laterExecutor,
+        "round2-review",
+        {
+          state: "accepted",
+          reviewedRevision: round2Submission.revision,
+          reviewerThreadId: reviewer,
+        },
+        reviewer,
+      );
+      yield* update(lead, "round2-consolidate", { state: "awaiting_review" }, lead);
+      const round2Outcome = yield* leadTask;
+      assert.deepEqual(round2Outcome.dependencyThreadIds, [laterExecutor]);
+      assert.deepEqual(
+        round2Outcome.files?.map((file) => file.path),
+        ["later-executor/round2.txt"],
+      );
+      yield* update(lead, "round2-assign-final", { ownerThreadId: reviewer }, chief);
+      yield* update(
+        lead,
+        "round2-review-final",
+        { reviewedRevision: round2Outcome.revision, reviewerThreadId: reviewer },
+        reviewer,
+      );
+      // Round 1's merged PR #12 is not this round's; round 2 waits for its own.
+      yield* linkPullRequests(laterExecutor, "round2-pr-open", [link(20, linkedAt, "open")]);
+      yield* reactor.sweep();
+      assert.equal((yield* leadTask).state, "awaiting_review");
+      yield* linkPullRequests(laterExecutor, "round2-pr-merged", [link(20, linkedAt, "merged")]);
+      yield* reactor.sweep();
+      const round2Accepted = yield* leadTask;
+      assert.equal(round2Accepted.state, "accepted");
+      assert.equal(round2Accepted.notes, "Accepted after merge of #20.");
+      assert.lengthOf(round2Accepted.rounds ?? [], 1);
     }).pipe(
       Effect.provide(
         ThreadManagement.layer.pipe(

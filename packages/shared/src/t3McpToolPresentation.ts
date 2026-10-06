@@ -244,6 +244,10 @@ const T3_MCP_TOOLS: Readonly<Record<string, T3McpToolDefinition>> = {
     ["Answer", "Answering", "Answered", "pending questions"],
     "question-respond",
   ),
+  organization_extend_lead: tool(
+    ["Extend", "Extending", "Extended", "a project lead"],
+    "thread-send",
+  ),
   t3_organization_ask_user: tool(["Ask", "Asking", "Asked", "the user"], "question-ask"),
   t3_organization_task: tool(
     ["Update", "Updating", "Updated", "an organization task"],

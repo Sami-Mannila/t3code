@@ -96,6 +96,12 @@ const handlers = {
       const service = yield* OrchestratorMcpService.OrchestratorMcpService;
       return yield* service.interruptThread(scope, input);
     }),
+  organization_extend_lead: (input) =>
+    Effect.gen(function* () {
+      const scope = yield* McpInvocationContext.McpInvocationContext;
+      const service = yield* OrchestratorMcpService.OrchestratorMcpService;
+      return yield* service.extendLead(scope, input);
+    }),
 } satisfies Parameters<typeof OrchestratorToolkit.toLayer>[0];
 
 export const OrchestratorToolkitHandlersLive = OrchestratorToolkit.toLayer(handlers);

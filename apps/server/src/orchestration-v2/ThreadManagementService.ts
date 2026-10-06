@@ -589,13 +589,17 @@ const make = Effect.gen(function* () {
           // A submission consolidates every implementation task; review and acceptance verify
           // the set that submitted revision was built from, so later work is its own scope.
           const reviewedSet = new Set(previous?.dependencyThreadIds ?? []);
+          // Work an earlier round of an extended lead was built from stays with that round.
+          const earlierRounds = new Set(
+            (previous?.rounds ?? []).flatMap((round) => round.dependencyThreadIds),
+          );
           const children = shell.threads
             .filter(
               (item) =>
                 item.organization?.parentThreadId === current.thread.id &&
                 item.organization.role === "executor" &&
                 item.organization.task &&
-                (submission || reviewedSet.has(item.id)),
+                (submission ? !earlierRounds.has(item.id) : reviewedSet.has(item.id)),
             )
             .toSorted((a, b) => a.id.localeCompare(b.id));
           const unready = children.find(
