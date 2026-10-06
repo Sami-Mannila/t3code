@@ -503,8 +503,6 @@ const make = Effect.gen(function* () {
       const archiving = command.type === "thread.workstream.archive";
       if (lead?.organization?.role !== "lead")
         return yield* reject("Only a lead's workstream can be archived or restored.");
-      if (archiving && lead.organization.task?.state !== "accepted")
-        return yield* reject("Archive a workstream once the user has accepted its lead's outcome.");
       const subtree = workstreamThreads(lead.id, threads);
       if (archiving) {
         const busy = subtree.find(

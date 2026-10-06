@@ -68,9 +68,10 @@ describe("workstreamThreads", () => {
 });
 
 describe("workstream actions", () => {
-  it("offers archiving only for a live lead whose outcome is accepted", () => {
+  it("offers archiving for any live lead, accepted or not", () => {
     expect(canArchiveWorkstream(thread("lead", "lead", "chief", "accepted"))).toBe(true);
-    expect(canArchiveWorkstream(thread("lead", "lead", "chief", "awaiting_review"))).toBe(false);
+    expect(canArchiveWorkstream(thread("lead", "lead", "chief", "awaiting_review"))).toBe(true);
+    expect(canArchiveWorkstream(thread("lead", "lead", "chief", "blocked"))).toBe(true);
     expect(canArchiveWorkstream(thread("executor", "executor", "lead", "accepted"))).toBe(false);
     expect(
       canArchiveWorkstream(

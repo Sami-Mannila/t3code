@@ -41,13 +41,13 @@ export function workstreamThreads<T extends WorkstreamThread>(
   return ordered;
 }
 
-/** A lead whose outcome the user accepted can be archived with its workstream. */
+/**
+ * Any live lead can be archived with its workstream, accepted or not: unfinished work is put
+ * away as it is. The server still refuses while a thread in it has work in progress.
+ */
 export function canArchiveWorkstream(thread: WorkstreamThread): boolean {
   return (
-    thread.organization?.role === "lead" &&
-    thread.organization.task?.state === "accepted" &&
-    thread.archivedAt == null &&
-    thread.deletedAt == null
+    thread.organization?.role === "lead" && thread.archivedAt == null && thread.deletedAt == null
   );
 }
 
