@@ -568,6 +568,82 @@ describe("PullRequestSyncReactor", () => {
     ),
   );
 
+  it.effect("writes only what a read actually changed, not what it could not answer", () =>
+    Effect.scoped(
+      Effect.gen(function* () {
+        yield* TestClock.setTime(Date.parse(NOW));
+        const author = (avatarUrl: string | null) => ({ login: "octocat", name: null, avatarUrl });
+        const current = yield* Ref.make<Partial<PullRequestSummary>>({
+          mergeability: "unknown",
+          author: author("https://avatars.githubusercontent.com/u/1?u=first&v=4"),
+          checksState: "pending",
+        });
+        const fixture = yield* makeHarness({
+          snapshot: makeSnapshot([makeThread("one", { pullRequests: [makeLink(42)] })]),
+          summary: (input) => Ref.get(current).pipe(Effect.map((o) => makeSummary(input, o))),
+        });
+        const latestSnapshot = Ref.get(fixture.syncCommands).pipe(
+          Effect.map((commands) => commands.at(-1)?.snapshot),
+        );
+
+        const persist = Effect.gen(function* () {
+          const commands = yield* Ref.get(fixture.syncCommands);
+          yield* Ref.update(fixture.snapshots, (snapshot) => applySync(snapshot, commands));
+          return commands.length;
+        });
+
+        yield* Effect.gen(function* () {
+          const reactor = yield* startAndSweep(fixture);
+          const sweepWith = Effect.fn("sweepWith")(function* (
+            overrides: Partial<PullRequestSummary>,
+          ) {
+            yield* Ref.update(current, (summary) => ({ ...summary, ...overrides }));
+            yield* sweepAgain(fixture, reactor);
+            return yield* persist;
+          });
+          // A first read records unknown mergeability: there is nothing better to keep.
+          assert.strictEqual(yield* persist, 1);
+          assert.strictEqual((yield* latestSnapshot)?.mergeability, "unknown");
+
+          assert.strictEqual(yield* sweepWith({ mergeability: "mergeable" }), 2);
+          // GitHub recomputing, a re-signed avatar, and the `/<login>.png` fallback change nothing.
+          assert.strictEqual(yield* sweepWith({ mergeability: "unknown" }), 2);
+          assert.strictEqual(
+            yield* sweepWith({
+              author: author("https://avatars.githubusercontent.com/u/1?u=second&v=4"),
+            }),
+            2,
+          );
+          assert.strictEqual(
+            yield* sweepWith({ author: author("https://github.com/octocat.png?size=80") }),
+            2,
+          );
+
+          // A real change still syncs, and carries the known values forward.
+          assert.strictEqual(yield* sweepWith({ checksState: "passing", additions: 3 }), 3);
+          const written = yield* latestSnapshot;
+          assert.strictEqual(written?.checksState, "passing");
+          assert.strictEqual(written?.additions, 3);
+          assert.strictEqual(written?.mergeability, "mergeable");
+          assert.strictEqual(
+            written?.author?.avatarUrl,
+            "https://avatars.githubusercontent.com/u/1?u=first&v=4",
+          );
+          assert.strictEqual(written?.syncedAt, DateTime.formatIso(yield* DateTime.now));
+
+          assert.strictEqual(yield* sweepWith({ mergeability: "conflicting" }), 4);
+          assert.strictEqual((yield* latestSnapshot)?.mergeability, "conflicting");
+          assert.strictEqual(
+            yield* sweepWith({
+              author: author("https://avatars.githubusercontent.com/u/2?v=4"),
+            }),
+            5,
+          );
+        }).pipe(Effect.provide(fixture.layer));
+      }),
+    ),
+  );
+
   it.effect("refreshes closed links through the reactor's project after reopening elsewhere", () =>
     Effect.scoped(
       Effect.gen(function* () {

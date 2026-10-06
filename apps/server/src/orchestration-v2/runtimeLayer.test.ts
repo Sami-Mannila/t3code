@@ -3959,13 +3959,14 @@ it.layer(SharedApplicationDataPlaneTestLayer)("visited projection", (it) => {
       assert.deepEqual(visited.thread.updatedAt, createdUpdatedAt);
 
       // Monotonic: an older watermark (a replay or a stale device) cannot
-      // rewind the marker.
-      yield* orchestrator.dispatch({
+      // rewind the marker, and records no event carrying the unchanged thread.
+      const staleVisit = yield* orchestrator.dispatch({
         type: "thread.visit",
         commandId: CommandId.make("runtime-layer-visited-thread-visit-stale"),
         threadId,
         visitedAt: "2026-07-24T00:30:00.000Z",
       });
+      assert.deepEqual(staleVisit.storedEvents, []);
       const afterStaleVisit = yield* orchestrator.getThreadProjection(threadId);
       assert.equal(DateTime.formatIso(afterStaleVisit.thread.lastVisitedAt!), visitedAt);
 

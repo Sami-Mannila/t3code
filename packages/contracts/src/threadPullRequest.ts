@@ -52,6 +52,7 @@ export const ThreadPullRequestSnapshot = Schema.Struct({
   baseBranch: TrimmedNonEmptyString,
   isDraft: Schema.Boolean,
   updatedAt: Schema.NullOr(IsoDateTime),
+  /** When a sync last changed this snapshot. A sync that finds nothing new writes nothing. */
   syncedAt: IsoDateTime,
   closedAt: Schema.optional(Schema.NullOr(Schema.String)),
   mergedAt: Schema.optional(Schema.NullOr(Schema.String)),
