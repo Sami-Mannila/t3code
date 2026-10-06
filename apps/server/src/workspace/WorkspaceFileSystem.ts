@@ -336,7 +336,8 @@ export const make = Effect.gen(function* () {
           }),
       ),
     );
-    yield* workspaceEntries.refresh(input.cwd);
+    // The client lists the tree right after its own write, so rescan now.
+    yield* workspaceEntries.refresh(input.cwd, { immediate: true });
     return { relativePath: target.relativePath };
   });
 
