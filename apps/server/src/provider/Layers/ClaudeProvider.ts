@@ -372,6 +372,11 @@ const probeClaudeCapabilities = (
               q.usage_EXPERIMENTAL_MAY_CHANGE_DO_NOT_RELY_ON_THIS_API_YET(),
             ).pipe(Effect.timeout(DEFAULT_TIMEOUT_MS), Effect.result)
           : undefined;
+        if (usageResult && Result.isFailure(usageResult)) {
+          yield* Effect.logWarning("Claude usage limits read failed.", {
+            cause: usageResult.failure,
+          });
+        }
         const usage =
           usageResult && Result.isSuccess(usageResult)
             ? {

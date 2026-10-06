@@ -52,6 +52,18 @@ describe("applyUsageLimitsUpdate", () => {
     });
   });
 
+  it("fills an empty available snapshot from the first streamed window", () => {
+    // A Team account's probe publishes `{ windows: [] }` with no `unavailable`;
+    // the mid-turn event must be allowed to establish the rows.
+    const empty = { checkedAt, windows: [] };
+    const next = applyUsageLimitsUpdate({
+      previous: empty,
+      checkedAt: "2026-09-03T12:00:05.000Z",
+      update: { windows: [session] },
+    });
+    expect(next).toEqual({ checkedAt: "2026-09-03T12:00:05.000Z", windows: [session] });
+  });
+
   it("leaves an unsupported account and an empty update alone", () => {
     const unsupported = { checkedAt, windows: [], unavailable: { reason: "unsupported" as const } };
     expect(

@@ -5,8 +5,10 @@
  *
  * - `get_usage` (on demand, during the capabilities probe) reports every
  *   window at once as 0–100 percentages with ISO reset times.
- * - `rate_limit_event` (streamed during a turn) names one window at a time
- *   with a 0–1 utilization fraction and an epoch-seconds reset.
+ * - `rate_limit_event` (streamed during a turn) reports the account-wide
+ *   windows under `unifiedWindows` as 0–1 utilization fractions with
+ *   epoch-seconds resets. Older CLIs instead name one window at a time with a
+ *   top-level `utilization`, which is still read as a fallback.
  *
  * @module provider/Layers/claudeUsageLimits
  */
@@ -127,6 +129,23 @@ function makeWindow(
 }
 
 /**
+ * `unifiedWindows` shipped in the CLI after the SDK typings we pin, so it is
+ * read structurally. Each entry uses the same 0–1 utilization and
+ * epoch-seconds reset as the legacy top-level fields, and may carry the
+ * overage-included bucket beside the account-wide windows.
+ */
+interface UnifiedWindow {
+  readonly utilization?: number | null;
+  readonly resetsAt?: number | null;
+}
+
+function readUnifiedWindows(info: SDKRateLimitInfo): Record<string, UnifiedWindow> | undefined {
+  const raw = (info as { readonly unifiedWindows?: unknown }).unifiedWindows;
+  if (typeof raw !== "object" || raw === null) return undefined;
+  return raw as Record<string, UnifiedWindow>;
+}
+
+/**
  * Utilization is a 0–1 fraction on the streamed event. An overage-included
  * event before any probe has named the bucket is dropped: guessing a name
  * would draw a row the next probe cannot reconcile.
@@ -135,6 +154,21 @@ export function claudeRateLimitEventToUpdate(
   info: SDKRateLimitInfo,
   names: ClaudeScopedLimitNames,
 ): ProviderUsageLimitsUpdate | undefined {
+  const unified = readUnifiedWindows(info);
+  if (unified) {
+    const windows: ServerProviderUsageWindow[] = [];
+    for (const [type, window] of Object.entries(unified)) {
+      if (typeof window?.utilization !== "number") continue;
+      const usedPercent = window.utilization * 100;
+      const resetsAt = isoFromEpochSeconds(window.resetsAt ?? undefined);
+      if (type in WINDOWS) {
+        windows.push(makeWindow(type, usedPercent, resetsAt));
+      } else if (type === OVERAGE_INCLUDED_EVENT_TYPE && names.overageIncluded) {
+        windows.push(scopedWindow(names.overageIncluded, usedPercent, resetsAt));
+      }
+    }
+    return windows.length > 0 ? { windows } : undefined;
+  }
   const type: string | undefined = info.rateLimitType;
   if (!type || typeof info.utilization !== "number") {
     return undefined;
@@ -159,9 +193,19 @@ export function claudeUsageResponseToLimits(input: {
   readonly checkedAt: string;
 }): { readonly limits: ServerProviderUsageLimits; readonly names: ClaudeScopedLimitNames } {
   const { response, checkedAt } = input;
-  if (!response.rate_limits_available || !response.rate_limits) {
+  if (!response.rate_limits_available) {
     return {
       limits: makeUnavailableUsageLimits({ checkedAt, reason: "unsupported" }),
+      names: { overageIncluded: undefined },
+    };
+  }
+  // Team accounts answer `available: true` with no windows yet; the CLI only
+  // learns them mid-turn. Publish an empty available snapshot so the first
+  // streamed `rate_limit_event` can fill the rows instead of being refused as
+  // an update to an `unsupported` snapshot.
+  if (!response.rate_limits) {
+    return {
+      limits: makeUsageLimits({ checkedAt, windows: [] }),
       names: { overageIncluded: undefined },
     };
   }

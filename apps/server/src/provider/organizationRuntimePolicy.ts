@@ -1,7 +1,8 @@
-/** This VM organization uses manual capacity control. Provider failures remain visible;
- * quota polling and reset-time continuation must not dispatch work behind the owner. */
+/** This VM organization uses manual capacity control. Quota reads are display-only:
+ * they populate the Usage view but must not dispatch work behind the owner. Provider
+ * failures remain visible, and reset-time continuation stays off. */
 export function quotaReadsEnabled(): boolean {
-  return false;
+  return true;
 }
 
 export function automaticLimitRecoveryEnabled(): boolean {
