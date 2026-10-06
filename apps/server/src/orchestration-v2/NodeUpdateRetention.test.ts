@@ -101,8 +101,11 @@ const nodeEvent = (node: OrchestrationV2ExecutionNode, now: DateTime.Utc) =>
     payload: node,
   }) satisfies OrchestrationV2DomainEvent;
 
-/** A thread whose node `a` flips status `updates` times, plus one node `b` and a visit. */
-const seedThread = (threadId: ThreadId, updates: number) =>
+/**
+ * A thread whose node `a` flips status `updates` times, plus one node `b`,
+ * then `visits` thread events that are not node updates.
+ */
+const seedThread = (threadId: ThreadId, updates: number, visits = 1) =>
   Effect.gen(function* () {
     const eventSink = yield* EventSink.EventSinkV2;
     const now = yield* DateTime.now;
@@ -121,13 +124,15 @@ const seedThread = (threadId: ThreadId, updates: number) =>
       if (index === 1) events.push(nodeEvent(makeNode(threadId, "b", now, "completed"), now));
     }
     events.push(nodeEvent(makeNode(threadId, "a", now, "completed"), now));
-    events.push({
-      id: EventId.make(`event:retention:${eventCounter++}`),
-      type: "thread.visited",
-      threadId,
-      occurredAt: now,
-      payload: { ...makeThread(threadId, now), lastVisitedAt: now },
-    });
+    for (let index = 0; index < visits; index++) {
+      events.push({
+        id: EventId.make(`event:retention:${eventCounter++}`),
+        type: "thread.visited",
+        threadId,
+        occurredAt: now,
+        payload: { ...makeThread(threadId, now), lastVisitedAt: now },
+      });
+    }
     yield* eventSink.write({ events });
   });
 
@@ -142,23 +147,37 @@ const nodeRows = (threadId: ThreadId) =>
     `;
   });
 
-it.effect("prunes superseded node updates of idle threads in bounded batches", () =>
+const insertRun = (runId: string, threadId: ThreadId, status: string) =>
   Effect.gen(function* () {
     const sql = yield* SqlClient.SqlClient;
-    const projections = yield* ProjectionStore.ProjectionStoreV2;
-    const maintenance = yield* ProjectionMaintenance.ProjectionMaintenanceV2;
-    const retention = yield* NodeUpdateRetention.make;
-    const idle = ThreadId.make("thread:retention-idle");
-    const busy = ThreadId.make("thread:retention-busy");
-    const updates = NodeUpdateRetention.NODE_UPDATE_RETENTION_BATCH_SIZE * 2 + 500;
-    yield* seedThread(idle, updates);
-    yield* seedThread(busy, 3);
     yield* sql`
       INSERT INTO orchestration_v2_projection_runs (
         run_id, thread_id, ordinal, provider, status, requested_at, payload_json
       )
-      VALUES ('run:retention-busy', ${busy}, 1, 'codex', 'running', '1970-01-01T00:00:00.000Z', '{}')
+      VALUES (${runId}, ${threadId}, 1, 'codex', ${status}, '1970-01-01T00:00:00.000Z', '{}')
     `;
+  });
+
+const streamHead = (threadId: ThreadId) =>
+  Effect.gen(function* () {
+    const sql = yield* SqlClient.SqlClient;
+    return (yield* sql<{ readonly sequence: number }>`
+      SELECT MAX(sequence) AS sequence FROM orchestration_events WHERE stream_id = ${threadId}
+    `)[0]!.sequence;
+  });
+
+it.effect("spreads a large thread over passes of bounded deletions", () =>
+  Effect.gen(function* () {
+    const projections = yield* ProjectionStore.ProjectionStoreV2;
+    const maintenance = yield* ProjectionMaintenance.ProjectionMaintenanceV2;
+    const retention = yield* NodeUpdateRetention.make({ batchPause: 0 });
+    const perPass = NodeUpdateRetention.NODE_UPDATE_RETENTION_ROWS_PER_PASS;
+    const idle = ThreadId.make("thread:retention-idle");
+    const busy = ThreadId.make("thread:retention-busy");
+    const updates = perPass * 2 + 500;
+    yield* seedThread(idle, updates);
+    yield* seedThread(busy, 3);
+    yield* insertRun("run:retention-busy", busy, "running");
     const liveNodes = (yield* projections.getThreadProjection(idle)).nodes;
     const busyBefore = yield* nodeRows(busy);
 
@@ -167,12 +186,14 @@ it.effect("prunes superseded node updates of idle threads in bounded batches", (
     assert.equal((yield* nodeRows(idle)).length, updates + 4);
 
     yield* TestClock.adjust(NodeUpdateRetention.NODE_UPDATE_RETENTION_IDLE_MS + 1);
-    const pass = yield* retention.runPass;
+    // One thread's backlog never exceeds the per-pass budget; later passes resume it.
+    assert.deepEqual(yield* retention.runPass, { deletedRows: perPass, threads: 1 });
+    assert.deepEqual(yield* retention.runPass, { deletedRows: perPass, threads: 1 });
+    assert.deepEqual(yield* retention.runPass, { deletedRows: 500, threads: 1 });
     // The walk finished, so the next one waits for the interval.
     assert.deepEqual(yield* retention.runPass, { deletedRows: 0, threads: 0 });
 
     // Node `a` keeps only its newest row; `b`, the thread events and the busy thread stay.
-    assert.deepEqual(pass, { deletedRows: updates, threads: 1 });
     assert.deepEqual(
       (yield* nodeRows(idle)).map((row) => [row.event_type, row.node_id]),
       [
@@ -190,38 +211,48 @@ it.effect("prunes superseded node updates of idle threads in bounded batches", (
   }).pipe(Effect.provide(TestLayer)),
 );
 
-it.effect("deletes at most one batch per transaction and stops once a run starts", () =>
+it.effect("deletes in small transactions and stops once a run starts", () =>
   Effect.gen(function* () {
-    const sql = yield* SqlClient.SqlClient;
-    const retention = yield* NodeUpdateRetention.make;
+    const retention = yield* NodeUpdateRetention.make({ batchPause: 0 });
     const threadId = ThreadId.make("thread:retention-batches");
-    const updates = NodeUpdateRetention.NODE_UPDATE_RETENTION_BATCH_SIZE * 2 + 500;
-    yield* seedThread(threadId, updates);
-    const head = (yield* sql<{ readonly sequence: number }>`
-      SELECT MAX(sequence) AS sequence FROM orchestration_events WHERE stream_id = ${threadId}
-    `)[0]!.sequence;
-
-    const pruned = yield* retention.pruneThread(threadId, head);
-    assert.deepEqual(pruned, { deletedRows: updates, batches: 3, complete: true });
+    yield* seedThread(threadId, 1_000);
+    const pruned = yield* retention.pruneThread(
+      NodeUpdateRetention.startProgress(threadId, yield* streamHead(threadId)),
+      Number.POSITIVE_INFINITY,
+    );
+    assert.deepEqual(pruned, {
+      deletedRows: 1_000,
+      batches: 1_000 / NodeUpdateRetention.NODE_UPDATE_RETENTION_DELETE_BATCH_SIZE,
+      pages: 1,
+      status: "complete",
+    });
 
     // A thread that gains an active run is left alone inside the delete transaction.
     const other = ThreadId.make("thread:retention-started");
     yield* seedThread(other, 5);
-    yield* sql`
-      INSERT INTO orchestration_v2_projection_runs (
-        run_id, thread_id, ordinal, provider, status, requested_at, payload_json
-      )
-      VALUES ('run:retention-started', ${other}, 1, 'codex', 'queued', '1970-01-01T00:00:00.000Z', '{}')
-    `;
+    yield* insertRun("run:retention-started", other, "queued");
     const before = yield* nodeRows(other);
-    const otherHead = (yield* sql<{ readonly sequence: number }>`
-      SELECT MAX(sequence) AS sequence FROM orchestration_events WHERE stream_id = ${other}
-    `)[0]!.sequence;
-    assert.deepEqual(yield* retention.pruneThread(other, otherHead), {
-      deletedRows: 0,
-      batches: 0,
-      complete: false,
-    });
+    const stopped = yield* retention.pruneThread(
+      NodeUpdateRetention.startProgress(other, yield* streamHead(other)),
+      Number.POSITIVE_INFINITY,
+    );
+    assert.equal(stopped.status, "busy");
+    assert.equal(stopped.deletedRows, 0);
     assert.deepEqual(yield* nodeRows(other), before);
+  }).pipe(Effect.provide(TestLayer)),
+);
+
+it.effect("reads every event page by page when node updates are sparse", () =>
+  Effect.gen(function* () {
+    const retention = yield* NodeUpdateRetention.make({ batchPause: 0 });
+    const pageSize = NodeUpdateRetention.NODE_UPDATE_RETENTION_PAGE_SIZE;
+    const threadId = ThreadId.make("thread:retention-sparse");
+    // Three node updates sit beneath two and a half pages of other events.
+    yield* seedThread(threadId, 2, pageSize * 2 + pageSize / 2);
+    const pruned = yield* retention.pruneThread(
+      NodeUpdateRetention.startProgress(threadId, yield* streamHead(threadId)),
+      Number.POSITIVE_INFINITY,
+    );
+    assert.deepEqual(pruned, { deletedRows: 2, batches: 1, pages: 3, status: "complete" });
   }).pipe(Effect.provide(TestLayer)),
 );
