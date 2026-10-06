@@ -98,4 +98,27 @@ describe("resolveUsageLimitsAfterProbe", () => {
     expect(resolveUsageLimitsAfterProbe({ published, probed: unsupported })).toBe(unsupported);
     expect(resolveUsageLimitsAfterProbe({ published: undefined, probed: failed })).toBe(failed);
   });
+
+  it("keeps streamed windows when an available probe reports none", () => {
+    // A Team account's periodic get_usage returns `available: true` with no
+    // windows; that refresh must not wipe the rows a turn already streamed.
+    const probed = {
+      checkedAt: "2026-09-03T12:05:00.000Z",
+      windows: [],
+      resetCredits: { availableCount: 1 },
+    };
+    expect(resolveUsageLimitsAfterProbe({ published, probed })).toEqual({
+      ...published,
+      checkedAt: "2026-09-03T12:05:00.000Z",
+      resetCredits: { availableCount: 1 },
+    });
+  });
+
+  it("lets an available probe with windows replace the published ones", () => {
+    const probed = {
+      checkedAt: "2026-09-03T12:05:00.000Z",
+      windows: [{ ...session, usedPercent: 70 }],
+    };
+    expect(resolveUsageLimitsAfterProbe({ published, probed })).toBe(probed);
+  });
 });
