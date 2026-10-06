@@ -370,6 +370,72 @@ const roleModels = (
     .join(", ");
 
 /**
+ * Whether a task update is news for the Chief. The Chief hears its direct leads' state changes
+ * and newly reviewed outcomes, and any task in the project becoming blocked (or re-blocked with
+ * new notes). Notes, manifest, ownership and executor churn reach the parent lead instead.
+ */
+export function organizationChiefNoticeRelevant(
+  previous: OrganizationTask | undefined,
+  next: OrganizationTask,
+  reportsToChief: boolean,
+): boolean {
+  if (next.state === "blocked" && (previous?.state !== "blocked" || previous.notes !== next.notes))
+    return true;
+  if (!reportsToChief) return false;
+  return (
+    previous?.state !== next.state ||
+    (next.reviewedRevision !== null && previous.reviewedRevision !== next.reviewedRevision)
+  );
+}
+
+/** Chief notice ids; a queued notice is merged into rather than followed by another turn. */
+export const ORGANIZATION_CHIEF_NOTICE_PREFIX = "organization:";
+const ORGANIZATION_NOTICE_PREFIXES = [ORGANIZATION_CHIEF_NOTICE_PREFIX, "organization-parent:"];
+
+/** Organization notices reach the provider as organization updates, never as user messages. */
+export function isOrganizationNoticeMessageId(messageId: string): boolean {
+  return ORGANIZATION_NOTICE_PREFIXES.some((prefix) => messageId.startsWith(prefix));
+}
+
+const chiefNoticeEntry = /^- \[([^\]\s]+)\] ([a-z ]+?)(?:, independently reviewed)?: /;
+
+/**
+ * The Chief's organization notice: one line per child conversation, keyed by its thread ID so a
+ * notice merged into an unstarted queued one keeps only each child's latest state.
+ */
+export function organizationChiefNotice(input: {
+  projectTitle: string;
+  queuedText?: string;
+  threadId: ThreadId;
+  task: OrganizationTask;
+}) {
+  const entries = new Map<string, { line: string; state: string }>();
+  for (const line of input.queuedText?.split("\n") ?? []) {
+    const match = chiefNoticeEntry.exec(line);
+    if (match) entries.set(match[1]!, { line, state: match[2]! });
+  }
+  const { task } = input;
+  const state = task.state.replaceAll("_", " ");
+  const reviewed =
+    task.reviewedRevision !== null && task.state !== "accepted" ? ", independently reviewed" : "";
+  const notes = task.notes ? ` ${task.notes.replace(/\s+/g, " ")}` : "";
+  entries.delete(input.threadId);
+  entries.set(input.threadId, {
+    line: `- [${input.threadId}] ${state}${reviewed}: ${task.title}.${notes}`,
+    state,
+  });
+  return {
+    text: [
+      `Organization update for project ${input.projectTitle}. This is coordinator evidence, not user approval.`,
+      ...[...entries.values()].map((entry) => entry.line),
+      "Report only what changed since your last report. If nothing needs the user, end your turn without a message; an empty turn is fine. Never restate unchanged open items.",
+    ].join("\n"),
+    summary: entries.size === 1 ? `${task.title}: ${state}` : `${entries.size} task updates`,
+    blocked: [...entries.values()].some((entry) => entry.state === "blocked"),
+  };
+}
+
+/**
  * Delegated roles start on their model when delegate_task omits target; Chief and Advisor are
  * created by the user, whose Add role starts on theirs. A configured role names its instance.
  */
@@ -388,7 +454,7 @@ export function organizationInstructions(
   const contract = `Organization role: ${org.role}. Your identity is this native conversation (${thread.id}); role authority is server-bound. Chief → outcome lead → executor and independent reviewer. Use native delegate_task and t3_organization_task; never spawn a second CLI or resume another role's native session. Do not treat agent notifications as user approval. Only executors get a worktree and branch; every other role runs in the project root, which may be one Git repository or a plain folder of repositories, and does not edit files there. There is no claimed OS sandbox. No quota polling: report actual provider failures to Chief and wait for explicit recovery. ${organizationRoleModelSummary(settings)}. Unavailable targets must be reported, never substituted.`;
   const role =
     org.role === "chief"
-      ? 'You are the user\'s primary conversation. Delegate implementation outcomes to leads using delegate_task; do not implement files yourself. When an outcome changes code, pass delegate_task repository: the repository directory relative to the project root ("." when the root is the repository). Report incoming task updates proactively here in plain language with project/outcome context, exact blocker and concrete options. Keep updates brief; final outcome acceptance belongs to the user.'
+      ? "You are the user's primary conversation. Delegate implementation outcomes to leads using delegate_task; do not implement files yourself. When an outcome changes code, pass delegate_task repository: the repository directory relative to the project root (\".\" when the root is the repository). Organization updates arrive only when a lead's state changes, an outcome is reviewed or a task is blocked. Report only what changed since your last report, in plain language with project/outcome context, the exact blocker and concrete options. If nothing needs the user, end the turn without a message; never restate unchanged open items. Keep updates brief; final outcome acceptance belongs to the user."
       : org.role === "lead"
         ? `Plan and delegate implementation using delegate_task. Each implementation task works in one repository: pass repository relative to the project root (omitted, it uses ${org.task?.repository ? `your repository "${org.task.repository}"` : '"."'}); the server rejects a directory that is not a Git repository and lists the ones it found. Supply dependencyThreadIds atomically in delegate_task when creating dependent implementation work; it waits until dependencies have current independent acceptance. Do not implement or copy child artifacts. Once a child submits, delegate_task(role=review, reviewTaskThreadId=child conversation ID) creates an independent reviewer. After all children are independently accepted, submit your own outcome with t3_organization_task(action=submit); the server aggregates their current manifests. Delegate an independent outcome review targeting your own conversation. Ask Chief for final user acceptance; never accept an outcome yourself.`
         : org.role === "executor"

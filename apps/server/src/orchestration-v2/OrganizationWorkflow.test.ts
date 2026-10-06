@@ -358,6 +358,15 @@ it.effect(
           (message) => message.id === "organization-parent:review",
         ),
       );
+      const chiefNotices = threads
+        .getThreadProjection(chief)
+        .pipe(
+          Effect.map((projection) =>
+            projection.messages.filter((message) => message.id.startsWith("organization:")),
+          ),
+        );
+      // Executor submission, assignment and review reach the lead, not the Chief.
+      assert.deepEqual(yield* chiefNotices, []);
       yield* update(lead, "consolidate", { state: "awaiting_review" }, lead);
       current = (yield* threads.getThreadProjection(lead)).thread.organization!.task!;
       assert.deepEqual(current.dependencyThreadIds, [executor]);
@@ -368,6 +377,16 @@ it.effect(
         "review-final",
         { reviewedRevision: current.revision, reviewerThreadId: reviewer },
         reviewer,
+      );
+      // A reviewed outcome is news even though the lead's state is unchanged.
+      const reviewedNotices = yield* chiefNotices;
+      assert.deepEqual(
+        reviewedNotices.map((message) => message.id),
+        ["organization:consolidate", "organization:review-final"],
+      );
+      assert.include(
+        reviewedNotices[1]?.text,
+        `[${lead}] awaiting review, independently reviewed:`,
       );
       const forbidden = yield* update(lead, "agent-accept", { state: "accepted" }, chief).pipe(
         Effect.result,
@@ -1429,7 +1448,7 @@ const taskNoticeSetup = Effect.gen(function* () {
   yield* create(chief, { role: "chief", parentThreadId: null });
   yield* create(lead, { role: "lead", parentThreadId: chief, task: task(lead) });
   yield* create(executor, { role: "executor", parentThreadId: lead, task: task(executor) });
-  const block = (id: ThreadId, key: string, actor = id) =>
+  const update = (id: ThreadId, key: string, patch: Partial<OrganizationTask>, actor = id) =>
     Effect.gen(function* () {
       const org = (yield* threads.getThreadProjection(id)).thread.organization!;
       yield* threads.dispatch({
@@ -1437,9 +1456,11 @@ const taskNoticeSetup = Effect.gen(function* () {
         commandId: CommandId.make(key),
         threadId: id,
         organizationActorThreadId: actor,
-        organization: { ...org, task: { ...org.task!, state: "blocked", notes: "Needs input." } },
+        organization: { ...org, task: { ...org.task!, ...patch } },
       });
     });
+  const block = (id: ThreadId, key: string, actor = id) =>
+    update(id, key, { state: "blocked", notes: "Needs input." }, actor);
   const notices = (id: ThreadId) =>
     threads
       .getThreadProjection(id)
@@ -1450,7 +1471,10 @@ const taskNoticeSetup = Effect.gen(function* () {
       );
   const noticeIds = (id: ThreadId) =>
     notices(id).pipe(Effect.map((messages) => messages.map((message) => message.id as string)));
-  return { orchestrator, chief, lead, executor, block, notices, noticeIds };
+  const chiefRuns = threads
+    .getThreadProjection(chief)
+    .pipe(Effect.map((projection) => projection.runs));
+  return { orchestrator, chief, lead, executor, update, block, notices, noticeIds, chiefRuns };
 });
 
 const taskNoticeLayer = ThreadManagement.layer.pipe(
@@ -1503,5 +1527,66 @@ it.effect("a child update under an archived lead is refused and sends no notices
     assert.equal(orphaned._tag, "Failure");
     assert.deepEqual(yield* noticeIds(chief), []);
     assert.deepEqual(yield* noticeIds(lead), []);
+  }).pipe(Effect.provide(taskNoticeLayer)),
+);
+
+it.effect("the Chief hears only status changes of its leads and blocked work", () =>
+  Effect.gen(function* () {
+    const { chief, lead, executor, update, noticeIds } = yield* taskNoticeSetup;
+    yield* update(lead, "lead-notes", { notes: "Planning the outcome." });
+    yield* update(lead, "lead-manifest", { manifest: ["plan.md"] });
+    // Executor claims and progress belong to the parent lead.
+    yield* update(executor, "executor-claim", { state: "working" });
+    yield* update(executor, "executor-notes", { notes: "Halfway." });
+    assert.deepEqual(yield* noticeIds(chief), []);
+    assert.deepEqual(yield* noticeIds(lead), [
+      "organization-parent:executor-claim",
+      "organization-parent:executor-notes",
+    ]);
+    yield* update(lead, "lead-claim", { state: "working" });
+    assert.deepEqual(yield* noticeIds(chief), ["organization:lead-claim"]);
+  }).pipe(Effect.provide(taskNoticeLayer)),
+);
+
+it.effect("the Chief is not woken by its own task updates", () =>
+  Effect.gen(function* () {
+    const { chief, lead, block, noticeIds } = yield* taskNoticeSetup;
+    yield* block(lead, "chief-blocks-lead", chief);
+    assert.deepEqual(yield* noticeIds(chief), []);
+  }).pipe(Effect.provide(taskNoticeLayer)),
+);
+
+it.effect("queued Chief notices merge into one turn with each task's latest state", () =>
+  Effect.gen(function* () {
+    const { chief, lead, executor, update, block, notices, noticeIds, chiefRuns } =
+      yield* taskNoticeSetup;
+    // The first notice starts a Chief turn; the next one queues behind it.
+    yield* update(lead, "lead-claim", { state: "working" });
+    yield* block(executor, "executor-blocked");
+    yield* block(lead, "lead-blocked");
+    yield* update(lead, "lead-unblocked", { state: "working", notes: null });
+    assert.sameMembers(yield* noticeIds(chief), [
+      "organization:lead-claim",
+      "organization:executor-blocked",
+    ]);
+    const runs = yield* chiefRuns;
+    assert.equal(runs.length, 2);
+    const queued = runs.filter((run) => run.status === "queued");
+    assert.deepEqual(
+      queued.map((run) => run.userMessageId),
+      ["organization:executor-blocked"],
+    );
+    const merged = (yield* notices(chief)).find(
+      (message) => message.id === "organization:executor-blocked",
+    )!;
+    const lines = merged.text.split("\n").filter((line) => line.startsWith("- ["));
+    assert.deepEqual(lines, [
+      `- [${executor}] blocked: ${executor} work. Needs input.`,
+      `- [${lead}] working: ${lead} work.`,
+    ]);
+    assert.equal(merged.notification?.outcome, "failed");
+    assert.equal(merged.notification?.summary, "2 task updates");
+    assert.notInclude(merged.text, "Explain the outcome");
+    assert.include(merged.text, "end your turn without a message");
   }).pipe(Effect.provide(taskNoticeLayer)),
 );

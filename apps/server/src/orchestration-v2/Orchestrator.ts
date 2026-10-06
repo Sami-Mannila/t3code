@@ -11,6 +11,9 @@ import {
   organizationRepository,
   organizationPreparationUnblock,
   organizationPreparesRuns,
+  organizationChiefNoticeRelevant,
+  organizationChiefNotice,
+  ORGANIZATION_CHIEF_NOTICE_PREFIX,
 } from "./OrganizationPolicy.ts";
 import {
   latestExecutedRun,
@@ -3256,7 +3259,16 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
           item.archivedAt === null &&
           item.deletedAt === null,
       );
-      const notifyChief = chief !== undefined && chief.id !== thread.id;
+      // The Chief hears status changes, never its own updates or worker churn.
+      const notifyChief =
+        chief !== undefined &&
+        chief.id !== thread.id &&
+        chief.id !== command.organizationActorThreadId &&
+        organizationChiefNoticeRelevant(
+          thread.organization?.task,
+          command.organization.task,
+          thread.organization?.parentThreadId === chief.id,
+        );
       // The parent coordinator owns the next step after a child task changes.
       const parent = snapshot.threads.find(
         (item) =>
@@ -3297,11 +3309,59 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
         if (notifyChief) {
           const project = yield* projects.get(thread.projectId).pipe(mapDispatchError(command));
           const projectTitle = Option.isSome(project) ? project.value.title : thread.projectId;
-          yield* notice(
-            chief.id,
-            MessageId.make(`organization:${command.commandId}`),
-            `Organization update for project ${projectTitle}. ${summary}. ${task.notes ?? ""} This is coordinator evidence, not user approval. Explain the outcome and any decision options briefly in this Chief conversation.`,
+          // Like delegated completions, an unstarted queued notice absorbs later ones so the
+          // Chief takes one turn for a burst of updates.
+          const chiefProjection = yield* getProjectionWithPendingEvents(chief.id, events);
+          const queued = chiefProjection.messages.find(
+            (message) =>
+              message.id.startsWith(ORGANIZATION_CHIEF_NOTICE_PREFIX) &&
+              chiefProjection.runs.some(
+                (run) =>
+                  run.userMessageId === message.id &&
+                  run.status === "queued" &&
+                  run.startedAt === null,
+              ),
           );
+          const chiefNotice = organizationChiefNotice({
+            projectTitle,
+            ...(queued ? { queuedText: queued.text } : {}),
+            threadId: thread.id,
+            task,
+          });
+          if (queued) {
+            const now = yield* DateTime.now;
+            yield* emit(
+              events,
+              command,
+            )({
+              type: "message.updated",
+              threadId: chief.id,
+              ...(queued.runId === null ? {} : { runId: queued.runId }),
+              ...(queued.nodeId === null ? {} : { nodeId: queued.nodeId }),
+              providerInstanceId: chiefProjection.thread.providerInstanceId,
+              occurredAt: now,
+              payload: {
+                ...queued,
+                text: chiefNotice.text,
+                ...(queued.notification
+                  ? {
+                      notification: {
+                        ...queued.notification,
+                        outcome: chiefNotice.blocked ? "failed" : "updated",
+                        summary: chiefNotice.summary,
+                      },
+                    }
+                  : {}),
+                updatedAt: now,
+              },
+            });
+          } else {
+            yield* notice(
+              chief.id,
+              MessageId.make(`${ORGANIZATION_CHIEF_NOTICE_PREFIX}${command.commandId}`),
+              chiefNotice.text,
+            );
+          }
         }
         if (parent) {
           yield* notice(
