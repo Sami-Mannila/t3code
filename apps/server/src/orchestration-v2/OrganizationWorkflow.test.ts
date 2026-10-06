@@ -1650,7 +1650,7 @@ it("only an idle lead that ended cleanly without asking is flagged blocked", () 
     progress: "result_available" as const,
     hasOpenQuestion: false,
     resultText: "  Which release\nshould I ship?  ",
-    resultRunStartedAt: undefined,
+    resultRunCompletedAt: undefined,
   };
   const blocked = organizationIdleLeadBlock(base)!;
   assert.equal(blocked.state, "blocked");
@@ -1682,9 +1682,11 @@ it("only an idle lead that ended cleanly without asking is flagged blocked", () 
         ...task("working"),
         roundStartedAt: "2026-01-02T00:00:00.000Z" as OrganizationTask["roundStartedAt"],
       },
-      resultRunStartedAt: "2026-01-01T00:00:00.000Z",
+      resultRunCompletedAt: "2026-01-01T00:00:00.000Z",
     }),
   );
+  // An extend steers its brief into the active run: it started before the round but ends after
+  // it, so the run is the new round's and must be blocked when it ends idle.
   assert.isNotNull(
     organizationIdleLeadBlock({
       ...base,
@@ -1692,7 +1694,7 @@ it("only an idle lead that ended cleanly without asking is flagged blocked", () 
         ...task("working"),
         roundStartedAt: "2026-01-02T00:00:00.000Z" as OrganizationTask["roundStartedAt"],
       },
-      resultRunStartedAt: "2026-01-02T01:00:00.000Z",
+      resultRunCompletedAt: "2026-01-02T01:00:00.000Z",
     }),
   );
   // A failed run is forwarded too, and the notes stay one bounded line.

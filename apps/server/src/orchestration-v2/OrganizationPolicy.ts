@@ -414,7 +414,9 @@ const IDLE_LEAD_BLOCK_PREFIX = "Stopped without submitting or asking the user. L
  * Chief, has neither submitted, asked the user, nor blocked. The server records the round blocked
  * with the lead's last message so the Chief hears it instead of silence. A queued, awaiting,
  * accepted, in-correction, or already-blocked round is a deliberate state and is left alone, as
- * is a result run that predates the current round (the round was extended after that run ended).
+ * is a result run that ended before the current round began (the round was extended after that
+ * run ended). The run's end, not its start, decides: an extend steers its brief into the active
+ * run, which started before the round but does the new round's work.
  */
 export function organizationIdleLeadBlock(input: {
   readonly task: OrganizationTask;
@@ -422,8 +424,8 @@ export function organizationIdleLeadBlock(input: {
   readonly progress: "working" | "waiting_for_children" | "result_available";
   readonly hasOpenQuestion: boolean;
   readonly resultText: string;
-  /** The result run's start; absent when it never recorded one. */
-  readonly resultRunStartedAt: string | undefined;
+  /** The result run's end; absent when it never recorded one. */
+  readonly resultRunCompletedAt: string | undefined;
 }): OrganizationTask | null {
   if (ORGANIZATION_EXTENDABLE_STATES.has(input.task.state)) return null;
   if (input.runStatus !== "completed" && input.runStatus !== "failed") return null;
@@ -432,8 +434,8 @@ export function organizationIdleLeadBlock(input: {
   const roundStartedAt = input.task.roundStartedAt;
   if (
     roundStartedAt !== undefined &&
-    input.resultRunStartedAt !== undefined &&
-    Date.parse(input.resultRunStartedAt) < Date.parse(roundStartedAt)
+    input.resultRunCompletedAt !== undefined &&
+    Date.parse(input.resultRunCompletedAt) < Date.parse(roundStartedAt)
   )
     return null;
   const excerpt = input.resultText.replace(/\s+/g, " ").trim();
