@@ -16,6 +16,7 @@ import {
 import * as DateTime from "effect/DateTime";
 import * as Effect from "effect/Effect";
 import * as Layer from "effect/Layer";
+import * as SqlClient from "effect/unstable/sql/SqlClient";
 
 import * as ServerConfig from "./config.ts";
 import * as GitManager from "./git/GitManager.ts";
@@ -88,40 +89,75 @@ function shell(
 }
 
 describe("idle worktree eligibility", () => {
-  const executor = (state: "working" | "accepted"): OrganizationThread => ({
-    role: "executor",
-    parentThreadId: ThreadId.make("lead"),
-    task: {
-      title: "Task",
-      ownerThreadId: ThreadId.make("executor"),
-      dependencyThreadIds: [],
-      state,
-      revision: null,
-      reviewedRevision: null,
-      reviewerThreadId: null,
-      notes: null,
-    },
+  type TaskState = NonNullable<OrganizationThread["task"]>["state"];
+  const task = (owner: string, state: TaskState): NonNullable<OrganizationThread["task"]> => ({
+    title: "Task",
+    ownerThreadId: ThreadId.make(owner),
+    dependencyThreadIds: [],
+    state,
+    revision: null,
+    reviewedRevision: null,
+    reviewerThreadId: null,
+    notes: null,
   });
+  const settledAt = DateTime.makeUnsafe(NOW_MS - IDLE_WORKTREE_RETENTION_MS);
+  const none = new Map<string, OrchestrationV2ThreadShell>();
+  const removable = (
+    thread: OrchestrationV2ThreadShell,
+    others: ReadonlyArray<OrchestrationV2ThreadShell> = [],
+  ) => idleWorktreeRemovable(thread, NOW_MS, new Map(others.map((other) => [other.id, other])));
 
-  it("waits for an hour without activity", () => {
-    expect(idleWorktreeRemovable(shell("idle"), NOW_MS)).toBe(true);
+  it("prunes ordinary threads only once they are settled and quiet for an hour", () => {
+    expect(idleWorktreeRemovable(shell("unsettled"), NOW_MS, none)).toBe(false);
+    expect(removable(shell("settled", { settledAt }))).toBe(true);
+    expect(removable(shell("pinned-settled", { settledOverride: "settled" }))).toBe(true);
     const recent = DateTime.makeUnsafe(NOW_MS - IDLE_WORKTREE_RETENTION_MS / 2);
-    expect(idleWorktreeRemovable(shell("recent", { latestRunCompletedAt: recent }), NOW_MS)).toBe(
-      false,
-    );
-    expect(
-      idleWorktreeRemovable(shell("running", { status: "running", activeRunId: null }), NOW_MS),
-    ).toBe(false);
+    expect(removable(shell("recent", { settledAt, latestRunCompletedAt: recent }))).toBe(false);
+    expect(removable(shell("running", { settledAt, status: "running" }))).toBe(false);
   });
 
-  it("keeps an executor's worktree while its task is being worked on", () => {
-    const withRole = (organization: OrganizationThread) =>
-      idleWorktreeRemovable(shell("org", { organization }), NOW_MS);
-    expect(withRole({ role: "reviewer", parentThreadId: ThreadId.make("lead") })).toBe(true);
-    expect(withRole({ role: "lead", parentThreadId: ThreadId.make("chief") })).toBe(true);
-    expect(withRole(executor("working"))).toBe(false);
-    expect(withRole(executor("accepted"))).toBe(true);
-    expect(withRole({ role: "chief", parentThreadId: null })).toBe(false);
+  it("prunes organization reviewers, leads and executors that are not working", () => {
+    const org = (organization: OrganizationThread) => removable(shell("org", { organization }));
+    expect(org({ role: "reviewer", parentThreadId: ThreadId.make("lead") })).toBe(true);
+    expect(org({ role: "lead", parentThreadId: ThreadId.make("chief") })).toBe(true);
+    expect(org({ role: "chief", parentThreadId: null })).toBe(false);
+    const executor = (state: TaskState): OrganizationThread => ({
+      role: "executor",
+      parentThreadId: ThreadId.make("lead"),
+      task: task("executor", state),
+    });
+    expect(org(executor("working"))).toBe(false);
+    for (const state of ["queued", "blocked", "changes_requested"] as const) {
+      expect(org(executor(state))).toBe(true);
+    }
+  });
+
+  it("keeps submitted and accepted executor work until its lead's outcome is final", () => {
+    const lead = (state: TaskState, overrides: Partial<OrchestrationV2ThreadShell> = {}) =>
+      shell("lead", {
+        organization: {
+          role: "lead",
+          parentThreadId: ThreadId.make("chief"),
+          task: task("lead", state),
+        },
+        ...overrides,
+      });
+    for (const state of ["awaiting_review", "accepted"] as const) {
+      const child = shell("executor", {
+        organization: {
+          role: "executor",
+          parentThreadId: ThreadId.make("lead"),
+          task: task("executor", state),
+        },
+      });
+      expect(removable(child, [lead("working")])).toBe(false);
+      expect(removable(child, [lead("awaiting_review")])).toBe(false);
+      // An unknown lead cannot vouch for its outcome.
+      expect(removable(child)).toBe(false);
+      expect(removable(child, [lead("accepted")])).toBe(true);
+      expect(removable(child, [lead("working", { archivedAt: settledAt })])).toBe(true);
+      expect(removable({ ...child, archivedAt: settledAt }, [lead("working")])).toBe(true);
+    }
   });
 
   it("allows only reproducible caches among untracked and ignored files", () => {
@@ -159,7 +195,17 @@ describe("idle worktree removal", () => {
       git(repo, "commit", "-m", "init");
       NodeFS.mkdirSync(config.worktreesDir, { recursive: true });
       const worktreesDir = NodeFS.realpathSync(config.worktreesDir);
-      const names = ["clean", "caches", "dirty", "untracked", "output", "active", "recent"];
+      const names = [
+        "clean",
+        "caches",
+        "dirty",
+        "untracked",
+        "output",
+        "active",
+        "recent",
+        "unsettled",
+        "queued",
+      ];
       const worktree = (name: string) => NodePath.join(worktreesDir, name);
       for (const name of names) git(repo, "worktree", "add", "-b", `t3/${name}`, worktree(name));
       NodeFS.mkdirSync(NodePath.join(worktree("caches"), "node_modules", "pkg"), {
@@ -177,6 +223,7 @@ describe("idle worktree removal", () => {
         ...names.map((name) =>
           shell(name, {
             worktreePath: worktree(name),
+            settledAt: name === "unsettled" ? null : DateTime.makeUnsafe(NOW_MS - 1),
             ...(name === "active"
               ? { status: "running" as const, activeRunId: null }
               : name === "recent"
@@ -191,11 +238,31 @@ describe("idle worktree removal", () => {
       );
       projects.splice(0, projects.length, { id: PROJECT_ID, workspaceRoot: repo });
 
+      // The shell still reads idle, but a run was queued after it was read.
+      const sql = yield* SqlClient.SqlClient;
+      yield* sql`
+        INSERT INTO orchestration_v2_projection_runs (
+          run_id, thread_id, ordinal, provider, status, requested_at, payload_json
+        )
+        VALUES (
+          'run:queued', ${ThreadId.make("queued")}, 1, 'codex', 'queued',
+          '1970-01-01T00:00:00.000Z', '{}'
+        )
+      `;
+
       const cleanup = yield* makeStorageCleanup;
       assert.equal(yield* cleanup.cleanIdleWorktrees(NOW_MS), 2);
 
       const remaining = names.filter((name) => NodeFS.existsSync(worktree(name)));
-      expect(remaining).toEqual(["dirty", "untracked", "output", "active", "recent"]);
+      expect(remaining).toEqual([
+        "dirty",
+        "untracked",
+        "output",
+        "active",
+        "recent",
+        "unsettled",
+        "queued",
+      ]);
       expect(
         NodeFS.readFileSync(NodePath.join(worktree("output"), "dist", "report.json"), "utf8"),
       ).toBe("{}");

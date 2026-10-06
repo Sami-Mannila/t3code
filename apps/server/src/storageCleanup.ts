@@ -98,10 +98,10 @@ export function storageCleanupThreadIdle(thread: OrchestrationV2ThreadShell, now
 }
 
 /**
- * Owner policy: a thread's worktree is removed once the thread has been idle
- * this long. The branch stays, and the next turn checks the worktree out again
- * (ProviderTurnStartService for ordinary threads, OrganizationWorkspace.prepare
- * for organization executors).
+ * Owner policy: an idle worktree is removed once its thread has been quiet this
+ * long, for organization threads and for settled ordinary threads. The branch
+ * stays, and the next turn checks the worktree out again (ProviderTurnStartService
+ * for ordinary threads, OrganizationWorkspace.prepare for organization executors).
  */
 export const IDLE_WORKTREE_RETENTION_MS = 60 * 60_000;
 const IDLE_WORKTREE_SWEEP_INTERVAL = "10 minutes";
@@ -110,22 +110,43 @@ const IDLE_WORKTREE_REMOVALS_PER_PASS = 3;
 const REPRODUCIBLE_IGNORED_PATH = /(^|\/)(node_modules|__pycache__|\.venv)\/$/;
 
 /**
- * Whether an idle thread may lose its worktree. Reviewers and leads never need
- * one; an executor keeps its worktree while its task is being worked on.
+ * Whether an idle thread may lose its worktree. Unsettled ordinary threads keep
+ * theirs. Reviewers and leads never need one. An executor keeps its worktree
+ * while its task is being worked on, and while a submitted or accepted task can
+ * still be reviewed or consolidated from it: until its lead's outcome is
+ * accepted, or the lead or executor is archived. `threads` resolves the lead.
  */
-export function idleWorktreeRemovable(thread: OrchestrationV2ThreadShell, now: number): boolean {
+export function idleWorktreeRemovable(
+  thread: OrchestrationV2ThreadShell,
+  now: number,
+  threads: ReadonlyMap<string, OrchestrationV2ThreadShell>,
+): boolean {
   if (!storageCleanupThreadIdle(thread, now)) return false;
   if (storageCleanupActivityAt(thread) > now - IDLE_WORKTREE_RETENTION_MS) return false;
   const organization = thread.organization;
-  if (organization == null) return true;
+  if (organization == null)
+    return thread.settledOverride === "settled" || thread.settledAt !== null;
   if (organization.role === "reviewer" || organization.role === "lead") return true;
-  return organization.role === "executor" && organization.task?.state !== "working";
+  if (organization.role !== "executor") return false;
+  const state = organization.task?.state;
+  if (state === "working") return false;
+  if (state !== "awaiting_review" && state !== "accepted") return true;
+  if (thread.archivedAt !== null) return true;
+  const lead =
+    organization.parentThreadId === null ? undefined : threads.get(organization.parentThreadId);
+  return (
+    lead !== undefined &&
+    (lead.archivedAt !== null || lead.organization?.task?.state === "accepted")
+  );
 }
 
 /**
  * Entries of `git status --porcelain=v1 -z --ignored` that are not reproducible
  * caches: modified or untracked files and ignored build output.
  */
+const threadsById = (threads: ReadonlyArray<OrchestrationV2ThreadShell>) =>
+  new Map<string, OrchestrationV2ThreadShell>(threads.map((thread) => [thread.id, thread]));
+
 export function unsavedWorktreeEntries(porcelain: string): ReadonlyArray<string> {
   return porcelain
     .split("\0")
@@ -489,13 +510,14 @@ export const make = Effect.gen(function* () {
     )
       return false;
     // Re-read after the Git calls so a queued turn or a new thread on this path cancels it.
-    const latest = (yield* readThreads()).threads.filter(
+    const latestThreads = (yield* readThreads()).threads;
+    const latest = latestThreads.filter(
       (entry) => entry.worktreePath !== null && path.resolve(entry.worktreePath) === worktreePath,
     );
     if (
       latest.length !== 1 ||
       latest[0]!.id !== thread.id ||
-      !idleWorktreeRemovable(latest[0]!, now) ||
+      !idleWorktreeRemovable(latest[0]!, now, threadsById(latestThreads)) ||
       storageCleanupActivityAt(latest[0]!) !== storageCleanupActivityAt(thread) ||
       hasTerminal(worktreePath)
     )
@@ -506,6 +528,18 @@ export const make = Effect.gen(function* () {
       head.commitSha
     )
       return false;
+    // Last step under the lease: turn starts and organization preparation take the
+    // same lease to ensure the checkout, and their run is persisted before they do.
+    const busy = yield* sql`
+      SELECT 1 FROM orchestration_v2_projection_runs
+      WHERE thread_id = ${thread.id}
+        AND status IN ('queued', 'preparing', 'starting', 'running', 'waiting')
+      UNION ALL
+      SELECT 1 FROM orchestration_v2_projection_runtime_requests
+      WHERE thread_id = ${thread.id} AND status = 'pending'
+      LIMIT 1
+    `;
+    if (busy.length > 0) return false;
     const repositoryRoot = organizationRepositoryRoot(project.workspaceRoot, thread);
     yield* git.removeWorktree({ cwd: repositoryRoot, path: worktreePath, force: false });
     yield* gitManager.invalidateStatus(repositoryRoot);
@@ -525,6 +559,7 @@ export const make = Effect.gen(function* () {
     if (!(yield* fs.exists(config.worktreesDir))) return 0;
     const root = yield* fs.realPath(config.worktreesDir);
     const { threads } = yield* readThreads();
+    const byId = threadsById(threads);
     const sharedPaths = Map.groupBy(
       threads.filter((thread) => thread.worktreePath !== null),
       (thread) => path.resolve(thread.worktreePath!),
@@ -533,7 +568,7 @@ export const make = Effect.gen(function* () {
     for (const group of sharedPaths.values()) {
       if (removed >= IDLE_WORKTREE_REMOVALS_PER_PASS) break;
       const thread = group[0]!;
-      if (group.length !== 1 || !idleWorktreeRemovable(thread, now)) continue;
+      if (group.length !== 1 || !idleWorktreeRemovable(thread, now, byId)) continue;
       const worktreePath = path.resolve(thread.worktreePath!);
       const didRemove = yield* removeIdleWorktree(thread, root, now).pipe(
         (effect) => withWorkspaceLease(worktreePath, effect),
