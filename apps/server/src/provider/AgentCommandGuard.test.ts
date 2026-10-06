@@ -80,6 +80,7 @@ describe("agent gh shim", () => {
         // The merges API merges a branch into another.
         ["api", "-X", "POST", "repos/acme/app/merges"],
         ["api", "repos/acme/app/merges?x=1"],
+        ["api", "graphql", "-f", "query=mutation { mergeBranch(input: {}) { x } }"],
       ]) {
         const result = yield* gh(...args);
         expect(result.code, args.join(" ")).toBe(1);

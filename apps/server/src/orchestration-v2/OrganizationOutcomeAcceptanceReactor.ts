@@ -56,6 +56,9 @@ export class OrganizationOutcomeAcceptanceReactor extends Context.Service<
 const SWEEP_DEBOUNCE = Duration.seconds(3);
 /** A refused acceptance whose inputs did not change is retried once per this window. */
 const ATTEMPT_BUCKET_MS = 3_600_000;
+/** Failed branch lookups in a row, or how long they may fail, before the Chief hears of it. */
+const LOOKUP_FAILURES_BEFORE_NOTICE = 3;
+const LOOKUP_FAILURE_NOTICE_MS = 3_600_000;
 /** How long a branch's pull request lookup is reused. */
 const BRANCH_LOOKUP_TTL_MS = 60_000;
 
@@ -93,14 +96,17 @@ export const make = Effect.gen(function* () {
   const vcs = yield* GitManager.GitManager;
   const branchLookups = new Map<string, { at: number; value: OutcomePullRequest | null }>();
 
+  /** Consecutive failed branch lookups per lead revision, to tell the Chief once they persist. */
+  const lookupFailures = new Map<string, { count: number; since: number; told: boolean }>();
+
   /**
-   * The pull request open from an implementation task's branch, linked or not. `undefined`
-   * when the host could not be asked: the lead then waits for a later sweep, since only a real
-   * "no pull request" answer may let it through. Failures are not cached.
+   * The pull request open from an implementation task's branch, linked or not, or the lookup
+   * failure: the lead then waits for a later sweep, since only a real "no pull request" answer
+   * may let it through. Failures are not cached.
    */
   const branchPullRequest = (
     thread: OrchestrationV2ThreadShell,
-  ): Effect.Effect<OutcomePullRequest | null | undefined> =>
+  ): Effect.Effect<OutcomePullRequest | null | { readonly lookupFailed: string }> =>
     Effect.gen(function* () {
       if (!thread.branch || !thread.worktreePath) return null;
       const key = `${thread.worktreePath}\0${thread.branch}`;
@@ -115,7 +121,7 @@ export const make = Effect.gen(function* () {
           threadId: thread.id,
           cause: lookup.failure,
         });
-        return undefined;
+        return { lookupFailed: failureReason(lookup.failure) };
       }
       const found = lookup.success;
       const parsed = found ? parseChangeRequestUrl(found.url) : null;
@@ -199,16 +205,49 @@ export const make = Effect.gen(function* () {
       const withBranches = yield* Effect.forEach(task.dependencyThreadIds, (id) =>
         Effect.gen(function* () {
           const thread = byId.get(id);
-          if (!thread) return { thread: undefined, unknown: false };
+          if (!thread) return { thread: undefined, failed: undefined };
           const found = yield* branchPullRequest(thread);
-          return {
-            thread: { ...outcomeThread(thread), branchPullRequest: found ?? null },
-            unknown: found === undefined,
-          };
+          return found !== null && "lookupFailed" in found
+            ? { thread: undefined, failed: { child: thread, reason: found.lookupFailed } }
+            : { thread: { ...outcomeThread(thread), branchPullRequest: found }, failed: undefined };
         }),
       );
-      // A branch the host could not be asked about may carry an open pull request.
-      if (withBranches.some((entry) => entry.unknown)) continue;
+      const failureKey = `${lead.id}:${revision}`;
+      const failed = withBranches.find((entry) => entry.failed)?.failed;
+      // A branch the host could not be asked about may carry an open pull request: hold, and
+      // tell the Chief once it keeps failing.
+      if (failed) {
+        const now = yield* Clock.currentTimeMillis;
+        const previous = lookupFailures.get(failureKey);
+        const current = {
+          count: (previous?.count ?? 0) + 1,
+          since: previous?.since ?? now,
+          told: previous?.told ?? false,
+        };
+        lookupFailures.set(failureKey, current);
+        const chief = live.find(
+          (thread) => thread.projectId === lead.projectId && thread.organization?.role === "chief",
+        );
+        if (
+          chief &&
+          !current.told &&
+          (current.count >= LOOKUP_FAILURES_BEFORE_NOTICE ||
+            now - current.since > LOOKUP_FAILURE_NOTICE_MS)
+        ) {
+          // The command id dedupes across restarts; this skips the dispatch within one.
+          lookupFailures.set(failureKey, { ...current, told: true });
+          yield* notifyChief({
+            chief,
+            lead,
+            prefix: ORGANIZATION_ACCEPTANCE_NOTICE_PREFIX,
+            key: `${failureKey}:lookup`,
+            text: `Organization update: ${lead.title}: can't check PRs for ${failed.child.title}: ${failed.reason}. The outcome stays unaccepted until its pull requests can be checked.`,
+            summary: `${lead.title}: can't check PRs for ${failed.child.title}`,
+          });
+        }
+        continue;
+      }
+      lookupFailures.delete(failureKey);
       const enriched = [
         ...candidates.filter((thread) => !task.dependencyThreadIds.includes(thread.id)),
         ...withBranches.flatMap((entry) => (entry.thread ? [entry.thread] : [])),

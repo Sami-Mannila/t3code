@@ -11,8 +11,9 @@ import * as Path from "effect/Path";
  *
  * It is not a sandbox; it stops the ordinary path and says why. Known ways around it: the host
  * API without `gh` (curl with a token, another CLI, a query read from a file), `git push` to the
- * base branch, the real `gh` by absolute path, aliases the user defined before, and shells whose
- * login profile prepends its own PATH (on macOS `brew shellenv` can put Homebrew's `gh` first).
+ * base branch, the real `gh` by absolute path, aliases the user defined before, `gh` extensions,
+ * and shells whose login profile prepends its own PATH (on macOS `brew shellenv` can put
+ * Homebrew's `gh` first).
  */
 export const AGENT_MERGE_REFUSAL =
   "Merging is reserved for the user; ask the Chief to request a merge.";
@@ -84,7 +85,7 @@ case "\${words[0]}" in
   api)
     for arg in "\${args[@]}"; do
       case "$arg" in
-        *pulls/*/merge* | */merges | */merges[?]* | *mergePullRequest* | *enablePullRequestAutoMerge*) refuse ;;
+        *pulls/*/merge* | */merges | */merges[?]* | *mergePullRequest* | *enablePullRequestAutoMerge* | *mergeBranch*) refuse ;;
       esac
     done
     ;;

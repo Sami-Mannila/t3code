@@ -19,7 +19,11 @@ import * as ThreadManagement from "./ThreadManagementService.ts";
 
 class TestFailure extends Schema.TaggedError<TestFailure>()("TestFailure", {
   reason: Schema.String,
-}) {}
+}) {
+  override get message(): string {
+    return this.reason;
+  }
+}
 
 const projectId = ProjectId.make("reactor-project");
 const chief = ThreadId.make("reactor-chief"),
@@ -117,6 +121,44 @@ it.effect("waits when an executor branch's pull request cannot be looked up", ()
     reachable = true;
     yield* reactor.sweep();
     assert.lengthOf(of("thread.metadata.update"), 1);
+  }),
+);
+
+it.effect("tells the Chief once when an executor branch keeps failing to be checked", () =>
+  Effect.gen(function* () {
+    const { reactor, of } = yield* harness({
+      branchLookup: () => Effect.fail(new TestFailure({ reason: "gh: authentication required" })),
+      accept: () => Effect.void,
+    });
+    yield* reactor.sweep();
+    yield* reactor.sweep();
+    assert.lengthOf(of("message.dispatch"), 0);
+    yield* reactor.sweep();
+    yield* reactor.sweep();
+    const notices = of("message.dispatch");
+    assert.lengthOf(notices, 1);
+    const notice = notices[0] as Extract<
+      OrchestrationV2ServerCommand,
+      { type: "message.dispatch" }
+    >;
+    assert.equal(notice.threadId, chief);
+    assert.include(notice.text, `can't check PRs for ${executor}`);
+    assert.include(notice.text, "authentication required");
+    // Still holding: nothing was accepted.
+    assert.lengthOf(of("thread.metadata.update"), 0);
+  }),
+);
+
+it.effect("tells the Chief when an executor branch has failed to be checked for an hour", () =>
+  Effect.gen(function* () {
+    const { reactor, of } = yield* harness({
+      branchLookup: () => Effect.fail(new TestFailure({ reason: "host unreachable" })),
+      accept: () => Effect.void,
+    });
+    yield* reactor.sweep();
+    yield* TestClock.adjust("61 minutes");
+    yield* reactor.sweep();
+    assert.lengthOf(of("message.dispatch"), 1);
   }),
 );
 

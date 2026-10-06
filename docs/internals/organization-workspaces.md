@@ -47,7 +47,7 @@ repositories, so worktrees are tied to tasks, not to the root.
   `gh pr merge` (whatever flags come between), merge and auto-merge API calls, and aliases that
   expand to a merge. It is not a sandbox. Known ways around it: the host API without `gh` (curl
   with a token, a query read from a file), `git push` straight to the base branch, the real
-  `gh` by absolute path, aliases defined before, and login shells that prepend their own PATH;
+  `gh` by absolute path, aliases defined before, `gh` extensions, and login shells that prepend their own PATH;
   on macOS a profile running `brew shellenv` can put Homebrew's `gh` ahead of the shim. Removal and preparation take the same workspace lease, and removal re-checks for a
   queued or active run as its last step, so a run that is preparing keeps its checkout.
 - A Git exit during preparation is usually deterministic, so the effect worker fails the run on the
