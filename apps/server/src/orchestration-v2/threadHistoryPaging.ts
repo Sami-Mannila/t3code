@@ -322,6 +322,45 @@ function retainedInterruptRequestTurnItems(
   return retained;
 }
 
+/**
+ * Pending approvals and user-input questions render from their request item, not
+ * from the runtime request. Keep the item when its request is still pending even
+ * if it sits outside the recent window, so the chat panel and sidebar resolve it;
+ * once the request resolves the item is no longer forced in and drops out.
+ */
+function retainedPendingRequestTurnItems(
+  projection: OrchestrationV2ThreadProjection,
+  visible: ReadonlyArray<OrchestrationV2ProjectedTurnItem>,
+  pendingRequestIds: ReadonlySet<string>,
+): OrchestrationV2TurnItem[] {
+  if (pendingRequestIds.size === 0) {
+    return [];
+  }
+
+  const visibleLocalIds = new Set<string>();
+  for (const row of visible) {
+    if (isLocalProjectedRow(projection, row)) {
+      visibleLocalIds.add(String(row.sourceItemId));
+    }
+  }
+
+  const retained: OrchestrationV2TurnItem[] = [];
+  for (const item of projection.turnItems) {
+    if (item.type !== "approval_request" && item.type !== "user_input_request") {
+      continue;
+    }
+    if (!pendingRequestIds.has(String(item.requestId))) {
+      continue;
+    }
+    // Already covered by local turnItems for the visible window.
+    if (visibleLocalIds.has(String(item.id))) {
+      continue;
+    }
+    retained.push(item);
+  }
+  return retained;
+}
+
 function localTurnItemsForVisibleWindow(
   projection: OrchestrationV2ThreadProjection,
   visible: ReadonlyArray<OrchestrationV2ProjectedTurnItem>,
@@ -395,7 +434,8 @@ export function computeLatestLocalTurnOrdinal(
 
 /**
  * Encoded timeline contribution for a bounded snapshot: visible rows plus the
- * duplicated local turnItems and any retained interrupt-request dependencies.
+ * duplicated local turnItems and any retained request dependencies (interrupt
+ * requests and still-pending approval/user-input request items).
  */
 export function boundedTimelineEncodedBytes(input: {
   readonly visibleTurnItems: ReadonlyArray<OrchestrationV2ProjectedTurnItem>;
@@ -431,14 +471,26 @@ export function buildBoundedThreadProjection(input: {
   };
   const latestLocalTurnOrdinal = computeLatestLocalTurnOrdinal(input.projection.turnItems);
 
-  // Reserve bytes for small interrupt-request dependencies that may sit outside
-  // the recent window but are required for visibility of results inside it.
+  const pendingRequestIds = new Set<string>();
+  for (const request of controlProjection.runtimeRequests) {
+    if (request.status === "pending") {
+      pendingRequestIds.add(String(request.id));
+    }
+  }
+
+  // Reserve bytes for small retained dependencies that may sit outside the recent
+  // window but are required for visibility of results inside it: interrupt
+  // requests and still-pending approval/user-input request items.
   const dependencyReserve = (() => {
-    // Upper bound: all request items in the full projection. Window selection
-    // uses this reserve so the final contribution stays under the cap.
+    // Upper bound: all retained request items in the full projection. Window
+    // selection uses this reserve so the final contribution stays under the cap.
     let reserve = 0;
     for (const item of controlProjection.turnItems) {
-      if (item.type === "run_interrupt_request") {
+      if (
+        item.type === "run_interrupt_request" ||
+        ((item.type === "approval_request" || item.type === "user_input_request") &&
+          pendingRequestIds.has(String(item.requestId)))
+      ) {
         reserve += bytesOfJson(item);
       }
     }
@@ -469,10 +521,10 @@ export function buildBoundedThreadProjection(input: {
   });
   const visibleTurnItems = renumberPositions(window.items);
   const windowTurnItems = localTurnItemsForVisibleWindow(controlProjection, visibleTurnItems);
-  const dependencyTurnItems = retainedInterruptRequestTurnItems(
-    controlProjection,
-    visibleTurnItems,
-  );
+  const dependencyTurnItems = [
+    ...retainedInterruptRequestTurnItems(controlProjection, visibleTurnItems),
+    ...retainedPendingRequestTurnItems(controlProjection, visibleTurnItems, pendingRequestIds),
+  ];
   const turnItemById = new Map<string, OrchestrationV2TurnItem>();
   for (const item of windowTurnItems) {
     turnItemById.set(String(item.id), item);
