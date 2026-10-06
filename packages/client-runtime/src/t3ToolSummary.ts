@@ -285,6 +285,9 @@ export function summarizeT3ToolCalls(
         quantity(countEntities(entityIds("requestId")), "pending question request"),
       );
       break;
+    case "question-ask":
+      label = phrase("Asked", "ask", `the user ${times}`);
+      break;
     case "worktree-handoff":
       label = phrase(
         "Handed off to",

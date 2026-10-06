@@ -80,8 +80,9 @@ export interface OrganizationModel {
 const createdOrder = (a: Shell, b: Shell) =>
   a.createdAt.localeCompare(b.createdAt) || a.id.localeCompare(b.id);
 
-/** "running", "idle", …: the conversation's live activity. */
-export const threadActivity = (thread: Shell) => thread.runtime?.status ?? "idle";
+/** "running", "idle", "awaiting input", …: the conversation's live activity. */
+export const threadActivity = (thread: Shell) =>
+  thread.hasPendingUserInput ? "awaiting input" : (thread.runtime?.status ?? "idle");
 export const threadIsActive = (thread: Shell) => thread.runtime?.activeRunId != null;
 export const threadModelLabel = (thread: Shell) =>
   `${thread.modelSelection.instanceId} · ${thread.modelSelection.model}`;

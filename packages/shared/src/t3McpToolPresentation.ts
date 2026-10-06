@@ -38,6 +38,7 @@ export type T3McpToolSummaryAction =
   | "question-list"
   | "question-read"
   | "question-respond"
+  | "question-ask"
   | "worktree-handoff"
   | "worktree-list"
   | "worktree-status"
@@ -242,6 +243,11 @@ const T3_MCP_TOOLS: Readonly<Record<string, T3McpToolDefinition>> = {
   t3_pending_request_respond: tool(
     ["Answer", "Answering", "Answered", "pending questions"],
     "question-respond",
+  ),
+  t3_organization_ask_user: tool(["Ask", "Asking", "Asked", "the user"], "question-ask"),
+  t3_organization_task: tool(
+    ["Update", "Updating", "Updated", "an organization task"],
+    "thread-update",
   ),
   t3_thread_configuration: tool(
     ["Read", "Reading", "Read", "thread configuration"],

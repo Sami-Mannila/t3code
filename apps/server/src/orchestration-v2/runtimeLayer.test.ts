@@ -1254,6 +1254,117 @@ it.layer(TestLayer)("OrchestrationV2LayerLive", (it) => {
     }),
   );
 
+  it.effect("opens a server question that only the user's answer or dismissal closes", () =>
+    Effect.gen(function* () {
+      const orchestrator = yield* Orchestrator.OrchestratorV2;
+      const threadId = ThreadId.make("runtime-server-question");
+      yield* orchestrator.dispatch({
+        type: "thread.create",
+        commandId: CommandId.make("runtime-server-question-create"),
+        createdBy: "user",
+        creationSource: "web",
+        threadId,
+        projectId: ProjectId.make("runtime-server-question-project"),
+        title: "Server question",
+        modelSelection,
+        runtimeMode: "full-access",
+        interactionMode: "default",
+        branch: null,
+        worktreePath: process.cwd(),
+      });
+      const ask = (name: string) =>
+        orchestrator.dispatch({
+          type: "thread.user-input.request",
+          commandId: CommandId.make(`runtime-server-question-${name}`),
+          threadId,
+          requestId: RuntimeRequestId.make(`server-question:${name}`),
+          questions: [
+            {
+              id: "scope",
+              header: "Scope",
+              question: "Which datasets?",
+              options: [
+                { label: "Fees", description: "Fee tables" },
+                { label: "Revenue", description: "Revenue tables" },
+              ],
+              multiSelect: true,
+            },
+          ],
+        });
+      const unprefixed = yield* orchestrator
+        .dispatch({
+          type: "thread.user-input.request",
+          commandId: CommandId.make("runtime-server-question-unprefixed"),
+          threadId,
+          requestId: RuntimeRequestId.make("provider-like-request"),
+          questions: [{ id: "q", header: "Q", question: "Q?", options: [] }],
+        })
+        .pipe(Effect.result);
+      assert.equal(unprefixed._tag, "Failure");
+      yield* ask("first");
+      const opened = yield* orchestrator.getThreadProjection(threadId);
+      const request = opened.runtimeRequests.find(
+        (candidate) => candidate.id === "server-question:first",
+      );
+      assert.equal(request?.status, "pending");
+      assert.deepEqual(request?.responseCapability, { type: "message" });
+      const item = opened.turnItems.find(
+        (candidate) =>
+          candidate.type === "user_input_request" && candidate.requestId === request?.id,
+      );
+      assert.equal(item?.status, "waiting");
+      assert.equal(item?.runId, null);
+      assert.lengthOf(opened.runs, 0);
+
+      // Settling would silently cancel it, so the user answers or dismisses it first.
+      const settle = yield* orchestrator
+        .dispatch({
+          type: "thread.settle",
+          commandId: CommandId.make("runtime-server-question-settle"),
+          threadId,
+        })
+        .pipe(Effect.result);
+      assert.equal(settle._tag, "Failure");
+
+      yield* ask("second");
+      yield* ask("third");
+      const capped = yield* ask("fourth").pipe(Effect.result);
+      assert.equal(capped._tag, "Failure");
+
+      yield* orchestrator.dispatch({
+        type: "runtime-request.respond",
+        commandId: CommandId.make("runtime-server-question-answer"),
+        threadId,
+        requestId: RuntimeRequestId.make("server-question:first"),
+        answers: { scope: ["Fees", " Revenue "] },
+      });
+      const answered = yield* orchestrator.getThreadProjection(threadId);
+      assert.equal(
+        answered.runtimeRequests.find((candidate) => candidate.id === "server-question:first")
+          ?.status,
+        "resolved",
+      );
+      const answer = answered.messages.find(
+        (message) => message.id === "async-answer:server-question:first",
+      );
+      assert.equal(answer?.text, "Which datasets?\nFees, Revenue");
+      assert.equal(answer?.createdBy, "user");
+
+      for (const name of ["second", "third"])
+        yield* orchestrator.dispatch({
+          type: "thread.user-input.dismiss",
+          commandId: CommandId.make(`runtime-server-question-dismiss-${name}`),
+          threadId,
+          requestId: RuntimeRequestId.make(`server-question:${name}`),
+        });
+      assert.isFalse(
+        (yield* orchestrator.getThreadProjection(threadId)).runtimeRequests.some(
+          (candidate) => candidate.status === "pending",
+        ),
+      );
+    }),
+  );
+
   it.effect("merges an explicit provider-finished run while checkpoint capture is pending", () =>
     Effect.gen(function* () {
       const orchestrator = yield* Orchestrator.OrchestratorV2;

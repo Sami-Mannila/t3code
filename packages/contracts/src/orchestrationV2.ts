@@ -2967,6 +2967,18 @@ const OrchestrationV2InternalCommand = Schema.Union([
       }),
     ),
   }),
+  /**
+   * Opens a question for the user that no provider turn waits on. It is answered by message, so
+   * it stays open across turn ends, restarts and session release until the user replies or
+   * dismisses it.
+   */
+  Schema.Struct({
+    type: Schema.Literal("thread.user-input.request"),
+    commandId: CommandId,
+    threadId: ThreadId,
+    requestId: RuntimeRequestId,
+    questions: Schema.NonEmptyArray(OrchestrationV2UserInputQuestion),
+  }),
   /** Records that the provider rollback `requestId` failed for good. */
   Schema.Struct({
     type: Schema.Literal("checkpoint.rollback.fail"),

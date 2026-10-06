@@ -1,7 +1,11 @@
 import { organizationTaskContext } from "../../../orchestration-v2/OrganizationTaskContext.ts";
 import {
+  isServerUserInputRequest,
+  SERVER_QUESTION_ID_PREFIX,
+} from "../../../orchestration-v2/Orchestrator.ts";
+import {
   CommandId,
-  type RuntimeRequestId,
+  RuntimeRequestId,
   ThreadId,
   type OrchestrationV2ThreadProjection,
   type RunId,
@@ -76,6 +80,18 @@ const readQuestion = Effect.fn("mcp.readQuestion")(function* (
     });
   return { ...context, request, item };
 });
+/** Surfaces the orchestrator's refusal reason, which agents need to correct the call. */
+const orchestrationFailure = (error: { readonly message: string; readonly cause?: unknown }) =>
+  new OrchestratorMcpFailure({
+    code: "orchestration_error",
+    message:
+      typeof error.cause === "string"
+        ? error.cause
+        : error.cause instanceof Error
+          ? error.cause.message
+          : error.message,
+  });
+
 export const ThreadToolkitHandlersLive = ThreadToolkit.toLayer({
   t3_organization_task: (input) =>
     Effect.gen(function* () {
@@ -183,20 +199,7 @@ export const ThreadToolkitHandlersLive = ThreadToolkit.toLayer({
           organizationActorThreadId: caller.id,
           organization: { ...organization, task },
         })
-        .pipe(
-          Effect.mapError(
-            (error) =>
-              new OrchestratorMcpFailure({
-                code: "orchestration_error",
-                message:
-                  "cause" in error && typeof error.cause === "string"
-                    ? error.cause
-                    : "cause" in error && error.cause instanceof Error
-                      ? error.cause.message
-                      : error.message,
-              }),
-          ),
-        );
+        .pipe(Effect.mapError(orchestrationFailure));
       const updated = yield* threads
         .getThreadShell(projection.thread.id)
         .pipe(Effect.mapError(unavailable));
@@ -207,6 +210,51 @@ export const ThreadToolkitHandlersLive = ThreadToolkit.toLayer({
         organization: updated?.organization ?? null,
         workspace: projection.thread.worktreePath,
       };
+    }),
+
+  t3_organization_ask_user: (input) =>
+    Effect.gen(function* () {
+      const { caller, threads } = yield* readMutationCaller();
+      const role = caller.organization?.role;
+      if (role !== "chief" && role !== "lead")
+        return yield* new OrchestratorMcpFailure({
+          code: "capability_denied",
+          message: "Only the Chief or a lead can ask the user; report the decision to your lead.",
+        });
+      const snapshot = yield* threads.getShellSnapshot().pipe(Effect.mapError(unavailable));
+      const chief =
+        role === "chief"
+          ? caller
+          : snapshot.threads.find(
+              (thread) =>
+                thread.projectId === caller.projectId &&
+                thread.organization?.role === "chief" &&
+                thread.archivedAt === null &&
+                thread.deletedAt === null,
+            );
+      if (chief === undefined)
+        return yield* new OrchestratorMcpFailure({
+          code: "invalid_request",
+          message: "This project has no active Chief conversation to ask the user from.",
+        });
+      const requestId = RuntimeRequestId.make(
+        `${SERVER_QUESTION_ID_PREFIX}organization:${caller.id}:${input.clientRequestId}`,
+      );
+      const { runtimeRequests } = yield* threads
+        .getThreadRecords(chief.id, ["runtimeRequests"])
+        .pipe(Effect.mapError(unavailable));
+      if (runtimeRequests.some((request) => request.id === requestId))
+        return { requestId, threadId: chief.id };
+      yield* threads
+        .dispatch({
+          type: "thread.user-input.request",
+          commandId: CommandId.make(requestId),
+          threadId: chief.id,
+          requestId,
+          questions: input.questions,
+        })
+        .pipe(Effect.mapError(orchestrationFailure));
+      return { requestId, threadId: chief.id };
     }),
 
   run_scheduled_task_now: (input) =>
@@ -340,7 +388,17 @@ export const ThreadToolkitHandlersLive = ThreadToolkit.toLayer({
     }),
   t3_pending_request_respond: (input) =>
     Effect.gen(function* () {
-      const { threads, projection } = yield* readQuestion(input, true);
+      const { threads, projection, caller, request } = yield* readQuestion(input, true);
+      // Organization agents never answer the user's questions for them: not the ones the
+      // server opened for the user, and not any on their own organization conversation.
+      if (
+        caller.organization &&
+        (isServerUserInputRequest(request) || projection.thread.id === caller.id)
+      )
+        return yield* new OrchestratorMcpFailure({
+          code: "capability_denied",
+          message: "Only the user can answer this question.",
+        });
       const result = yield* threads
         .dispatch({
           type: "runtime-request.respond",

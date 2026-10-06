@@ -1590,3 +1590,111 @@ it.effect("queued Chief notices merge into one turn with each task's latest stat
     assert.include(merged.text, "end your turn without a message");
   }).pipe(Effect.provide(taskNoticeLayer)),
 );
+
+it.effect(
+  "the Chief and its leads ask the user through a durable question only the user answers",
+  () =>
+    Effect.gen(function* () {
+      const { orchestrator, chief, lead, executor } = yield* taskNoticeSetup;
+      for (const id of [chief, lead, executor])
+        yield* orchestrator.dispatch({
+          type: "message.dispatch",
+          commandId: CommandId.make(`ask-start-${id}`),
+          messageId: MessageId.make(`ask-start-${id}`),
+          threadId: id,
+          text: "Work",
+          attachments: [],
+          dispatchMode: { type: "start_immediately" },
+          createdBy: "user",
+          creationSource: "web",
+        });
+      const server = yield* McpServer.McpServer;
+      const call = (actor: ThreadId, name: string, args: Record<string, unknown>) =>
+        server.callTool({ name, arguments: args }).pipe(
+          Effect.provideService(McpInvocationContext.McpInvocationContext, {
+            environmentId: EnvironmentId.make("organization-test"),
+            threadId: actor,
+            providerSessionId: `session-${actor}`,
+            providerInstanceId: modelSelection.instanceId,
+            capabilities: new Set(["orchestration"] as const),
+            issuedAt: 1,
+          }),
+          Effect.provideService(McpSchema.McpServerClient, mcpClient),
+        );
+      const ask = (actor: ThreadId, clientRequestId: string) =>
+        call(actor, "t3_organization_ask_user", {
+          clientRequestId,
+          questions: [
+            {
+              id: "release",
+              header: "Release",
+              question: "Ship the outcome now?",
+              options: [
+                { label: "Ship", description: "Merge today" },
+                { label: "Wait", description: "Hold for review" },
+              ],
+            },
+          ],
+        });
+      const content = (result: { structuredContent?: unknown }) =>
+        result.structuredContent as { requestId: string; threadId: string; code?: string };
+      const pending = orchestrator
+        .getThreadProjection(chief)
+        .pipe(
+          Effect.map((projection) =>
+            projection.runtimeRequests.filter((request) => request.status === "pending"),
+          ),
+        );
+
+      const first = yield* ask(chief, "decide-release");
+      assert.isFalse(first.isError);
+      const replay = yield* ask(chief, "decide-release");
+      assert.equal(content(replay).requestId, content(first).requestId);
+      assert.lengthOf(yield* pending, 1);
+
+      // A lead's question opens where the user talks to the organization.
+      const fromLead = yield* ask(lead, "lead-scope");
+      assert.isFalse(fromLead.isError);
+      assert.equal(content(fromLead).threadId, chief);
+
+      const denied = yield* ask(executor, "executor-question");
+      assert.equal(content(denied).code, "capability_denied");
+
+      yield* ask(chief, "third");
+      const capped = yield* ask(chief, "fourth");
+      assert.equal(content(capped).code, "orchestration_error");
+      assert.include(
+        (capped.structuredContent as { message: string }).message,
+        "unanswered questions",
+      );
+      assert.lengthOf(yield* pending, 3);
+
+      // Neither the asker nor another organization agent answers for the user.
+      for (const actor of [chief, lead]) {
+        const selfAnswer = yield* call(actor, "t3_pending_request_respond", {
+          threadId: chief,
+          requestId: content(first).requestId,
+          answers: { release: "Ship" },
+        });
+        assert.equal(content(selfAnswer).code, "capability_denied", actor);
+      }
+      assert.lengthOf(yield* pending, 3);
+
+      yield* orchestrator.dispatch({
+        type: "runtime-request.respond",
+        commandId: CommandId.make("user-answers-release"),
+        threadId: chief,
+        requestId: content(first).requestId as never,
+        answers: { release: "Ship" },
+      });
+      const answered = yield* orchestrator.getThreadProjection(chief);
+      assert.lengthOf(yield* pending, 2);
+      assert.isTrue(
+        answered.messages.some(
+          (message) =>
+            message.id === `async-answer:${content(first).requestId}` &&
+            message.createdBy === "user",
+        ),
+      );
+    }).pipe(Effect.provide(NativeToolkitLayer.pipe(Layer.provideMerge(taskNoticeLayer)))),
+);

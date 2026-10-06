@@ -54,6 +54,7 @@ import {
   type OrchestrationV2ProviderTurn,
   type OrchestrationV2Run,
   type OrchestrationV2RunAttempt,
+  type OrchestrationV2RuntimeRequest,
   type OrchestrationV2ThreadShell,
   type OrchestrationV2ThreadShellSnapshot,
   type OrchestrationV2StoredEvent,
@@ -66,7 +67,8 @@ import {
   RunId,
   ThreadLinkedPullRequest,
   ThreadId,
-  type TurnItemId,
+  NodeId,
+  TurnItemId,
 } from "@t3tools/contracts";
 import { modelSelectionsEqual } from "@t3tools/shared/model";
 import {
@@ -386,6 +388,19 @@ export function isNativeMaintenanceCommand(message: {
   );
 }
 
+/** Open server-created questions a conversation may hold at once. */
+export const MAX_PENDING_SERVER_QUESTIONS = 3;
+
+/** Every `thread.user-input.request` id carries this prefix, which no provider request uses. */
+export const SERVER_QUESTION_ID_PREFIX = "server-question:";
+
+/** A question the server opened for the user (`thread.user-input.request`), not a provider's. */
+export function isServerUserInputRequest(
+  request: Pick<OrchestrationV2RuntimeRequest, "id" | "kind">,
+): boolean {
+  return request.kind === "user_input" && request.id.startsWith(SERVER_QUESTION_ID_PREFIX);
+}
+
 const threadPullRequestLinksEqual = Schema.toEquivalence(Schema.NullOr(ThreadLinkedPullRequest));
 
 function commandThreadId(command: OrchestrationV2ServerCommand): ThreadId {
@@ -434,6 +449,7 @@ function commandThreadId(command: OrchestrationV2ServerCommand): ThreadId {
     case "queued-run.edit":
     case "runtime-request.respond":
     case "thread.user-input.dismiss":
+    case "thread.user-input.request":
     case "checkpoint.rollback":
     case "checkpoint.rollback.fail":
     case "thread.background-work.settle":
@@ -2629,6 +2645,15 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
       const blockingRequestExists = pendingRequests.some(
         (request) => request.kind !== "user_input" || request.responseCapability.type !== "message",
       );
+      // A question the server opened for the user is the whole point of the conversation's
+      // wait; settling must not silently cancel it. The user answers or dismisses it first.
+      if (pendingRequests.some(isServerUserInputRequest)) {
+        return yield* new OrchestratorDispatchError({
+          commandId: command.commandId,
+          commandType: command.type,
+          cause: `Thread ${command.threadId} has an open question for the user; answer or dismiss it before settling.`,
+        });
+      }
       if (activeRunExists || blockingRequestExists) {
         return yield* new OrchestratorDispatchError({
           commandId: command.commandId,
@@ -7381,7 +7406,14 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
         }
         const replies: string[] = [];
         for (const question of approvalTurnItem.questions) {
-          const answer = command.answers?.[question.id];
+          const raw = command.answers?.[question.id];
+          // Multi-select answers arrive as one string per chosen option.
+          const answer = Array.isArray(raw)
+            ? raw
+                .filter((part): part is string => typeof part === "string" && part.trim() !== "")
+                .map((part) => part.trim())
+                .join(", ")
+            : raw;
           if (typeof answer !== "string" || answer.trim().length === 0) {
             if (question.required === false) continue;
             return yield* new OrchestratorDispatchError({
@@ -7503,6 +7535,111 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
         events,
         effects,
       );
+    });
+
+  const dispatchThreadUserInputRequest = (
+    command: Extract<
+      OrchestrationV2InternalCommand,
+      { readonly type: "thread.user-input.request" }
+    >,
+    events: Ref.Ref<Array<OrchestrationV2DomainEvent>>,
+  ) =>
+    Effect.gen(function* () {
+      const projection = yield* projectionStore
+        .getThreadRecords(command.threadId, ["runtimeRequests"])
+        .pipe(
+          Effect.mapError(() => new OrchestratorProjectionError({ threadId: command.threadId })),
+        );
+      const reject = (cause: string) =>
+        new OrchestratorDispatchError({
+          commandId: command.commandId,
+          commandType: command.type,
+          cause,
+        });
+      if (!command.requestId.startsWith(SERVER_QUESTION_ID_PREFIX))
+        return yield* reject(`Question ids start with ${SERVER_QUESTION_ID_PREFIX}.`);
+      if (projection.thread.archivedAt !== null || projection.thread.deletedAt !== null)
+        return yield* reject(`Thread ${command.threadId} is not active.`);
+      if (projection.runtimeRequests.some((request) => request.id === command.requestId))
+        return yield* reject(`Question ${command.requestId} already exists.`);
+      const open = projection.runtimeRequests
+        .filter(isServerUserInputRequest)
+        .filter((request) => request.status === "pending").length;
+      if (open >= MAX_PENDING_SERVER_QUESTIONS)
+        return yield* reject(
+          `This conversation already has ${open} unanswered questions for the user. Wait for an answer, or fold the new question into a later one.`,
+        );
+      const now = yield* DateTime.now;
+      // No provider turn waits on this question: it roots itself and is answered by message.
+      const nodeId = NodeId.make(`user-input:${command.requestId}`);
+      const node: OrchestrationV2ExecutionNode = {
+        id: nodeId,
+        threadId: command.threadId,
+        runId: null,
+        parentNodeId: null,
+        rootNodeId: nodeId,
+        kind: "user_input_request",
+        status: "waiting",
+        countsForRun: false,
+        providerThreadId: null,
+        providerTurnId: null,
+        nativeItemRef: null,
+        runtimeRequestId: command.requestId,
+        checkpointScopeId: null,
+        startedAt: now,
+        completedAt: null,
+      };
+      const emitEvent = emit(events, command);
+      yield* emitEvent({
+        type: "node.updated",
+        threadId: command.threadId,
+        nodeId,
+        occurredAt: now,
+        payload: node,
+      });
+      yield* emitEvent({
+        type: "runtime-request.updated",
+        threadId: command.threadId,
+        nodeId,
+        occurredAt: now,
+        payload: {
+          id: command.requestId,
+          nodeId,
+          providerTurnId: null,
+          nativeRequestRef: null,
+          kind: "user_input",
+          status: "pending",
+          responseCapability: { type: "message" },
+          createdAt: now,
+          resolvedAt: null,
+        },
+      });
+      yield* emitEvent({
+        type: "turn-item.updated",
+        threadId: command.threadId,
+        nodeId,
+        occurredAt: now,
+        payload: {
+          id: TurnItemId.make(`user-input:${command.requestId}`),
+          threadId: command.threadId,
+          runId: null,
+          nodeId,
+          providerThreadId: null,
+          providerTurnId: null,
+          nativeItemRef: null,
+          parentItemId: null,
+          ordinal: yield* nextTurnItemOrdinal(projection),
+          status: "waiting",
+          title: null,
+          startedAt: now,
+          completedAt: null,
+          updatedAt: now,
+          type: "user_input_request",
+          requestId: command.requestId,
+          questions: command.questions,
+          responseMode: "message",
+        },
+      });
     });
 
   const dispatchQueuedMessagePromoteToSteer = (
@@ -10147,6 +10284,9 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
         break;
       case "checkpoint.rollback.fail":
         yield* dispatchCheckpointRollbackFail(command, events);
+        break;
+      case "thread.user-input.request":
+        yield* dispatchThreadUserInputRequest(command, events);
         break;
       case "thread.background-work.settle":
         yield* dispatchBackgroundWorkSettle(command, events);

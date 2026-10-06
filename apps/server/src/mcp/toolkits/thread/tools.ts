@@ -2,6 +2,7 @@ import {
   ScheduledTaskId,
   OrganizationThread,
   OrganizationRole,
+  OrchestrationV2UserInputQuestion,
   ScheduledTask,
   OrchestrationSearchThreadsInput,
   OrchestrationSearchThreadsResult,
@@ -326,8 +327,20 @@ const OrganizationTaskTool = Tool.make("t3_organization_task", {
   }),
 }).annotate(Tool.Destructive, true);
 
+const OrganizationAskUserTool = Tool.make("t3_organization_ask_user", {
+  ...commandTool,
+  description:
+    "Ask the user a decision question in the Chief conversation. The user sees a question box that stays open across turns and restarts until they answer or dismiss it; the answer arrives in the Chief conversation as their message. Use only when the user must decide; end your turn after asking instead of restating the question. Chief and leads may ask; a lead's question opens in its Chief's conversation. At most 3 questions may be open per conversation. Reusing clientRequestId returns the same question.",
+  parameters: Schema.Struct({
+    questions: Schema.NonEmptyArray(OrchestrationV2UserInputQuestion),
+    clientRequestId: TrimmedNonEmptyString,
+  }),
+  success: Schema.Struct({ requestId: RuntimeRequestId, threadId: ThreadId }),
+}).annotate(Tool.Destructive, false);
+
 export const ThreadToolkit = Toolkit.make(
   OrganizationTaskTool,
+  OrganizationAskUserTool,
   ScheduledTaskRunTool,
   ThreadSearchTool,
   ThreadForkTool,
