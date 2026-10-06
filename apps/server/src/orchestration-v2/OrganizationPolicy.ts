@@ -564,7 +564,8 @@ export function organizationChiefNotice(input: {
   const notes = task.notes ? ` ${task.notes.replace(/\s+/g, " ")}` : "";
   entries.delete(input.threadId);
   entries.set(input.threadId, {
-    line: `- [${input.threadId}] ${state}${reviewed}: ${task.title}.${notes}`,
+    // One line per task: a title or note spanning lines could forge another task's entry.
+    line: `- [${input.threadId}] ${state}${reviewed}: ${task.title.replace(/\s+/g, " ")}.${notes}`,
     state,
   });
   return {

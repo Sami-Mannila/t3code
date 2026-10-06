@@ -389,11 +389,11 @@ export const ThreadToolkitHandlersLive = ThreadToolkit.toLayer({
   t3_pending_request_respond: (input) =>
     Effect.gen(function* () {
       const { threads, projection, caller, request } = yield* readQuestion(input, true);
-      // Organization agents never answer the user's questions for them: not the ones the
-      // server opened for the user, and not any on their own organization conversation.
+      // Agents never answer the user's questions for them: no agent answers a question the
+      // server opened for the user, and organization agents none on their own conversation.
       if (
-        caller.organization &&
-        (isServerUserInputRequest(request) || projection.thread.id === caller.id)
+        isServerUserInputRequest(request) ||
+        (caller.organization && projection.thread.id === caller.id)
       )
         return yield* new OrchestratorMcpFailure({
           code: "capability_denied",
