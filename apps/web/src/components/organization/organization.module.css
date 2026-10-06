@@ -397,8 +397,8 @@
 }
 .org-item {
   display: grid;
-  /* The title keeps a readable minimum; compact chips and the pill stay at their content size. */
-  grid-template-columns: 20px minmax(88px, 1fr) auto auto;
+  /* The title keeps a readable minimum; the trailing group wraps inside its own track. */
+  grid-template-columns: 20px minmax(88px, 1fr) auto;
   gap: 8px;
   align-items: start;
   padding: 7px 6px;
@@ -436,9 +436,12 @@
   gap: 4px;
 }
 .org-item-trailing {
-  display: inline-flex;
+  display: flex;
+  flex-wrap: wrap;
   align-items: center;
+  justify-content: flex-end;
   gap: 6px;
+  row-gap: 4px;
   padding-top: 2px;
 }
 .org-tooltip-line {

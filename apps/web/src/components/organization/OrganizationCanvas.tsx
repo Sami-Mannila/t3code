@@ -568,8 +568,8 @@ function SubtaskRow(props: {
             compact
           />
         ))}
+        <Pill state={subtask.task.state} />
       </div>
-      <Pill state={subtask.task.state} />
     </div>
   );
 }
