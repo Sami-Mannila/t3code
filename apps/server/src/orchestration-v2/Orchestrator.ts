@@ -2434,6 +2434,7 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
         thread,
         next: command.organization,
         threads: snapshot.threads,
+        archivedThreads: snapshot.archivedThreads,
         ...(command.organizationActorThreadId
           ? { actorThreadId: command.organizationActorThreadId }
           : {}),

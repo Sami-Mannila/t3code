@@ -133,6 +133,10 @@ export function organizationProblem(input: {
   threads: ReadonlyArray<
     Pick<OrchestrationV2AppThread, "id" | "projectId" | "organization" | "deletedAt" | "archivedAt">
   >;
+  /** Archived conversations, which the active snapshot omits; adoption resolves its old parent here. */
+  archivedThreads?: ReadonlyArray<
+    Pick<OrchestrationV2AppThread, "id" | "projectId" | "organization" | "deletedAt" | "archivedAt">
+  >;
   actorThreadId?: ThreadId;
   checkpointRefs?: ReadonlyArray<string>;
 }): string | null {
@@ -140,6 +144,7 @@ export function organizationProblem(input: {
   const previous = thread.organization;
   const threads = new Map(input.threads.map((item) => [item.id, item]));
   threads.set(thread.id, { ...thread, organization: next });
+  const archived = new Map((input.archivedThreads ?? []).map((item) => [item.id, item]));
   const related = (id: ThreadId) => {
     const item = threads.get(id);
     return item?.projectId === thread.projectId && item.deletedAt === null ? item : undefined;
@@ -148,31 +153,26 @@ export function organizationProblem(input: {
   if (actorThreadId && !actor?.organization)
     return "The acting conversation has no organization role in this project.";
   const parent = next?.parentThreadId ? related(next.parentThreadId) : undefined;
-  // A lead may adopt an executor task from a retired parent lead under the same Chief. The task
-  // itself is unchanged: only its reporting parent moves to the adopting lead. A parent absent
-  // from the active snapshot is a deleted lead; the caller checks the Chief before dispatching.
+  // A lead may adopt an executor task from a retired parent lead under the same Chief. Only the
+  // reporting parent moves: the task must be structurally unchanged, and the retired lead must
+  // still resolve so its Chief can be checked.
   const previousParent = previous?.parentThreadId
-    ? threads.get(previous.parentThreadId)
+    ? (threads.get(previous.parentThreadId) ?? archived.get(previous.parentThreadId))
     : undefined;
-  const previousParentRetired =
-    previousParent === undefined ||
-    previousParent.archivedAt !== null ||
-    previousParent.deletedAt !== null;
-  const previousParentChief =
-    previousParent === undefined
-      ? parent?.organization?.parentThreadId
-      : previousParent.organization?.parentThreadId;
   const adopting =
     previous?.role === "executor" &&
     next?.role === "executor" &&
     next.parentThreadId !== previous.parentThreadId &&
     next.parentThreadId === actorThreadId &&
     actor?.organization?.role === "lead" &&
-    previousParentRetired &&
-    (previousParent === undefined ||
-      (previousParent.organization?.role === "lead" &&
-        previousParent.projectId === thread.projectId)) &&
-    previousParentChief === parent?.organization?.parentThreadId;
+    previousParent !== undefined &&
+    previousParent.projectId === thread.projectId &&
+    previousParent.organization?.role === "lead" &&
+    (previousParent.archivedAt !== null || previousParent.deletedAt !== null) &&
+    previousParent.organization.parentThreadId === parent?.organization?.parentThreadId &&
+    previous.task !== undefined &&
+    next.task !== undefined &&
+    Equal.equals(previous.task, next.task);
   if (!next)
     return previous
       ? "Organization identity is retained for its recorded work; archive the conversation instead."
