@@ -27,6 +27,8 @@ export const NODE_UPDATE_RETENTION_DELETE_BATCH_SIZE = 250;
 export const NODE_UPDATE_RETENTION_BATCH_PAUSE = Duration.millis(75);
 /** Rows one scheduler tick (every 5 s) may delete, across all threads. */
 export const NODE_UPDATE_RETENTION_ROWS_PER_PASS = 2_000;
+/** Discovery statements one scheduler tick may run, so threads with little to delete stay cheap. */
+export const NODE_UPDATE_RETENTION_PAGES_PER_PASS = 4;
 /** A thread's newest event must be at least this old before it is pruned. */
 export const NODE_UPDATE_RETENTION_IDLE_MS = 10 * 60_000;
 /** Pause between full walks over all threads. */
@@ -55,6 +57,7 @@ export interface NodeUpdatePruneResult {
 
 export interface NodeUpdateRetentionOptions {
   readonly rowsPerPass?: number;
+  readonly pagesPerPass?: number;
   readonly deleteBatchSize?: number;
   readonly batchPause?: Duration.Input;
 }
@@ -70,6 +73,7 @@ export const make = (options: NodeUpdateRetentionOptions = {}) =>
   Effect.gen(function* () {
     const sql = yield* SqlClient.SqlClient;
     const rowsPerPass = options.rowsPerPass ?? NODE_UPDATE_RETENTION_ROWS_PER_PASS;
+    const pagesPerPass = options.pagesPerPass ?? NODE_UPDATE_RETENTION_PAGES_PER_PASS;
     const deleteBatchSize = options.deleteBatchSize ?? NODE_UPDATE_RETENTION_DELETE_BATCH_SIZE;
     const batchPause = Duration.fromInputUnsafe(
       options.batchPause ?? NODE_UPDATE_RETENTION_BATCH_PAUSE,
@@ -95,7 +99,11 @@ export const make = (options: NodeUpdateRetentionOptions = {}) =>
      * kept. Appends that race the scan only add newer rows, so a row found
      * superseded stays superseded, and progress can resume on a later pass.
      */
-    const pruneThread = (progress: NodeUpdatePruneProgress, budget: number) =>
+    const pruneThread = (
+      progress: NodeUpdatePruneProgress,
+      budget: number,
+      pageBudget = Number.POSITIVE_INFINITY,
+    ) =>
       Effect.gen(function* () {
         let deletedRows = 0;
         let batches = 0;
@@ -144,11 +152,11 @@ export const make = (options: NodeUpdateRetentionOptions = {}) =>
           }
           // Every row from `scannedThrough` up has been accounted for.
           progress.before = scannedThrough;
-          if (budgetReached) {
-            return { deletedRows, batches, pages, status: "budget" } as NodeUpdatePruneResult;
-          }
-          if (rows.length < NODE_UPDATE_RETENTION_PAGE_SIZE) {
+          if (rows.length < NODE_UPDATE_RETENTION_PAGE_SIZE && !budgetReached) {
             return { deletedRows, batches, pages, status: "complete" } as NodeUpdatePruneResult;
+          }
+          if (budgetReached || pages >= pageBudget) {
+            return { deletedRows, batches, pages, status: "budget" } as NodeUpdatePruneResult;
           }
           yield* Effect.yieldNow;
         }
@@ -170,11 +178,17 @@ export const make = (options: NodeUpdateRetentionOptions = {}) =>
       const nowMs = DateTime.toEpochMillis(yield* DateTime.now);
       if (unfinished === null && nowMs < nextWalkAt) return { deletedRows: 0, threads: 0 };
       let deletedRows = 0;
+      let pagesRead = 0;
       const prunedThreads = new Set<string>();
       const prune = (progress: NodeUpdatePruneProgress) =>
         Effect.gen(function* () {
-          const result = yield* pruneThread(progress, rowsPerPass - deletedRows);
+          const result = yield* pruneThread(
+            progress,
+            rowsPerPass - deletedRows,
+            pagesPerPass - pagesRead,
+          );
           deletedRows += result.deletedRows;
+          pagesRead += result.pages;
           if (result.deletedRows > 0) prunedThreads.add(progress.threadId);
           unfinished = result.status === "budget" ? progress : null;
           if (result.status === "complete") prunedThrough.set(progress.threadId, progress.head);
@@ -196,7 +210,7 @@ export const make = (options: NodeUpdateRetentionOptions = {}) =>
         `;
         let visited = 0;
         for (const { thread_id: threadId } of threads) {
-          if (deletedRows >= rowsPerPass) break;
+          if (deletedRows >= rowsPerPass || pagesRead >= pagesPerPass) break;
           visited += 1;
           cursor = threadId;
           const head = (yield* sql<{ readonly sequence: number; readonly occurred_at: string }>`

@@ -256,3 +256,60 @@ it.effect("reads every event page by page when node updates are sparse", () =>
     assert.deepEqual(pruned, { deletedRows: 2, batches: 1, pages: 3, status: "complete" });
   }).pipe(Effect.provide(TestLayer)),
 );
+
+it.effect("spreads discovery of a sparse thread over passes of bounded reads", () =>
+  Effect.gen(function* () {
+    const retention = yield* NodeUpdateRetention.make({ batchPause: 0, pagesPerPass: 1 });
+    const pageSize = NodeUpdateRetention.NODE_UPDATE_RETENTION_PAGE_SIZE;
+    const threadId = ThreadId.make("thread:retention-sparse-passes");
+    // Node `a` has two superseded rows beneath two and a half pages of other events.
+    yield* seedThread(threadId, 2, pageSize * 2 + pageSize / 2);
+    yield* TestClock.adjust(NodeUpdateRetention.NODE_UPDATE_RETENTION_IDLE_MS + 1);
+    const deleted: Array<number> = [];
+    for (let pass = 0; pass < 3; pass++) deleted.push((yield* retention.runPass).deletedRows);
+    assert.deepEqual(deleted, [0, 0, 2]);
+    // The walk finished, so the next one waits for the interval.
+    assert.deepEqual(yield* retention.runPass, { deletedRows: 0, threads: 0 });
+  }).pipe(Effect.provide(TestLayer)),
+);
+
+it.effect("leaves events appended to a paused thread for the next walk", () =>
+  Effect.gen(function* () {
+    const eventSink = yield* EventSink.EventSinkV2;
+    const projections = yield* ProjectionStore.ProjectionStoreV2;
+    const maintenance = yield* ProjectionMaintenance.ProjectionMaintenanceV2;
+    const retention = yield* NodeUpdateRetention.make({ batchPause: 0 });
+    const perPass = NodeUpdateRetention.NODE_UPDATE_RETENTION_ROWS_PER_PASS;
+    const threadId = ThreadId.make("thread:retention-appended");
+    yield* seedThread(threadId, perPass + 500);
+    yield* TestClock.adjust(NodeUpdateRetention.NODE_UPDATE_RETENTION_IDLE_MS + 1);
+    assert.equal((yield* retention.runPass).deletedRows, perPass);
+
+    // New updates land while the thread is paused mid-scan.
+    const now = yield* DateTime.now;
+    yield* eventSink.write({
+      events: [
+        nodeEvent(makeNode(threadId, "a", now, "running"), now),
+        nodeEvent(makeNode(threadId, "c", now, "running"), now),
+      ],
+    });
+    assert.equal((yield* retention.runPass).deletedRows, 500);
+    const nodeIds = (
+      rows: ReadonlyArray<{ readonly event_type: string; readonly node_id: string | null }>,
+    ) => rows.flatMap((row) => (row.event_type === "node.updated" ? [row.node_id] : []));
+    // `a` keeps the newest row of the paused scan and its appended row; `b` and `c` stay.
+    assert.deepEqual(nodeIds(yield* nodeRows(threadId)), [
+      `${threadId}:b`,
+      `${threadId}:a`,
+      `${threadId}:a`,
+      `${threadId}:c`,
+    ]);
+    const live = (yield* projections.getThreadProjection(threadId)).nodes;
+    assert.isTrue((yield* maintenance.rebuild).valid);
+    assert.deepEqual((yield* projections.getThreadProjection(threadId)).nodes, live);
+
+    // The next walk sees the new head and removes the row the append superseded.
+    yield* TestClock.adjust(NodeUpdateRetention.NODE_UPDATE_RETENTION_INTERVAL_MS);
+    assert.equal((yield* retention.runPass).deletedRows, 1);
+  }).pipe(Effect.provide(TestLayer)),
+);
