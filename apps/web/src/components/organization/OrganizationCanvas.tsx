@@ -196,16 +196,23 @@ function CardHeader(props: {
   );
 }
 
-/** One pull request as a chip: state glyph, number and a short title, opening on click. */
+/**
+ * One pull request as a chip: state glyph, number and (unless compact) a short title. Compact
+ * chips keep only the glyph and number so a narrow subtask row still has room for its title.
+ */
 function PullRequestChip(props: {
   pullRequest: OrganizationPullRequest;
   onOpen: (event: ReactMouseEvent<HTMLElement>, url: string) => void;
+  compact?: boolean;
 }) {
   const { pullRequest } = props;
   const presentation = resolvePullRequestState({
     state: pullRequest.state,
     isDraft: pullRequest.isDraft,
   });
+  const label = `Pull request #${pullRequest.number}${
+    pullRequest.title ? `: ${pullRequest.title}` : ""
+  }`;
   return (
     <Tooltip>
       <TooltipTrigger
@@ -215,6 +222,7 @@ function PullRequestChip(props: {
             href={pullRequest.url}
             target="_blank"
             rel="noopener noreferrer"
+            aria-label={label}
             onClick={(event) => props.onOpen(event, pullRequest.url)}
           />
         }
@@ -224,7 +232,7 @@ function PullRequestChip(props: {
           aria-hidden
         />
         <span className={styles["org-pr-number"]}>#{pullRequest.number}</span>
-        {pullRequest.title ? (
+        {!props.compact && pullRequest.title ? (
           <span className={styles["org-pr-title"]}>{pullRequest.title}</span>
         ) : null}
       </TooltipTrigger>
@@ -237,15 +245,19 @@ function PullRequestChip(props: {
   );
 }
 
-/** Earlier-round merged pull requests as one chip that reveals the history list. */
-function MergedHistoryChip(props: { count: number; expanded: boolean; onOpenHistory: () => void }) {
+/** Earlier-round merged pull requests as one chip that toggles the history list. */
+function MergedHistoryChip(props: {
+  count: number;
+  expanded: boolean;
+  onToggleHistory: () => void;
+}) {
   const presentation = resolvePullRequestState({ state: "merged", isDraft: false });
   return (
     <button
       type="button"
       className={cn(styles["org-pr-chip"], styles["org-pr-merged"])}
       aria-expanded={props.expanded}
-      onClick={props.onOpenHistory}
+      onClick={props.onToggleHistory}
     >
       <presentation.Icon
         className={cn("size-3 shrink-0", presentation.toneClassName)}
@@ -292,14 +304,39 @@ function reviewerPresentation(review: OrganizationReview | null): {
 }
 
 /** Green when accepted, amber while under review, grey with none; the verdict is the tooltip. */
-function ReviewerGlyph({ review }: { review: OrganizationReview | null }) {
-  const presentation = reviewerPresentation(review);
+function ReviewerGlyph(props: {
+  review: OrganizationReview | null;
+  highlightThreadId: string | null;
+  onOpenThread: (thread: Shell) => void;
+}) {
+  const presentation = reviewerPresentation(props.review);
+  const reviewer = props.review?.reviewer;
+  const glyph = <presentation.Icon className="size-3.5" aria-hidden />;
+  const triggerClassName = cn(styles["org-reviewer"], presentation.className);
   return (
     <Tooltip>
       <TooltipTrigger
-        render={<span className={cn(styles["org-reviewer"], presentation.className)} />}
+        render={
+          reviewer ? (
+            <button
+              type="button"
+              className={cn(
+                triggerClassName,
+                styles["org-reviewer-button"],
+                reviewer.id === props.highlightThreadId && styles["org-current"],
+              )}
+              aria-label={presentation.label}
+              onClick={(event) => {
+                event.stopPropagation();
+                props.onOpenThread(reviewer);
+              }}
+            />
+          ) : (
+            <span className={triggerClassName} />
+          )
+        }
       >
-        <presentation.Icon className="size-3.5" aria-hidden />
+        {glyph}
       </TooltipTrigger>
       <TooltipPopup side="top">{presentation.label}</TooltipPopup>
     </Tooltip>
@@ -518,12 +555,17 @@ function SubtaskRow(props: {
           thread={executor}
           entry={props.providerEntryByInstanceId.get(instanceIdOf(executor))}
         />
-        <ReviewerGlyph review={subtask.review} />
+        <ReviewerGlyph
+          review={subtask.review}
+          highlightThreadId={props.highlightThreadId}
+          onOpenThread={props.onOpenThread}
+        />
         {subtask.pullRequests.map((pullRequest) => (
           <PullRequestChip
             key={pullRequest.url}
             pullRequest={pullRequest}
             onOpen={props.onOpenPullRequest}
+            compact
           />
         ))}
       </div>
@@ -586,7 +628,7 @@ function LeadCard(props: {
             <MergedHistoryChip
               count={card.mergedHistory.length}
               expanded={historyOpen}
-              onOpenHistory={() => setHistoryOpen(true)}
+              onToggleHistory={() => setHistoryOpen((open) => !open)}
             />
           ) : null}
         </div>

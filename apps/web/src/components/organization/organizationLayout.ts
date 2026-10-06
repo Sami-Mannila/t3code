@@ -155,38 +155,51 @@ const byPullRequestNumber = (left: OrganizationPullRequest, right: OrganizationP
 /**
  * A lead's finished rounds own pull requests that are already merged; showing them as individual
  * chips would bury the current round. They collapse into one merged count, so this returns the
- * merged history plus the link keys the rows must hide. The pool is the lead and its executors, so
- * an executor's merged link is found even when only the number was recorded on the round.
+ * merged history plus the link keys the rows must hide.
+ *
+ * A round only owns what its own participants linked: the lead and the round's
+ * `dependencyThreadIds`. Resolving a round's recorded number against every executor would let a
+ * multi-repo project collapse another repository's same-numbered pull request.
  */
 function collapseMergedHistory(
   lead: Shell,
-  executors: ReadonlyArray<Shell>,
+  byId: ReadonlyMap<string, Shell>,
   task: OrganizationTask | undefined,
 ): {
-  readonly byNumber: ReadonlyMap<number, ThreadPullRequestLink>;
   readonly mergedHistory: ReadonlyArray<OrganizationPullRequest>;
   readonly collapsed: ReadonlySet<string>;
+  readonly rounds: ReadonlyArray<OrganizationRound>;
 } {
-  const byNumber = new Map<number, ThreadPullRequestLink>();
-  for (const thread of [lead, ...executors]) {
-    for (const link of visiblePullRequestLinks(thread)) {
-      if (!byNumber.has(link.number)) byNumber.set(link.number, link);
-    }
-  }
   const mergedHistory: OrganizationPullRequest[] = [];
   const collapsed = new Set<string>();
+  const rounds: OrganizationRound[] = [];
   for (const round of task?.rounds ?? []) {
-    for (const number of round.pullRequests) {
-      const link = byNumber.get(number);
-      if (link === undefined || link.snapshot?.state !== "merged") continue;
-      const key = threadPullRequestKeyOf(link);
-      if (collapsed.has(key)) continue;
-      collapsed.add(key);
-      mergedHistory.push(toPullRequest(link));
+    const owners = [lead, ...round.dependencyThreadIds.map((id) => byId.get(id))].filter(
+      (thread): thread is Shell => thread !== undefined,
+    );
+    const ownerLinks = new Map<string, ThreadPullRequestLink>();
+    for (const thread of owners) {
+      for (const link of visiblePullRequestLinks(thread)) {
+        const key = threadPullRequestKeyOf(link);
+        if (!ownerLinks.has(key)) ownerLinks.set(key, link);
+      }
     }
+    const roundPullRequests: OrganizationPullRequest[] = [];
+    for (const number of round.pullRequests) {
+      for (const link of ownerLinks.values()) {
+        if (link.number !== number) continue;
+        roundPullRequests.push(toPullRequest(link));
+        if (link.snapshot?.state !== "merged") continue;
+        const key = threadPullRequestKeyOf(link);
+        if (collapsed.has(key)) continue;
+        collapsed.add(key);
+        mergedHistory.push(toPullRequest(link));
+      }
+    }
+    rounds.push({ round: round.round, state: round.state, pullRequests: roundPullRequests });
   }
   mergedHistory.sort(byPullRequestNumber);
-  return { byNumber, mergedHistory, collapsed };
+  return { mergedHistory, collapsed, rounds };
 }
 
 /** The server accepts outcomes; the card says what a reviewed one is waiting for. */
@@ -372,10 +385,12 @@ export function organizationModel(
       const { review, earlier } = reviewOf(lead);
       const outcome = lead.source.organization!.task;
       const executorThreads = executorsByLead.get(lead.id) ?? [];
-      const { byNumber, mergedHistory, collapsed } = collapseMergedHistory(
-        lead,
-        executorThreads,
-        outcome,
+      const { mergedHistory, collapsed, rounds } = collapseMergedHistory(lead, byId, outcome);
+      // A lead that inherited an executor's link should not draw it twice; the row owns it.
+      const executorKeys = new Set(
+        executorThreads.flatMap((thread) =>
+          visiblePullRequestLinks(thread).map(threadPullRequestKeyOf),
+        ),
       );
       return {
         lead,
@@ -385,17 +400,14 @@ export function organizationModel(
         subtasks: checklist(executorThreads, collapsed),
         outcomeWait: outcomeWaitLabel(organizationOutcomeGate(outcomeThread(lead), outcomeThreads)),
         pullRequests: visiblePullRequestLinks(lead)
-          .filter((link) => !collapsed.has(threadPullRequestKeyOf(link)))
+          .filter(
+            (link) =>
+              !collapsed.has(threadPullRequestKeyOf(link)) &&
+              !executorKeys.has(threadPullRequestKeyOf(link)),
+          )
           .map(toPullRequest),
         mergedHistory,
-        rounds: (outcome?.rounds ?? []).map((round) => ({
-          round: round.round,
-          state: round.state,
-          pullRequests: round.pullRequests
-            .map((number) => byNumber.get(number))
-            .filter((link): link is ThreadPullRequestLink => link !== undefined)
-            .map(toPullRequest),
-        })),
+        rounds,
       };
     });
   const roots = threads
