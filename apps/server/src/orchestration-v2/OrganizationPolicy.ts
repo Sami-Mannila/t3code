@@ -413,7 +413,8 @@ const IDLE_LEAD_BLOCK_PREFIX = "Stopped without submitting or asking the user. L
  * A lead that ends its turn still working, with nothing running and no question open on the
  * Chief, has neither submitted, asked the user, nor blocked. The server records the round blocked
  * with the lead's last message so the Chief hears it instead of silence. A queued, awaiting,
- * accepted, in-correction, or already-blocked round is a deliberate state and is left alone.
+ * accepted, in-correction, or already-blocked round is a deliberate state and is left alone, as
+ * is a result run that predates the current round (the round was extended after that run ended).
  */
 export function organizationIdleLeadBlock(input: {
   readonly task: OrganizationTask;
@@ -421,11 +422,20 @@ export function organizationIdleLeadBlock(input: {
   readonly progress: "working" | "waiting_for_children" | "result_available";
   readonly hasOpenQuestion: boolean;
   readonly resultText: string;
+  /** The result run's start; absent when it never recorded one. */
+  readonly resultRunStartedAt: string | undefined;
 }): OrganizationTask | null {
   if (ORGANIZATION_EXTENDABLE_STATES.has(input.task.state)) return null;
   if (input.runStatus !== "completed" && input.runStatus !== "failed") return null;
   if (input.progress !== "result_available") return null;
   if (input.hasOpenQuestion) return null;
+  const roundStartedAt = input.task.roundStartedAt;
+  if (
+    roundStartedAt !== undefined &&
+    input.resultRunStartedAt !== undefined &&
+    Date.parse(input.resultRunStartedAt) < Date.parse(roundStartedAt)
+  )
+    return null;
   const excerpt = input.resultText.replace(/\s+/g, " ").trim();
   return {
     ...input.task,
