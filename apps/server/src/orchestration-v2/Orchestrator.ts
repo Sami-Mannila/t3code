@@ -13,6 +13,7 @@ import {
   organizationPreparesRuns,
   organizationChiefNoticeRelevant,
   organizationChiefNotice,
+  organizationIdleLeadBlock,
   ORGANIZATION_CHIEF_NOTICE_PREFIX,
   organizationInstructionUnblock,
 } from "./OrganizationPolicy.ts";
@@ -3279,7 +3280,7 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
       !Equal.equals(thread.organization?.task, command.organization.task)
     )
       yield* announceOrganizationTaskChange(
-        command,
+        command.commandId,
         {
           thread,
           previous: thread.organization?.task,
@@ -4475,7 +4476,7 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
    * organizationChiefNoticeRelevant); the parent hears every change of its child.
    */
   const announceOrganizationTaskChange = (
-    command: OrchestrationV2ServerCommand,
+    commandId: CommandId,
     input: {
       readonly thread: OrchestrationV2AppThread;
       readonly previous: OrganizationTask | undefined;
@@ -4486,6 +4487,12 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
     effects: Ref.Ref<Array<PendingOrchestrationEffectV2>>,
   ): Effect.Effect<void, OrchestratorV2Error> =>
     Effect.gen(function* () {
+      // The command only carries its id: notices are built and committed by the caller's path.
+      const command = {
+        type: "thread.metadata.update",
+        commandId,
+        threadId: input.thread.id,
+      } as OrchestrationV2ServerCommand;
       const snapshot = yield* projectionStore.getShellSnapshot().pipe(mapDispatchError(command));
       const chief = snapshot.threads.find(
         (item) =>
@@ -4612,6 +4619,49 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
       }
     });
 
+  /**
+   * A lead's run can end while its round is still working and nothing is running: it never
+   * submitted, asked the user, or blocked, so no task-state change ever reached the Chief. Record
+   * the round blocked with the lead's last message; the normal announce path wakes the Chief and
+   * the UI shows it blocked. It runs before the delegated-result transfer dedupe, so first and
+   * extended rounds alike are covered. Callers hold the Chief's dispatch lock.
+   */
+  const blockIdleOrganizationLead = (input: {
+    readonly thread: OrchestrationV2AppThread;
+    readonly task: OrganizationTask;
+    readonly runStatus: OrchestrationV2Run["status"];
+    readonly progress: "working" | "waiting_for_children" | "result_available";
+    readonly hasOpenQuestion: boolean;
+    readonly resultText: string;
+  }) =>
+    Effect.gen(function* () {
+      const blocked = organizationIdleLeadBlock(input);
+      if (blocked === null) return;
+      const now = yield* DateTime.now;
+      const thread: OrchestrationV2AppThread = {
+        ...input.thread,
+        organization: { ...input.thread.organization!, task: blocked },
+        updatedAt: now,
+      };
+      const events = yield* Ref.make<Array<OrchestrationV2DomainEvent>>([]);
+      const effects = yield* Ref.make<Array<PendingOrchestrationEffectV2>>([]);
+      yield* announceOrganizationTaskChange(
+        CommandId.make(`organization:lead-idle:${input.thread.id}:${now}`),
+        { thread, previous: input.task, next: blocked, actorThreadId: undefined },
+        events,
+        effects,
+      );
+      const metadataEvent = yield* makeSystemEvent({
+        type: "thread.metadata-updated",
+        threadId: thread.id,
+        providerInstanceId: thread.providerInstanceId,
+        occurredAt: now,
+        payload: thread,
+      });
+      yield* Ref.update(events, (existing) => [...existing, metadataEvent]);
+      yield* writeSystemEvents(yield* Ref.get(events), yield* Ref.get(effects));
+    });
+
   const dispatchMessage = (
     command: Extract<OrchestrationV2Command, { readonly type: "message.dispatch" }>,
     events: Ref.Ref<Array<OrchestrationV2DomainEvent>>,
@@ -4659,7 +4709,7 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
             payload: thread,
           });
           yield* announceOrganizationTaskChange(
-            command,
+            command.commandId,
             { thread, previous, next: unblock.task, actorThreadId: unblock.actorThreadId },
             events,
             effects,
@@ -9648,9 +9698,29 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
           "nodes",
           "turnItems",
           "contextTransfers",
+          "runtimeRequests",
         ],
         { turnItemTypes: ["subagent"], messageRoles: ["user"] },
       );
+      // A lead can end a round without submitting, asking, or blocking. Flag it before the
+      // result-transfer dedupe below, which otherwise swallows every round after the first.
+      const childOrganization = childControls.thread.organization;
+      if (childOrganization?.role === "lead" && childOrganization.task !== undefined) {
+        yield* blockIdleOrganizationLead({
+          thread: childControls.thread,
+          task: childOrganization.task,
+          runStatus: childRun.status,
+          progress: progress.state,
+          hasOpenQuestion: parentProjection.runtimeRequests.some(
+            (request) =>
+              request.status === "pending" &&
+              String(request.id).startsWith(
+                `${SERVER_QUESTION_ID_PREFIX}organization:${childThreadId}:`,
+              ),
+          ),
+          resultText: subagentResultForRun(childProjection, childRun).text,
+        });
+      }
       const task = parentProjection.subagents.find(
         (candidate) =>
           candidate.id === forkedFrom.nodeId &&
