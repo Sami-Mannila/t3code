@@ -11,6 +11,10 @@ import {
   organizationRepository,
   organizationPreparationUnblock,
   organizationPreparesRuns,
+  organizationChiefNoticeRelevant,
+  organizationChiefNotice,
+  ORGANIZATION_CHIEF_NOTICE_PREFIX,
+  organizationInstructionUnblock,
 } from "./OrganizationPolicy.ts";
 import {
   latestExecutedRun,
@@ -51,6 +55,8 @@ import {
   type OrchestrationV2ProviderTurn,
   type OrchestrationV2Run,
   type OrchestrationV2RunAttempt,
+  type OrchestrationV2RuntimeRequest,
+  type OrganizationTask,
   type OrchestrationV2ThreadShell,
   type OrchestrationV2ThreadShellSnapshot,
   type OrchestrationV2StoredEvent,
@@ -63,7 +69,8 @@ import {
   RunId,
   ThreadLinkedPullRequest,
   ThreadId,
-  type TurnItemId,
+  NodeId,
+  TurnItemId,
 } from "@t3tools/contracts";
 import { modelSelectionsEqual } from "@t3tools/shared/model";
 import {
@@ -383,6 +390,19 @@ export function isNativeMaintenanceCommand(message: {
   );
 }
 
+/** Open server-created questions a conversation may hold at once. */
+export const MAX_PENDING_SERVER_QUESTIONS = 3;
+
+/** Every `thread.user-input.request` id carries this prefix, which no provider request uses. */
+export const SERVER_QUESTION_ID_PREFIX = "server-question:";
+
+/** A question the server opened for the user (`thread.user-input.request`), not a provider's. */
+export function isServerUserInputRequest(
+  request: Pick<OrchestrationV2RuntimeRequest, "id" | "kind">,
+): boolean {
+  return request.kind === "user_input" && request.id.startsWith(SERVER_QUESTION_ID_PREFIX);
+}
+
 const threadPullRequestLinksEqual = Schema.toEquivalence(Schema.NullOr(ThreadLinkedPullRequest));
 
 function commandThreadId(command: OrchestrationV2ServerCommand): ThreadId {
@@ -431,6 +451,7 @@ function commandThreadId(command: OrchestrationV2ServerCommand): ThreadId {
     case "queued-run.edit":
     case "runtime-request.respond":
     case "thread.user-input.dismiss":
+    case "thread.user-input.request":
     case "checkpoint.rollback":
     case "checkpoint.rollback.fail":
     case "thread.background-work.settle":
@@ -2626,6 +2647,15 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
       const blockingRequestExists = pendingRequests.some(
         (request) => request.kind !== "user_input" || request.responseCapability.type !== "message",
       );
+      // A question the server opened for the user is the whole point of the conversation's
+      // wait; settling must not silently cancel it. The user answers or dismisses it first.
+      if (pendingRequests.some(isServerUserInputRequest)) {
+        return yield* new OrchestratorDispatchError({
+          commandId: command.commandId,
+          commandType: command.type,
+          cause: `Thread ${command.threadId} has an open question for the user; answer or dismiss it before settling.`,
+        });
+      }
       if (activeRunExists || blockingRequestExists) {
         return yield* new OrchestratorDispatchError({
           commandId: command.commandId,
@@ -3247,71 +3277,18 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
       command.type === "thread.metadata.update" &&
       command.organization?.task &&
       !Equal.equals(thread.organization?.task, command.organization.task)
-    ) {
-      const snapshot = yield* projectionStore.getShellSnapshot().pipe(mapDispatchError(command));
-      const chief = snapshot.threads.find(
-        (item) =>
-          item.projectId === thread.projectId &&
-          item.organization?.role === "chief" &&
-          item.archivedAt === null &&
-          item.deletedAt === null,
+    )
+      yield* announceOrganizationTaskChange(
+        command,
+        {
+          thread,
+          previous: thread.organization?.task,
+          next: command.organization.task,
+          actorThreadId: command.organizationActorThreadId,
+        },
+        events,
+        effects,
       );
-      const notifyChief = chief !== undefined && chief.id !== thread.id;
-      // The parent coordinator owns the next step after a child task changes.
-      const parent = snapshot.threads.find(
-        (item) =>
-          item.id === thread.organization?.parentThreadId &&
-          item.id !== thread.id &&
-          item.id !== chief?.id &&
-          item.id !== command.organizationActorThreadId &&
-          item.projectId === thread.projectId &&
-          item.archivedAt === null &&
-          item.deletedAt === null,
-      );
-      if (notifyChief || parent) {
-        const task = command.organization.task;
-        const state = task.state.replaceAll("_", " ");
-        const summary = `${thread.title}: ${state}`;
-        const notice = (threadId: ThreadId, messageId: MessageId, text: string) =>
-          dispatchMessage(
-            {
-              type: "message.dispatch",
-              commandId: command.commandId,
-              threadId,
-              messageId,
-              senderThreadId: thread.id,
-              text,
-              notification: {
-                source: { kind: "background_task" },
-                outcome: task.state === "blocked" ? "failed" : "updated",
-                summary,
-              },
-              attachments: [],
-              dispatchMode: { type: "queue_after_active" },
-              createdBy: "agent",
-              creationSource: "server",
-            },
-            events,
-            effects,
-          );
-        if (notifyChief) {
-          const project = yield* projects.get(thread.projectId).pipe(mapDispatchError(command));
-          const projectTitle = Option.isSome(project) ? project.value.title : thread.projectId;
-          yield* notice(
-            chief.id,
-            MessageId.make(`organization:${command.commandId}`),
-            `Organization update for project ${projectTitle}. ${summary}. ${task.notes ?? ""} This is coordinator evidence, not user approval. Explain the outcome and any decision options briefly in this Chief conversation.`,
-          );
-        }
-        if (parent) {
-          yield* notice(
-            parent.id,
-            MessageId.make(`organization-parent:${command.commandId}`),
-            `Child task update. ${task.title}: ${state}. ${task.notes ?? ""} This is coordinator evidence, not user approval. Continue your own task from its canonical record (t3_organization_task read): after an accepted review, submit your outcome for independent review; after blocked or changes requested, decide the next step.`,
-          );
-        }
-      }
-    }
 
     if (command.type === "thread.metadata.update" && command.regenerateTitle === true) {
       yield* Ref.update(effects, (existing) => [
@@ -4492,6 +4469,149 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
       ]);
     });
 
+  /**
+   * Tells the Chief and the parent coordinator about a task change, as commit-time notices of
+   * the command that changed it. The Chief hears only status changes (see
+   * organizationChiefNoticeRelevant); the parent hears every change of its child.
+   */
+  const announceOrganizationTaskChange = (
+    command: OrchestrationV2ServerCommand,
+    input: {
+      readonly thread: OrchestrationV2AppThread;
+      readonly previous: OrganizationTask | undefined;
+      readonly next: OrganizationTask;
+      readonly actorThreadId: ThreadId | undefined;
+    },
+    events: Ref.Ref<Array<OrchestrationV2DomainEvent>>,
+    effects: Ref.Ref<Array<PendingOrchestrationEffectV2>>,
+  ): Effect.Effect<void, OrchestratorV2Error> =>
+    Effect.gen(function* () {
+      const snapshot = yield* projectionStore.getShellSnapshot().pipe(mapDispatchError(command));
+      const chief = snapshot.threads.find(
+        (item) =>
+          item.projectId === input.thread.projectId &&
+          item.organization?.role === "chief" &&
+          item.archivedAt === null &&
+          item.deletedAt === null,
+      );
+      // The Chief hears status changes, never its own updates or worker churn.
+      const notifyChief =
+        chief !== undefined &&
+        chief.id !== input.thread.id &&
+        chief.id !== input.actorThreadId &&
+        organizationChiefNoticeRelevant(
+          input.previous,
+          input.next,
+          input.thread.organization?.parentThreadId === chief.id,
+        );
+      // The parent coordinator owns the next step after a child task changes.
+      const parent = snapshot.threads.find(
+        (item) =>
+          item.id === input.thread.organization?.parentThreadId &&
+          item.id !== input.thread.id &&
+          item.id !== chief?.id &&
+          item.id !== input.actorThreadId &&
+          item.projectId === input.thread.projectId &&
+          item.archivedAt === null &&
+          item.deletedAt === null,
+      );
+      if (notifyChief || parent) {
+        const task = input.next;
+        const state = task.state.replaceAll("_", " ");
+        const summary = `${input.thread.title}: ${state}`;
+        const notice = (threadId: ThreadId, messageId: MessageId, text: string) =>
+          dispatchMessage(
+            {
+              type: "message.dispatch",
+              commandId: command.commandId,
+              threadId,
+              messageId,
+              senderThreadId: input.thread.id,
+              text,
+              notification: {
+                source: { kind: "background_task" },
+                outcome: task.state === "blocked" ? "failed" : "updated",
+                summary,
+              },
+              attachments: [],
+              dispatchMode: { type: "queue_after_active" },
+              createdBy: "agent",
+              creationSource: "server",
+            },
+            events,
+            effects,
+          );
+        if (notifyChief) {
+          const project = yield* projects
+            .get(input.thread.projectId)
+            .pipe(mapDispatchError(command));
+          const projectTitle = Option.isSome(project)
+            ? project.value.title
+            : input.thread.projectId;
+          // Like delegated completions, an unstarted queued notice absorbs later ones so the
+          // Chief takes one turn for a burst of updates.
+          const chiefProjection = yield* getProjectionWithPendingEvents(chief.id, events);
+          const queued = chiefProjection.messages.find(
+            (message) =>
+              message.id.startsWith(ORGANIZATION_CHIEF_NOTICE_PREFIX) &&
+              chiefProjection.runs.some(
+                (run) =>
+                  run.userMessageId === message.id &&
+                  run.status === "queued" &&
+                  run.startedAt === null,
+              ),
+          );
+          const chiefNotice = organizationChiefNotice({
+            projectTitle,
+            ...(queued ? { queuedText: queued.text } : {}),
+            threadId: input.thread.id,
+            task,
+          });
+          if (queued) {
+            const now = yield* DateTime.now;
+            yield* emit(
+              events,
+              command,
+            )({
+              type: "message.updated",
+              threadId: chief.id,
+              ...(queued.runId === null ? {} : { runId: queued.runId }),
+              ...(queued.nodeId === null ? {} : { nodeId: queued.nodeId }),
+              providerInstanceId: chiefProjection.thread.providerInstanceId,
+              occurredAt: now,
+              payload: {
+                ...queued,
+                text: chiefNotice.text,
+                ...(queued.notification
+                  ? {
+                      notification: {
+                        ...queued.notification,
+                        outcome: chiefNotice.blocked ? "failed" : "updated",
+                        summary: chiefNotice.summary,
+                      },
+                    }
+                  : {}),
+                updatedAt: now,
+              },
+            });
+          } else {
+            yield* notice(
+              chief.id,
+              MessageId.make(`${ORGANIZATION_CHIEF_NOTICE_PREFIX}${command.commandId}`),
+              chiefNotice.text,
+            );
+          }
+        }
+        if (parent) {
+          yield* notice(
+            parent.id,
+            MessageId.make(`organization-parent:${command.commandId}`),
+            `Child task update. ${task.title}: ${state}. ${task.notes ?? ""} This is coordinator evidence, not user approval. Continue your own task from its canonical record (t3_organization_task read): after an accepted review, submit your outcome for independent review; after blocked or changes requested, decide the next step.`,
+          );
+        }
+      }
+    });
+
   const dispatchMessage = (
     command: Extract<OrchestrationV2Command, { readonly type: "message.dispatch" }>,
     events: Ref.Ref<Array<OrchestrationV2DomainEvent>>,
@@ -4499,6 +4619,54 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
   ) =>
     Effect.gen(function* () {
       let projection = yield* getProjectionWithPendingEvents(command.threadId, events);
+      if (projection.thread.organization?.task?.state === "blocked") {
+        const shell = yield* projectionStore.getShellSnapshot().pipe(mapDispatchError(command));
+        const coordinator = shell.threads.find(
+          (item) => item.id === projection.thread.organization?.parentThreadId,
+        );
+        const unblock = organizationInstructionUnblock({
+          thread: projection.thread,
+          message: { ...command, messageId: command.messageId },
+          coordinatorLabel: coordinator?.organization?.role === "chief" ? "the Chief" : "its lead",
+          queued: projection.runs.some(isBlockingRun),
+        });
+        const next = unblock && {
+          ...projection.thread.organization,
+          task: unblock.task,
+        };
+        // The same rules as any task update; a refused unblock leaves the message as it was.
+        if (
+          unblock &&
+          next &&
+          !organizationProblem({
+            thread: projection.thread,
+            next,
+            threads: shell.threads,
+            ...(unblock.actorThreadId ? { actorThreadId: unblock.actorThreadId } : {}),
+          })
+        ) {
+          const now = yield* DateTime.now;
+          const previous = projection.thread.organization.task;
+          const thread = { ...projection.thread, organization: next, updatedAt: now };
+          yield* emit(
+            events,
+            command,
+          )({
+            type: "thread.metadata-updated",
+            threadId: command.threadId,
+            providerInstanceId: thread.providerInstanceId,
+            occurredAt: now,
+            payload: thread,
+          });
+          yield* announceOrganizationTaskChange(
+            command,
+            { thread, previous, next: unblock.task, actorThreadId: unblock.actorThreadId },
+            events,
+            effects,
+          );
+          projection = yield* getProjectionWithPendingEvents(command.threadId, events);
+        }
+      }
       if (
         projection.thread.organization &&
         command.dispatchMode.type !== "queue_after_active" &&
@@ -6731,6 +6899,11 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
               },
               branch: null,
               worktreePath: null,
+              // A role owns only the pull requests it opens; its parent's would gate its
+              // outcome and hold it open for settling.
+              pullRequests: [],
+              linkedPullRequest: null,
+              branchPullRequest: null,
             }
           : {}),
         runtimeMode: command.runtimeMode,
@@ -7321,7 +7494,14 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
         }
         const replies: string[] = [];
         for (const question of approvalTurnItem.questions) {
-          const answer = command.answers?.[question.id];
+          const raw = command.answers?.[question.id];
+          // Multi-select answers arrive as one string per chosen option.
+          const answer = Array.isArray(raw)
+            ? raw
+                .filter((part): part is string => typeof part === "string" && part.trim() !== "")
+                .map((part) => part.trim())
+                .join(", ")
+            : raw;
           if (typeof answer !== "string" || answer.trim().length === 0) {
             if (question.required === false) continue;
             return yield* new OrchestratorDispatchError({
@@ -7381,8 +7561,14 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
             messageId: MessageId.make(`async-answer:${command.requestId}`),
             text: replies.join("\n\n"),
             attachments: [],
-            createdBy: "user",
-            creationSource: "server",
+            // The answer is the responder's message: an agent's answer is not the user's.
+            ...(command.respondedByThreadId === undefined
+              ? { createdBy: "user" as const, creationSource: "server" as const }
+              : {
+                  createdBy: "agent" as const,
+                  creationSource: "mcp" as const,
+                  senderThreadId: command.respondedByThreadId,
+                }),
             dispatchMode,
           },
           events,
@@ -7443,6 +7629,111 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
         events,
         effects,
       );
+    });
+
+  const dispatchThreadUserInputRequest = (
+    command: Extract<
+      OrchestrationV2InternalCommand,
+      { readonly type: "thread.user-input.request" }
+    >,
+    events: Ref.Ref<Array<OrchestrationV2DomainEvent>>,
+  ) =>
+    Effect.gen(function* () {
+      const projection = yield* projectionStore
+        .getThreadRecords(command.threadId, ["runtimeRequests"])
+        .pipe(
+          Effect.mapError(() => new OrchestratorProjectionError({ threadId: command.threadId })),
+        );
+      const reject = (cause: string) =>
+        new OrchestratorDispatchError({
+          commandId: command.commandId,
+          commandType: command.type,
+          cause,
+        });
+      if (!command.requestId.startsWith(SERVER_QUESTION_ID_PREFIX))
+        return yield* reject(`Question ids start with ${SERVER_QUESTION_ID_PREFIX}.`);
+      if (projection.thread.archivedAt !== null || projection.thread.deletedAt !== null)
+        return yield* reject(`Thread ${command.threadId} is not active.`);
+      if (projection.runtimeRequests.some((request) => request.id === command.requestId))
+        return yield* reject(`Question ${command.requestId} already exists.`);
+      const open = projection.runtimeRequests
+        .filter(isServerUserInputRequest)
+        .filter((request) => request.status === "pending").length;
+      if (open >= MAX_PENDING_SERVER_QUESTIONS)
+        return yield* reject(
+          `This conversation already has ${open} unanswered questions for the user. Wait for an answer, or fold the new question into a later one.`,
+        );
+      const now = yield* DateTime.now;
+      // No provider turn waits on this question: it roots itself and is answered by message.
+      const nodeId = NodeId.make(`user-input:${command.requestId}`);
+      const node: OrchestrationV2ExecutionNode = {
+        id: nodeId,
+        threadId: command.threadId,
+        runId: null,
+        parentNodeId: null,
+        rootNodeId: nodeId,
+        kind: "user_input_request",
+        status: "waiting",
+        countsForRun: false,
+        providerThreadId: null,
+        providerTurnId: null,
+        nativeItemRef: null,
+        runtimeRequestId: command.requestId,
+        checkpointScopeId: null,
+        startedAt: now,
+        completedAt: null,
+      };
+      const emitEvent = emit(events, command);
+      yield* emitEvent({
+        type: "node.updated",
+        threadId: command.threadId,
+        nodeId,
+        occurredAt: now,
+        payload: node,
+      });
+      yield* emitEvent({
+        type: "runtime-request.updated",
+        threadId: command.threadId,
+        nodeId,
+        occurredAt: now,
+        payload: {
+          id: command.requestId,
+          nodeId,
+          providerTurnId: null,
+          nativeRequestRef: null,
+          kind: "user_input",
+          status: "pending",
+          responseCapability: { type: "message" },
+          createdAt: now,
+          resolvedAt: null,
+        },
+      });
+      yield* emitEvent({
+        type: "turn-item.updated",
+        threadId: command.threadId,
+        nodeId,
+        occurredAt: now,
+        payload: {
+          id: TurnItemId.make(`user-input:${command.requestId}`),
+          threadId: command.threadId,
+          runId: null,
+          nodeId,
+          providerThreadId: null,
+          providerTurnId: null,
+          nativeItemRef: null,
+          parentItemId: null,
+          ordinal: yield* nextTurnItemOrdinal(projection),
+          status: "waiting",
+          title: null,
+          startedAt: now,
+          completedAt: null,
+          updatedAt: now,
+          type: "user_input_request",
+          requestId: command.requestId,
+          questions: command.questions,
+          responseMode: "message",
+        },
+      });
     });
 
   const dispatchQueuedMessagePromoteToSteer = (
@@ -10087,6 +10378,9 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
         break;
       case "checkpoint.rollback.fail":
         yield* dispatchCheckpointRollbackFail(command, events);
+        break;
+      case "thread.user-input.request":
+        yield* dispatchThreadUserInputRequest(command, events);
         break;
       case "thread.background-work.settle":
         yield* dispatchBackgroundWorkSettle(command, events);

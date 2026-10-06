@@ -54,6 +54,10 @@ import {
   rewriteCursorSkillMentions,
 } from "../../provider/Drivers/CursorSkills.ts";
 import { mergeProviderInstanceEnvironment } from "../../provider/ProviderInstanceEnvironment.ts";
+import {
+  agentCommandGuardDirectory,
+  withAgentCommandGuard,
+} from "../../provider/AgentCommandGuard.ts";
 import { t3OrchestrationPromptForFirstRun } from "../../provider/T3OrchestrationInstructions.ts";
 import { buildRuntimeInstructions } from "../../provider/RuntimeInstructions.ts";
 import * as IdAllocator from "../IdAllocator.ts";
@@ -2630,7 +2634,10 @@ export const CursorAdapterV2Driver: ProviderAdapterDriver<
           ...input.config,
           enabled: input.enabled,
         },
-        environment: mergeProviderInstanceEnvironment(input.environment, hostEnvironment),
+        environment: yield* withAgentCommandGuard(
+          mergeProviderInstanceEnvironment(input.environment, hostEnvironment),
+          agentCommandGuardDirectory(serverConfig.stateDir),
+        ),
         fileSystem,
         path,
         idAllocator,

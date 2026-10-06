@@ -17,8 +17,8 @@ import {
 import { Button } from "~/components/ui/button";
 
 /**
- * Confirms archiving a lead whose outcome the user accepted, together with its executors and
- * reviewers. The server refuses while any of them still has work in progress.
+ * Confirms archiving a lead, accepted or not, together with its executors and reviewers. The
+ * server refuses while any of them still has work in progress.
  */
 export function OrganizationArchiveDialog(props: {
   readonly lead: EnvironmentThreadShell | null;
@@ -36,6 +36,7 @@ export function OrganizationArchiveDialog(props: {
           props.lead.id,
           props.threads.map((thread) => thread.source),
         );
+  const state = props.lead?.source.organization?.task?.state;
   const close = () => {
     setError("");
     props.onClose();
@@ -66,6 +67,9 @@ export function OrganizationArchiveDialog(props: {
             Archives {props.lead?.title ?? "this lead"} and every executor and reviewer reporting to
             it: {members.length} {members.length === 1 ? "thread" : "threads"}. Unarchive the lead
             from Settings → Archived to restore them together.
+            {state && state !== "accepted"
+              ? ` Its outcome is ${state.replaceAll("_", " ")}, not accepted: the work is put away as it is.`
+              : ""}
           </AlertDialogDescription>
         </AlertDialogHeader>
         <ul className="max-h-48 space-y-1 overflow-auto p-4 text-sm">

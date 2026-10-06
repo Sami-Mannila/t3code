@@ -15,7 +15,6 @@ export function OrganizationPanel(props: { threadRef: ScopedThreadRef }) {
   const { environments } = useEnvironments();
   const environment = environments.find((e) => e.environmentId === props.threadRef.environmentId);
   const supported = environment?.serverConfig?.environment.capabilities.organizationV1 === true;
-  const connected = environment?.connection.phase === "connected";
   if (!thread) return null;
   if (!supported)
     return (
@@ -41,7 +40,6 @@ export function OrganizationPanel(props: { threadRef: ScopedThreadRef }) {
         environmentId={thread.environmentId}
         projectId={thread.projectId}
         highlightThreadId={thread.id}
-        acceptDisabled={!connected}
         onOpenThread={(target) => {
           // The panel stays open beside the conversation the user moves to.
           useRightPanelStore

@@ -33,6 +33,10 @@ import * as AcpSessionRuntime from "../../provider/acp/AcpSessionRuntime.ts";
 import { makeAcpNativeLoggerFactory } from "../../provider/acp/AcpNativeLogging.ts";
 import * as ProviderEventLoggers from "../../provider/Layers/ProviderEventLoggers.ts";
 import { mergeProviderInstanceEnvironment } from "../../provider/ProviderInstanceEnvironment.ts";
+import {
+  agentCommandGuardDirectory,
+  withAgentCommandGuard,
+} from "../../provider/AgentCommandGuard.ts";
 import * as IdAllocator from "../IdAllocator.ts";
 import { makeProviderFailure } from "../ProviderFailure.ts";
 import {
@@ -293,7 +297,10 @@ export const AcpRegistryAdapterV2Driver: ProviderAdapterDriver<
       return makeAcpRegistryAdapterV2({
         instanceId: input.instanceId,
         settings: { ...input.config, enabled: input.enabled },
-        environment: mergeProviderInstanceEnvironment(input.environment, hostEnvironment),
+        environment: yield* withAgentCommandGuard(
+          mergeProviderInstanceEnvironment(input.environment, hostEnvironment),
+          agentCommandGuardDirectory(serverConfig.stateDir),
+        ),
         childProcessSpawner,
         crypto,
         fileSystem,

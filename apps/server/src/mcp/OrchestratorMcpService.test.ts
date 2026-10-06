@@ -9,6 +9,8 @@ import {
   RunId,
   ThreadId,
   type OrchestrationV2ThreadProjection,
+  type OrchestrationV2ThreadShell,
+  type OrchestratorMcpFailure,
   type ServerProvider,
   DEFAULT_SERVER_SETTINGS,
   type ServerSettings,
@@ -1597,5 +1599,207 @@ describe("OrchestratorMcpService provider resolution", () => {
         assert.isUndefined(command);
       }),
     ),
+  );
+});
+
+describe("OrchestratorMcpService.extendLead", () => {
+  const projectId = ProjectId.make("project:extend");
+  const codex = ProviderInstanceId.make("codex");
+  const claude = ProviderInstanceId.make("claudeAgent");
+  const chief = ThreadId.make("thread:extend-chief");
+  const lead = ThreadId.make("thread:extend-lead");
+  const otherChief = ThreadId.make("thread:extend-other-chief");
+  const scope = (threadId: ThreadId): McpInvocationScope => ({
+    environmentId: EnvironmentId.make("environment:extend"),
+    threadId,
+    providerSessionId: `provider-session:${threadId}`,
+    providerInstanceId: codex,
+    capabilities: new Set(["orchestration"]),
+    issuedAt: 1,
+  });
+  const leadTask = {
+    title: "Underlying step 1",
+    ownerThreadId: lead,
+    dependencyThreadIds: [ThreadId.make("thread:extend-executor")],
+    state: "accepted" as const,
+    revision: "r1",
+    reviewedRevision: "r1",
+    reviewerThreadId: ThreadId.make("thread:extend-reviewer"),
+    notes: "Accepted after independent review; no pull request was opened.",
+  };
+  const shell = (patch: Record<string, unknown>) =>
+    ({
+      projectId,
+      title: "thread",
+      providerInstanceId: codex,
+      modelSelection: { instanceId: codex, model: "gpt-5.4" },
+      archivedAt: null,
+      deletedAt: null,
+      activeRunId: null,
+      pendingRuntimeRequest: null,
+      status: "completed",
+      pullRequests: [],
+      createdAt: DateTime.makeUnsafe("2026-10-01T00:00:00Z"),
+      ...patch,
+    }) as unknown as OrchestrationV2ThreadShell;
+  const threads = (leadPatch: Record<string, unknown> = {}) => [
+    shell({ id: chief, organization: { role: "chief", parentThreadId: null } }),
+    shell({ id: otherChief, organization: { role: "advisor", parentThreadId: null } }),
+    shell({
+      id: lead,
+      title: "Underlying step 1 lead",
+      organization: { role: "lead", parentThreadId: chief, task: leadTask },
+      ...leadPatch,
+    }),
+  ];
+  const provider = (instanceId: ProviderInstanceId, driver: string, model: string) =>
+    ({
+      instanceId,
+      driver: ProviderDriverKind.make(driver),
+      enabled: true,
+      installed: true,
+      version: "test",
+      status: "ready",
+      auth: { status: "authenticated" },
+      checkedAt: "2026-10-01T00:00:00.000Z",
+      models: [{ slug: model, name: model, isCustom: false, capabilities: null }],
+      slashCommands: [],
+      skills: [],
+    }) as unknown as ServerProvider;
+
+  const run = (
+    active: ReadonlyArray<OrchestrationV2ThreadShell>,
+    test: (
+      service: OrchestratorMcpService.OrchestratorMcpServiceShape,
+      dispatched: Array<{ readonly type: string; readonly [key: string]: unknown }>,
+    ) => Effect.Effect<void, OrchestratorMcpFailure>,
+    archived: ReadonlyArray<OrchestrationV2ThreadShell> = [],
+  ) =>
+    Effect.gen(function* () {
+      const dispatched: Array<{ readonly type: string; readonly [key: string]: unknown }> = [];
+      const dependencies = Layer.mergeAll(
+        NodeServices.layer,
+        Layer.mock(ThreadManagementService.ThreadManagementService)({
+          getShellSnapshot: (options) =>
+            Effect.succeed({
+              snapshotSequence: 1,
+              threads: options?.location === "archive" ? archived : active,
+            } as never),
+          getProjectThreadRecords: (input) =>
+            Effect.succeed({
+              thread: active.find((thread) => thread.id === input.threadId),
+            } as never),
+          dispatch: (command) =>
+            Effect.sync(() => {
+              dispatched.push(command as never);
+              return { sequence: dispatched.length, storedEvents: [] };
+            }),
+          sendToThread: (input) =>
+            Effect.sync(() => {
+              dispatched.push({ type: "send", ...input });
+              return {
+                run: { id: RunId.make("run:extend"), status: "preparing" },
+                delivery: "started",
+              } as never;
+            }),
+        }),
+        Layer.mock(ProviderRegistry.ProviderRegistry)({
+          getProviders: Effect.succeed([
+            provider(codex, "codex", "gpt-5.4"),
+            provider(claude, "claudeAgent", "claude-opus-4-8"),
+          ]),
+        }),
+        Layer.mock(ProviderAdapterRegistry.ProviderAdapterRegistryV2)({
+          list: () => Effect.succeed([codex, claude]),
+        }),
+        Layer.mock(ScheduledTaskService.ScheduledTaskService)({}),
+      );
+      yield* Effect.gen(function* () {
+        const service = yield* OrchestratorMcpService.OrchestratorMcpService;
+        yield* test(service, dispatched);
+      }).pipe(Effect.provide(OrchestratorMcpService.layer.pipe(Layer.provide(dependencies))));
+    });
+  const input = { threadId: lead, brief: "Cover stocks too.", clientRequestId: "round-2" };
+
+  it.effect("starts a new round on an idle lead, switching its provider when targeted", () =>
+    run(threads(), (service, dispatched) =>
+      Effect.gen(function* () {
+        const result = yield* service.extendLead(scope(chief), {
+          ...input,
+          target: { providerInstanceId: claude, model: "claude-opus-4-8" },
+        });
+        assert.equal(result.round, 2);
+        assert.deepEqual(result.modelSelection, { instanceId: claude, model: "claude-opus-4-8" });
+        assert.deepEqual(
+          dispatched.map((command) => command.type),
+          ["provider.switch", "thread.metadata.update", "send"],
+        );
+        const update = dispatched[1] as unknown as {
+          organizationActorThreadId: ThreadId;
+          organization: { task: { state: string; rounds: Array<{ round: number }> } };
+        };
+        assert.equal(update.organizationActorThreadId, chief);
+        assert.equal(update.organization.task.state, "working");
+        assert.deepEqual(
+          update.organization.task.rounds.map((round) => round.round),
+          [1],
+        );
+        assert.include(String(dispatched[2]?.text), "Cover stocks too.");
+      }),
+    ),
+  );
+
+  it.effect("refuses non-Chiefs, other Chiefs' leads, busy, working and archived leads", () =>
+    Effect.gen(function* () {
+      const refused = (
+        active: ReadonlyArray<OrchestrationV2ThreadShell>,
+        caller: ThreadId,
+        code: string,
+        archived: ReadonlyArray<OrchestrationV2ThreadShell> = [],
+        extra: Record<string, unknown> = {},
+      ) =>
+        run(
+          active,
+          (service, dispatched) =>
+            Effect.gen(function* () {
+              const error = yield* service
+                .extendLead(scope(caller), { ...input, ...extra })
+                .pipe(Effect.flip, Effect.orDie);
+              assert.equal(error.code, code, error.message);
+              assert.deepEqual(dispatched, []);
+            }),
+          archived,
+        );
+      yield* refused(threads(), lead, "capability_denied");
+      yield* refused(threads(), otherChief, "capability_denied");
+      yield* refused(
+        threads({ organization: { role: "lead", parentThreadId: otherChief, task: leadTask } }),
+        chief,
+        "capability_denied",
+      );
+      yield* refused(threads({ activeRunId: RunId.make("run:busy") }), chief, "invalid_request");
+      yield* refused(
+        threads({
+          organization: {
+            role: "lead",
+            parentThreadId: chief,
+            task: { ...leadTask, state: "working" },
+          },
+        }),
+        chief,
+        "invalid_request",
+      );
+      const [chiefShell, , leadShell] = threads();
+      yield* refused([chiefShell!], chief, "invalid_request", [
+        { ...leadShell!, archivedAt: DateTime.makeUnsafe("2026-10-02T00:00:00Z") } as never,
+      ]);
+      // An unavailable target is reported, never substituted.
+      yield* refused(threads(), chief, "provider_unavailable", [], {
+        target: { providerInstanceId: ProviderInstanceId.make("missing") },
+      });
+      yield* refused(threads(), chief, "model_unavailable", [], {
+        target: { providerInstanceId: claude, model: "not-a-model" },
+      });
+    }),
   );
 });

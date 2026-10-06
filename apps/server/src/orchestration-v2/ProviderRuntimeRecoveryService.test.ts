@@ -192,11 +192,32 @@ it.effect("preserves async questions across startup and shutdown", () => {
         status: "pending",
         responseCapability: { type: "message" },
       },
+      // A question the server opened for the user has no run or provider turn at all.
+      {
+        id: RuntimeRequestId.make("server-question:organization:chief:decide"),
+        nodeId: NodeId.make("user-input:server-question:organization:chief:decide"),
+        kind: "user_input",
+        providerTurnId: null,
+        nativeRequestRef: null,
+        status: "pending",
+        responseCapability: { type: "message" },
+      },
     ],
     providerSessions: [],
     providerThreads: [],
     runs: [],
-    nodes: [],
+    nodes: [
+      {
+        id: NodeId.make("user-input:server-question:organization:chief:decide"),
+        threadId,
+        runId: null,
+        parentNodeId: null,
+        rootNodeId: NodeId.make("user-input:server-question:organization:chief:decide"),
+        kind: "user_input_request",
+        status: "waiting",
+        countsForRun: false,
+      },
+    ],
     turnItems: [],
   } as unknown as OrchestrationV2ThreadProjection;
   const commitCommand = vi.fn(() => Effect.die("an async question needs no process-loss write"));
@@ -225,6 +246,7 @@ it.effect("preserves async questions across startup and shutdown", () => {
     const recovery = yield* ProviderRuntimeRecovery.ProviderRuntimeRecoveryService;
     assert.equal((yield* recovery.reconcile("startup")).closedRequests, 0);
     assert.equal((yield* recovery.reconcile("startup")).closedRequests, 0);
+    assert.equal((yield* recovery.reconcile("shutdown")).closedRequests, 0);
     assert.isFalse(commitCommand.mock.calls.length > 0);
   }).pipe(Effect.provide(layer));
 });

@@ -74,3 +74,55 @@ it.effect("keeps calling-thread storage failures as orchestration errors", () =>
     expect(error.code).toBe("orchestration_error");
   }),
 );
+
+it.effect("refuses to drop an organization conversation's pull request link", () =>
+  Effect.gen(function* () {
+    const dispatched: Array<unknown> = [];
+    const thread = {
+      id: threadId,
+      projectId: "project",
+      organization: { role: "lead", parentThreadId: "chief" },
+      linkedPullRequest: {
+        projectId: "project",
+        repository: "acme/app",
+        number: 12,
+        url: "https://github.com/acme/app/pull/12",
+      },
+    };
+    const layer = ThreadMetadataMcp.layer.pipe(
+      Layer.provide(
+        Layer.merge(
+          Layer.mock(ThreadManagement.ThreadManagementService)({
+            getThreadShell: () => Effect.succeed(thread as never),
+            getThreadRecords: () => Effect.succeed({ thread } as never),
+            dispatch: (command) =>
+              Effect.sync(() => {
+                dispatched.push(command);
+                return { sequence: 1, storedEvents: [] };
+              }),
+          } satisfies Partial<ThreadManagement.ThreadManagementService["Service"]>),
+          NodeCrypto.layer,
+        ),
+      ),
+    );
+    const update = (
+      input: Parameters<ThreadMetadataMcp.ThreadMetadataMcpService["Service"]["update"]>[1],
+    ) =>
+      ThreadMetadataMcp.ThreadMetadataMcpService.pipe(
+        Effect.flatMap((metadata) => metadata.update(scope, input)),
+        Effect.provide(layer),
+        Effect.flip,
+      );
+    expect((yield* update({ action: "unlink_pull_request" })).code).toBe("capability_denied");
+    const replace = yield* update({
+      action: "link_pull_request",
+      pullRequest: {
+        repository: "acme/app",
+        number: 13,
+        url: "https://github.com/acme/app/pull/13",
+      },
+    });
+    expect(replace.code).toBe("capability_denied");
+    expect(dispatched).toEqual([]);
+  }),
+);

@@ -2,6 +2,7 @@ import {
   organizationExecutionProblem,
   organizationInstructions,
   organizationRepositoryRoot,
+  isOrganizationNoticeMessageId,
 } from "./OrganizationPolicy.ts";
 import * as OrganizationArtifacts from "./OrganizationArtifacts.ts";
 import * as ServerSettings from "../serverSettings.ts";
@@ -1257,7 +1258,11 @@ export const layer: Layer.Layer<
             ...(noteContinuation ? promptedInput : turnInput),
             message: {
               ...turnInput.message,
-              text: context === "" ? userText : `${context}\n\nUser message:\n${userText}`,
+              // Organization notices are coordinator evidence, never user input.
+              text:
+                context === ""
+                  ? userText
+                  : `${context}\n\n${isOrganizationNoticeMessageId(message.id) ? "Organization update (not user approval)" : "User message"}:\n${userText}`,
             },
           });
           // The provider already accepted the turn. A stale pending marker

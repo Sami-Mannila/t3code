@@ -65,6 +65,10 @@ import {
   summarizeNativeProtocolPayload,
 } from "../../provider/NativeProtocolLogging.ts";
 import { mergeProviderInstanceEnvironment } from "../../provider/ProviderInstanceEnvironment.ts";
+import {
+  agentCommandGuardDirectory,
+  withAgentCommandGuard,
+} from "../../provider/AgentCommandGuard.ts";
 import { t3OrchestrationSystemPrompt } from "../../provider/T3OrchestrationInstructions.ts";
 import { buildRuntimeInstructions } from "../../provider/RuntimeInstructions.ts";
 import * as OpenCodeRuntime from "../../provider/opencodeRuntime.ts";
@@ -3755,7 +3759,10 @@ export const OpenCodeAdapterV2Driver: ProviderAdapterDriver<
       return makeOpenCodeAdapterV2({
         instanceId: input.instanceId,
         settings: { ...input.config, enabled: input.enabled },
-        environment: mergeProviderInstanceEnvironment(input.environment, hostEnvironment),
+        environment: yield* withAgentCommandGuard(
+          mergeProviderInstanceEnvironment(input.environment, hostEnvironment),
+          agentCommandGuardDirectory(serverConfig.stateDir),
+        ),
         runtime: openCodeRuntime,
         idAllocator,
         serverConfig,

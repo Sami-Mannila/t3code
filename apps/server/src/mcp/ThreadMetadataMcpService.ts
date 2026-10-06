@@ -176,6 +176,17 @@ const make = Effect.gen(function* () {
         : yield* threadManagement
             .getProjectThreadRecords({ projectId: parent.thread.projectId, threadId }, [])
             .pipe(Effect.mapError(threadLookupFailure));
+    // An organization conversation's links gate its outcome's acceptance: an agent may not drop
+    // one, by unlinking or by linking another in its place.
+    if (
+      target.thread.organization &&
+      (input.action === "unlink_pull_request" ||
+        (input.action === "link_pull_request" && target.thread.linkedPullRequest))
+    )
+      return yield* failure(
+        "capability_denied",
+        "Organization conversations keep their pull request links: they decide when the outcome is accepted. Only the user can remove one.",
+      );
     const requestKey =
       input.clientRequestId === undefined
         ? yield* crypto.randomUUIDv4.pipe(Effect.orDie)

@@ -4,6 +4,8 @@ import * as Random from "effect/Random";
 import * as Semaphore from "effect/Semaphore";
 import * as StorageCleanup from "./storageCleanup.ts";
 import * as PullRequestSyncReactor from "./orchestration-v2/PullRequestSyncReactor.ts";
+import * as OrganizationOutcomeAcceptanceReactor from "./orchestration-v2/OrganizationOutcomeAcceptanceReactor.ts";
+import * as AgentCommandGuard from "./provider/AgentCommandGuard.ts";
 import * as PullRequestWatchReactor from "./orchestration-v2/PullRequestWatchReactor.ts";
 // @effect-diagnostics nodeBuiltinImport:off
 import * as NodeHttp from "node:http";
@@ -523,6 +525,24 @@ const RuntimeCoreDependenciesBaseLive = Layer.mergeAll(
     Layer.provide(PullRequestServiceLive),
     Layer.provide(ProjectionStoreV2.layer),
   ),
+  // Agent sessions find this `gh` first on PATH; it refuses to merge pull requests.
+  Layer.effectDiscard(
+    Effect.gen(function* () {
+      const { stateDir } = yield* ServerConfig.ServerConfig;
+      yield* AgentCommandGuard.installAgentCommandGuard(stateDir).pipe(
+        Effect.catchCause((cause) =>
+          Effect.logWarning("Could not install the agent merge guard", { cause }),
+        ),
+      );
+    }),
+  ),
+  Layer.effectDiscard(
+    Effect.gen(function* () {
+      const service =
+        yield* OrganizationOutcomeAcceptanceReactor.OrganizationOutcomeAcceptanceReactor;
+      yield* service.start();
+    }),
+  ).pipe(Layer.provide(OrganizationOutcomeAcceptanceReactor.layer)),
   Layer.effectDiscard(
     Effect.gen(function* () {
       const service = yield* PullRequestWatchReactor.PullRequestWatchReactor;

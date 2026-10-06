@@ -109,6 +109,13 @@ no pending RPC response to send. The
 Their execution nodes do not block the run. Web, desktop, and mobile use their normal question
 panels, and requests remain pending after a turn finishes, a provider exits, or the server restarts.
 
+The server opens the same kind of question itself with the internal `thread.user-input.request`
+command, which organization agents reach through `t3_organization_ask_user`. Nothing waits on it:
+its node roots itself with no run, and its request id starts with `server-question:`. That prefix
+is how the orchestrator caps open server questions per thread, refuses to let a manual settle
+cancel one (the user answers or dismisses it first), and how the MCP toolkit stops organization
+agents from answering them for the user.
+
 `runtime-request.respond` reads the persisted request and question item, validates required
 answers, and commits the resolution and a user message in one transaction. Repeating the same
 command returns its receipt without posting the answer twice. The normal message path starts or

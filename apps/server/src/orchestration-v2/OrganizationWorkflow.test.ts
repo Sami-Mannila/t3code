@@ -3,6 +3,8 @@ import {
   organizationInstructions,
   organizationPreparationBlock,
   organizationPreparationUnblock,
+  organizationExtendedTask,
+  organizationChiefNotice,
 } from "./OrganizationPolicy.ts";
 import { McpSchema, McpServer } from "effect/unstable/ai";
 import * as McpHttpServer from "../mcp/McpHttpServer.ts";
@@ -26,7 +28,9 @@ import {
   DEFAULT_SERVER_SETTINGS,
   ProviderThreadId,
   RunId,
+  RuntimeRequestId,
   ThreadId,
+  TurnItemId,
 } from "@t3tools/contracts";
 import * as DateTime from "effect/DateTime";
 import * as Effect from "effect/Effect";
@@ -56,6 +60,8 @@ import * as WorkspacePaths from "../workspace/WorkspacePaths.ts";
 import { CodexProviderCapabilitiesV2 } from "./Adapters/CodexAdapterV2.ts";
 import * as EventSink from "./EventSink.ts";
 import * as Orchestrator from "./Orchestrator.ts";
+import * as OrganizationOutcomeAcceptanceReactor from "./OrganizationOutcomeAcceptanceReactor.ts";
+import * as GitManager from "../git/GitManager.ts";
 import type { ProviderAdapterV2Shape } from "./ProviderAdapter.ts";
 import {
   OrchestrationV2EventSinkLayerLive,
@@ -168,6 +174,29 @@ const TestLayer = Layer.mergeAll(
   Layer.provide(PlatformTestLayer),
 );
 
+/** Pull requests open from a branch, as the host would report them; nothing by default. */
+const branchPullRequests = new Map<string, { number: number; state: "open" | "merged" }>();
+const makeReactor = OrganizationOutcomeAcceptanceReactor.make.pipe(
+  Effect.provide(
+    Layer.mock(GitManager.GitManager)({
+      branchPullRequest: ({ branch }) =>
+        Effect.succeed(
+          branchPullRequests.has(branch)
+            ? ({
+                ...branchPullRequests.get(branch)!,
+                title: "Work",
+                url: `https://github.com/acme/app/pull/${branchPullRequests.get(branch)!.number}`,
+                baseRef: "main",
+                headRef: branch,
+                repositoryKey: "github.com/acme/app",
+                updatedAt: null,
+              } as unknown as GitManager.GitBranchPullRequest)
+            : null,
+        ),
+    }),
+  ),
+);
+
 const NativeToolkitLayer = McpHttpServer.ThreadToolkitRegistrationLive.pipe(
   Layer.provideMerge(McpServer.McpServer.layer),
   Layer.provideMerge(TestLayer),
@@ -188,7 +217,7 @@ const mcpClient = McpSchema.McpServerClient.of({
 });
 
 it.effect(
-  "reviews actual child artifacts, consolidates the outcome and reserves final acceptance for the user",
+  "reviews actual child artifacts, consolidates the outcome and accepts it once its pull requests merge",
   () =>
     Effect.gen(function* () {
       const orchestrator = yield* Orchestrator.OrchestratorV2;
@@ -358,6 +387,15 @@ it.effect(
           (message) => message.id === "organization-parent:review",
         ),
       );
+      const chiefNotices = threads
+        .getThreadProjection(chief)
+        .pipe(
+          Effect.map((projection) =>
+            projection.messages.filter((message) => message.id.startsWith("organization:")),
+          ),
+        );
+      // Executor submission, assignment and review reach the lead, not the Chief.
+      assert.deepEqual(yield* chiefNotices, []);
       yield* update(lead, "consolidate", { state: "awaiting_review" }, lead);
       current = (yield* threads.getThreadProjection(lead)).thread.organization!.task!;
       assert.deepEqual(current.dependencyThreadIds, [executor]);
@@ -369,20 +407,259 @@ it.effect(
         { reviewedRevision: current.revision, reviewerThreadId: reviewer },
         reviewer,
       );
+      // A reviewed outcome is news even though the lead's state is unchanged.
+      const reviewedNotices = yield* chiefNotices;
+      assert.deepEqual(
+        reviewedNotices.map((message) => message.id),
+        ["organization:consolidate", "organization:review-final"],
+      );
+      assert.include(
+        reviewedNotices[1]?.text,
+        `[${lead}] awaiting review, independently reviewed:`,
+      );
       const forbidden = yield* update(lead, "agent-accept", { state: "accepted" }, chief).pipe(
         Effect.result,
       );
       assert.equal(forbidden._tag, "Failure");
-      yield* update(lead, "user-accept", { state: "accepted" });
-      assert.equal(
-        (yield* threads.getThreadProjection(lead)).thread.organization!.task!.state,
-        "accepted",
+
+      // The server accepts the outcome once the pull requests it owns merge.
+      const reactor = yield* makeReactor;
+      const leadTask = threads
+        .getThreadProjection(lead)
+        .pipe(Effect.map((projection) => projection.thread.organization!.task!));
+      const link = (number: number, linkedAt: string, state: "open" | "closed" | "merged") => ({
+        host: "github.com",
+        repository: "acme/app",
+        number,
+        url: `https://github.com/acme/app/pull/${number}`,
+        source: "agent" as const,
+        linkedAt,
+        snapshot: {
+          state,
+          title: "Work",
+          headBranch: "work",
+          baseBranch: "main",
+          isDraft: false,
+          updatedAt: null,
+          syncedAt: linkedAt,
+        },
+        stack: null,
+      });
+      const linkPullRequests = (id: ThreadId, key: string, links: ReturnType<typeof link>[]) =>
+        Effect.gen(function* () {
+          const thread = (yield* threads.getThreadProjection(id)).thread;
+          yield* sink.write({
+            commandId: CommandId.make(key),
+            events: [
+              {
+                id: EventId.make(key),
+                type: "thread.pull-request-synced",
+                threadId: id,
+                occurredAt: yield* DateTime.now,
+                payload: { ...thread, pullRequests: links },
+              },
+            ],
+          });
+        });
+      const linkedAt = DateTime.formatIso(yield* DateTime.now);
+      // A link older than the lead (test clocks start at the epoch) was inherited; it gates nothing.
+      yield* linkPullRequests(lead, "lead-inherited-pr", [
+        link(1, "1969-12-31T00:00:00.000Z", "open"),
+      ]);
+      yield* linkPullRequests(executor, "executor-pr-open", [link(12, linkedAt, "open")]);
+      // Work the lead starts after the review is separate scope.
+      yield* orchestrator.dispatch({
+        type: "thread.create",
+        commandId: CommandId.make("create-later-executor"),
+        threadId: ThreadId.make("later-executor"),
+        projectId,
+        title: "later-executor",
+        modelSelection,
+        runtimeMode: "full-access",
+        interactionMode: "default",
+        branch: null,
+        worktreePath: workspace,
+        createdBy: "user",
+        creationSource: "web",
+        organization: {
+          role: "executor",
+          parentThreadId: lead,
+          task: { ...task(ThreadId.make("later-executor")), state: "working" },
+        },
+      });
+      yield* reactor.sweep();
+      assert.equal((yield* leadTask).state, "awaiting_review");
+
+      const prNotices = threads
+        .getThreadProjection(chief)
+        .pipe(
+          Effect.map((projection) =>
+            projection.messages.filter((message) => message.id.startsWith("organization-pr:")),
+          ),
+        );
+      yield* linkPullRequests(executor, "executor-pr-closed", [link(12, linkedAt, "closed")]);
+      yield* reactor.sweep();
+      yield* reactor.sweep();
+      assert.equal((yield* leadTask).state, "awaiting_review");
+      const closedNotices = yield* prNotices;
+      assert.lengthOf(closedNotices, 1);
+      assert.include(closedNotices[0]?.text, "PR #12 closed without merging");
+
+      yield* linkPullRequests(executor, "executor-pr-merged", [link(12, linkedAt, "merged")]);
+      // A refused acceptance tells the Chief once and does not stop a later attempt.
+      yield* fs.writeFileString(`${workspace}/result.txt`, "changed before acceptance");
+      yield* reactor.sweep();
+      yield* reactor.sweep();
+      assert.equal((yield* leadTask).state, "awaiting_review");
+      const refusals = (yield* threads.getThreadProjection(chief)).messages.filter((message) =>
+        message.id.startsWith("organization-acceptance:"),
+      );
+      assert.lengthOf(refusals, 1);
+      assert.include(refusals[0]?.text, "A reviewed child artifact changed");
+      yield* fs.writeFileString(`${workspace}/result.txt`, "organization proof\n");
+      // A restarted server's startup sweep finds the merge.
+      const restarted = yield* makeReactor;
+      yield* restarted.start();
+      yield* restarted.drain;
+      const accepted = yield* leadTask;
+      assert.equal(accepted.state, "accepted");
+      assert.equal(accepted.notes, "Accepted after merge of #12.");
+      assert.isTrue(
+        (yield* chiefNotices).some((message) =>
+          message.text.includes(`[${lead}] accepted: lead work. Accepted after merge of #12.`),
+        ),
       );
       yield* fs.writeFileString(`${workspace}/result.txt`, "changed after review");
       const changed = yield* update(lead, "stale-accept", { state: "accepted" }).pipe(
         Effect.result,
       );
       assert.equal(changed._tag, "Failure");
+
+      // The Chief extends the accepted lead with a second round of work.
+      const extend = (key: string, actor: ThreadId) =>
+        Effect.gen(function* () {
+          const organization = (yield* threads.getThreadProjection(lead)).thread.organization!;
+          return yield* threads.dispatch({
+            type: "thread.metadata.update",
+            commandId: CommandId.make(key),
+            threadId: lead,
+            organizationActorThreadId: actor,
+            organization: {
+              ...organization,
+              task: organizationExtendedTask(organization.task!, {
+                leadThreadId: lead,
+                brief: "Also cover the stocks dataset.",
+                now: DateTime.formatIso(yield* DateTime.now),
+                pullRequests: [12],
+              }),
+            },
+          });
+        });
+      assert.equal(
+        (yield* extend("lead-extends-itself", lead).pipe(Effect.result))._tag,
+        "Failure",
+      );
+      yield* extend("chief-extends-lead", chief);
+      const round2 = yield* leadTask;
+      assert.equal(round2.state, "working");
+      assert.equal(round2.notes, "Round 2: Also cover the stocks dataset.");
+      assert.isNull(round2.revision);
+      assert.deepEqual(round2.dependencyThreadIds, []);
+      assert.deepEqual(
+        round2.rounds?.map((round) => [
+          round.round,
+          round.state,
+          round.revision,
+          round.dependencyThreadIds,
+          round.pullRequests,
+        ]),
+        [[1, "accepted", accepted.revision, [executor], [12]]],
+      );
+      const round1Executor = (yield* threads.getThreadProjection(executor)).thread.organization!
+        .task!;
+      assert.equal(round1Executor.state, "accepted");
+      // Earlier rounds are not rewritten afterwards.
+      assert.equal(
+        (yield* update(lead, "rewrite-rounds", { rounds: [] }, chief).pipe(Effect.result))._tag,
+        "Failure",
+      );
+
+      // Round 2 consolidates only its own executor: round 1's changed file is not re-read.
+      const laterExecutor = ThreadId.make("later-executor");
+      yield* sink.write({
+        commandId: CommandId.make("native-later-executor"),
+        events: [
+          {
+            id: EventId.make("native-later-executor"),
+            type: "provider-thread.updated",
+            threadId: laterExecutor,
+            driver,
+            providerInstanceId: modelSelection.instanceId,
+            occurredAt: now,
+            payload: {
+              id: ProviderThreadId.make("provider-later-executor"),
+              driver,
+              providerInstanceId: modelSelection.instanceId,
+              providerSessionId: null,
+              appThreadId: laterExecutor,
+              ownerNodeId: NodeId.make("node-later-executor"),
+              nativeThreadRef: { driver, nativeId: "native-later-executor", strength: "strong" },
+              nativeConversationHeadRef: null,
+              status: "active",
+              firstRunOrdinal: 1,
+              lastRunOrdinal: 1,
+              handoffIds: [],
+              forkedFrom: null,
+              createdAt: now,
+              updatedAt: now,
+            },
+          },
+        ],
+      });
+      yield* fs.writeFileString(`${workspace}/round2.txt`, "round two\n");
+      yield* update(
+        laterExecutor,
+        "round2-submit",
+        { state: "awaiting_review", manifest: ["round2.txt"] },
+        laterExecutor,
+      );
+      yield* update(laterExecutor, "round2-assign", { ownerThreadId: reviewer }, lead);
+      const round2Submission = (yield* threads.getThreadProjection(laterExecutor)).thread
+        .organization!.task!;
+      yield* update(
+        laterExecutor,
+        "round2-review",
+        {
+          state: "accepted",
+          reviewedRevision: round2Submission.revision,
+          reviewerThreadId: reviewer,
+        },
+        reviewer,
+      );
+      yield* update(lead, "round2-consolidate", { state: "awaiting_review" }, lead);
+      const round2Outcome = yield* leadTask;
+      assert.deepEqual(round2Outcome.dependencyThreadIds, [laterExecutor]);
+      assert.deepEqual(
+        round2Outcome.files?.map((file) => file.path),
+        ["later-executor/round2.txt"],
+      );
+      yield* update(lead, "round2-assign-final", { ownerThreadId: reviewer }, chief);
+      yield* update(
+        lead,
+        "round2-review-final",
+        { reviewedRevision: round2Outcome.revision, reviewerThreadId: reviewer },
+        reviewer,
+      );
+      // Round 1's merged PR #12 is not this round's; round 2 waits for its own.
+      yield* linkPullRequests(laterExecutor, "round2-pr-open", [link(20, linkedAt, "open")]);
+      yield* reactor.sweep();
+      assert.equal((yield* leadTask).state, "awaiting_review");
+      yield* linkPullRequests(laterExecutor, "round2-pr-merged", [link(20, linkedAt, "merged")]);
+      yield* reactor.sweep();
+      const round2Accepted = yield* leadTask;
+      assert.equal(round2Accepted.state, "accepted");
+      assert.equal(round2Accepted.notes, "Accepted after merge of #20.");
+      assert.lengthOf(round2Accepted.rounds ?? [], 1);
     }).pipe(
       Effect.provide(
         ThreadManagement.layer.pipe(
@@ -459,6 +736,41 @@ it.effect(
         creationSource: "web",
       });
       const parent = yield* orchestrator.getThreadProjection(chief);
+      // The Chief's own pull request must not become the lead's.
+      const chiefLink = {
+        projectId,
+        repository: "acme/app",
+        number: 28064,
+        url: "https://github.com/acme/app/pull/28064",
+      };
+      yield* (yield* EventSink.EventSinkV2).write({
+        commandId: CommandId.make("native-chief-pr"),
+        events: [
+          {
+            id: EventId.make("native-chief-pr"),
+            type: "thread.pull-request-synced",
+            threadId: chief,
+            occurredAt: yield* DateTime.now,
+            payload: {
+              ...parent.thread,
+              linkedPullRequest: chiefLink,
+              branchPullRequest: chiefLink,
+              pullRequests: [
+                {
+                  host: "github.com",
+                  repository: "acme/app",
+                  number: 28064,
+                  url: chiefLink.url,
+                  source: "agent",
+                  linkedAt: DateTime.formatIso(yield* DateTime.now),
+                  snapshot: null,
+                  stack: null,
+                },
+              ],
+            },
+          },
+        ],
+      });
       const run = parent.runs[0]!;
       const command = {
         type: "delegated_task.request" as const,
@@ -482,6 +794,10 @@ it.effect(
       assert.equal(child.thread.organization?.parentThreadId, chief);
       assert.equal(child.thread.worktreePath, null);
       assert.equal(child.runs[0]?.status, "preparing");
+      assert.equal((yield* orchestrator.getThreadProjection(chief)).thread.pullRequests?.length, 1);
+      assert.deepEqual(child.thread.pullRequests ?? [], []);
+      assert.equal(child.thread.linkedPullRequest ?? null, null);
+      assert.equal(child.thread.branchPullRequest ?? null, null);
       const replay = yield* orchestrator.dispatch(command);
       assert.equal(replay.sequence, result.sequence);
       assert.equal(
@@ -1134,7 +1450,7 @@ it.effect(
         { state: "accepted", reviewedRevision: submitted.revision, reviewerThreadId: reviewer.id },
         reviewer.id,
       );
-      // The lead submits and the user accepts its outcome without a lead worktree.
+      // The lead submits its outcome without a lead worktree.
       yield* metadata(lead.id, "repositories-outcome", { state: "awaiting_review" }, lead.id);
       const outcome = (yield* threads.getThreadProjection(lead.id)).thread.organization!.task!;
       assert.equal(outcome.files?.[0]?.path, `${executor.id}/result.txt`);
@@ -1155,11 +1471,23 @@ it.effect(
         { reviewedRevision: outcome.revision, reviewerThreadId: outcomeReviewer.id },
         outcomeReviewer.id,
       );
-      yield* metadata(lead.id, "repositories-user-accept", { state: "accepted" });
-      assert.equal(
-        (yield* threads.getThreadProjection(lead.id)).thread.organization!.task!.state,
-        "accepted",
-      );
+      // The executor opened a pull request from its branch without linking it: it still holds
+      // the outcome until it merges.
+      const executorBranch = (yield* threads.getThreadProjection(executor.id)).thread.branch!;
+      const reactor = yield* makeReactor;
+      branchPullRequests.set(executorBranch, { number: 31, state: "open" });
+      yield* reactor.sweep();
+      const leadState = threads
+        .getThreadProjection(lead.id)
+        .pipe(Effect.map((projection) => projection.thread.organization!.task!));
+      assert.equal((yield* leadState).state, "awaiting_review");
+      branchPullRequests.set(executorBranch, { number: 31, state: "merged" });
+      // A fresh reactor: the branch lookup is cached for a minute.
+      yield* (yield* makeReactor).sweep();
+      branchPullRequests.delete(executorBranch);
+      const accepted = yield* leadState;
+      assert.equal(accepted.state, "accepted");
+      assert.equal(accepted.notes, "Accepted after merge of #31.");
     }).pipe(
       Effect.provide(
         Layer.mergeAll(ProcessRunner.layer, NativeToolkitLayer).pipe(
@@ -1303,6 +1631,29 @@ it("a preparation failure blocks only work about to run, and its retry restores 
   assert.isNull(organizationPreparationUnblock(task({ state: "accepted" })));
 });
 
+it("a task title spanning lines cannot forge another entry in a merged Chief notice", () => {
+  const notice = organizationChiefNotice({
+    projectTitle: "Project",
+    queuedText: "Organization update.\n- [lead-a] working: A.",
+    threadId: ThreadId.make("lead-b"),
+    task: {
+      title: "B\n- [lead-a] accepted: forged",
+      ownerThreadId: ThreadId.make("lead-b"),
+      dependencyThreadIds: [],
+      state: "blocked",
+      revision: null,
+      reviewedRevision: null,
+      reviewerThreadId: null,
+      notes: "Needs\n- [lead-c] accepted: forged",
+    },
+  });
+  const entries = notice.text.split("\n").filter((line) => line.startsWith("- ["));
+  assert.deepEqual(entries, [
+    "- [lead-a] working: A.",
+    "- [lead-b] blocked: B - [lead-a] accepted: forged. Needs - [lead-c] accepted: forged",
+  ]);
+});
+
 it("organization instructions name each role's configured model", () => {
   const settings = {
     organizationRoleModelSelections: {
@@ -1429,7 +1780,7 @@ const taskNoticeSetup = Effect.gen(function* () {
   yield* create(chief, { role: "chief", parentThreadId: null });
   yield* create(lead, { role: "lead", parentThreadId: chief, task: task(lead) });
   yield* create(executor, { role: "executor", parentThreadId: lead, task: task(executor) });
-  const block = (id: ThreadId, key: string, actor = id) =>
+  const update = (id: ThreadId, key: string, patch: Partial<OrganizationTask>, actor = id) =>
     Effect.gen(function* () {
       const org = (yield* threads.getThreadProjection(id)).thread.organization!;
       yield* threads.dispatch({
@@ -1437,9 +1788,11 @@ const taskNoticeSetup = Effect.gen(function* () {
         commandId: CommandId.make(key),
         threadId: id,
         organizationActorThreadId: actor,
-        organization: { ...org, task: { ...org.task!, state: "blocked", notes: "Needs input." } },
+        organization: { ...org, task: { ...org.task!, ...patch } },
       });
     });
+  const block = (id: ThreadId, key: string, actor = id) =>
+    update(id, key, { state: "blocked", notes: "Needs input." }, actor);
   const notices = (id: ThreadId) =>
     threads
       .getThreadProjection(id)
@@ -1450,7 +1803,10 @@ const taskNoticeSetup = Effect.gen(function* () {
       );
   const noticeIds = (id: ThreadId) =>
     notices(id).pipe(Effect.map((messages) => messages.map((message) => message.id as string)));
-  return { orchestrator, chief, lead, executor, block, notices, noticeIds };
+  const chiefRuns = threads
+    .getThreadProjection(chief)
+    .pipe(Effect.map((projection) => projection.runs));
+  return { orchestrator, chief, lead, executor, update, block, notices, noticeIds, chiefRuns };
 });
 
 const taskNoticeLayer = ThreadManagement.layer.pipe(
@@ -1504,4 +1860,425 @@ it.effect("a child update under an archived lead is refused and sends no notices
     assert.deepEqual(yield* noticeIds(chief), []);
     assert.deepEqual(yield* noticeIds(lead), []);
   }).pipe(Effect.provide(taskNoticeLayer)),
+);
+
+it.effect("the Chief hears only status changes of its leads and blocked work", () =>
+  Effect.gen(function* () {
+    const { chief, lead, executor, update, noticeIds } = yield* taskNoticeSetup;
+    yield* update(lead, "lead-notes", { notes: "Planning the outcome." });
+    yield* update(lead, "lead-manifest", { manifest: ["plan.md"] });
+    // Executor claims and progress belong to the parent lead.
+    yield* update(executor, "executor-claim", { state: "working" });
+    yield* update(executor, "executor-notes", { notes: "Halfway." });
+    assert.deepEqual(yield* noticeIds(chief), []);
+    assert.deepEqual(yield* noticeIds(lead), [
+      "organization-parent:executor-claim",
+      "organization-parent:executor-notes",
+    ]);
+    yield* update(lead, "lead-claim", { state: "working" });
+    assert.deepEqual(yield* noticeIds(chief), ["organization:lead-claim"]);
+  }).pipe(Effect.provide(taskNoticeLayer)),
+);
+
+it.effect("new instructions unblock a blocked executor at once; notices and its own do not", () =>
+  Effect.gen(function* () {
+    const { orchestrator, chief, lead, executor, block, noticeIds } = yield* taskNoticeSetup;
+    const threads = yield* ThreadManagement.ThreadManagementService;
+    const state = (id: ThreadId) =>
+      threads
+        .getThreadProjection(id)
+        .pipe(Effect.map((projection) => projection.thread.organization?.task));
+    const send = (
+      key: string,
+      patch: Partial<Extract<OrchestrationV2Command, { type: "message.dispatch" }>>,
+    ) =>
+      orchestrator.dispatch({
+        type: "message.dispatch",
+        commandId: CommandId.make(key),
+        messageId: MessageId.make(key),
+        threadId: executor,
+        text: "Go with option 2.",
+        attachments: [],
+        dispatchMode: { type: "queue_after_active" },
+        createdBy: "agent",
+        creationSource: "mcp",
+        ...patch,
+      });
+
+    yield* block(executor, "executor-blocked");
+    // Server notices, other agents and the executor itself leave the block for its coordinator.
+    yield* send("notice", {
+      messageId: MessageId.make("organization-parent:notice"),
+      senderThreadId: lead,
+      creationSource: "server",
+      notification: { source: { kind: "background_task" }, outcome: "updated", summary: "x" },
+    });
+    yield* send("own-status", { senderThreadId: executor });
+    yield* send("chief-bypass", { senderThreadId: chief });
+    // Usage-limit recovery resumes the same work as the user, but is no new instruction.
+    yield* send("limit-resume", {
+      createdBy: "user",
+      creationSource: "server",
+      usageLimitContinuationOfRunId: RunId.make("run-limited"),
+    }).pipe(Effect.result);
+    // An agent's answer to the executor's question is the agent's message, not the user's.
+    yield* orchestrator.dispatch({
+      type: "thread.user-input.request",
+      commandId: CommandId.make("executor-question"),
+      threadId: executor,
+      requestId: RuntimeRequestId.make("server-question:executor-question"),
+      questions: [{ id: "pick", header: "Pick", question: "Option 1 or 2?", options: [] }],
+    });
+    yield* orchestrator.dispatch({
+      type: "runtime-request.respond",
+      commandId: CommandId.make("lead-answers-for-user"),
+      threadId: executor,
+      requestId: RuntimeRequestId.make("server-question:executor-question"),
+      answers: { pick: "2" },
+      respondedByThreadId: lead,
+    });
+    const agentAnswer = (yield* threads.getThreadProjection(executor)).messages.find(
+      (message) => message.id === "async-answer:server-question:executor-question",
+    );
+    assert.equal(agentAnswer?.createdBy, "agent");
+    assert.equal(agentAnswer?.senderThreadId, lead);
+    assert.equal((yield* state(executor))?.state, "blocked");
+
+    // Its lead's brief (t3_thread_send) unblocks it in the same command.
+    yield* send("lead-brief", { senderThreadId: lead });
+    const unblocked = (yield* state(executor))!;
+    assert.include(["working", "queued"], unblocked.state);
+    assert.equal(unblocked.notes, "Unblocked by new instructions from its lead.");
+    // The lead sent it, so the lead is not told about its own instruction.
+    assert.notInclude(yield* noticeIds(lead), "organization-parent:lead-brief");
+
+    // A user's message unblocks it, starting at once rather than being refused as blocked.
+    yield* block(executor, "executor-blocked-again");
+    yield* send("user-answer", {
+      createdBy: "user",
+      creationSource: "web",
+      dispatchMode: { type: "start_immediately" },
+    });
+    const byUser = (yield* state(executor))!;
+    assert.equal(byUser.notes, "Unblocked by new instructions from the user.");
+    assert.notEqual(byUser.state, "blocked");
+    assert.include(yield* noticeIds(lead), "organization-parent:user-answer");
+  }).pipe(Effect.provide(taskNoticeLayer)),
+);
+
+it.effect("answering a blocked lead's open question unblocks it", () =>
+  Effect.gen(function* () {
+    const { orchestrator, chief, lead, block, noticeIds } = yield* taskNoticeSetup;
+    const threads = yield* ThreadManagement.ThreadManagementService;
+    yield* block(lead, "lead-blocked");
+    yield* orchestrator.dispatch({
+      type: "thread.user-input.request",
+      commandId: CommandId.make("lead-question"),
+      threadId: lead,
+      requestId: RuntimeRequestId.make("server-question:lead-question"),
+      questions: [{ id: "pick", header: "Pick", question: "Option 1 or 2?", options: [] }],
+    });
+    yield* orchestrator.dispatch({
+      type: "runtime-request.respond",
+      commandId: CommandId.make("lead-question-answer"),
+      threadId: lead,
+      requestId: RuntimeRequestId.make("server-question:lead-question"),
+      answers: { pick: "2" },
+    });
+    const task = (yield* threads.getThreadProjection(lead)).thread.organization!.task!;
+    assert.notEqual(task.state, "blocked");
+    assert.equal(task.notes, "Unblocked by new instructions from the user.");
+    // A real status change: the Chief hears it once.
+    assert.include(yield* noticeIds(chief), "organization:lead-question-answer");
+
+    // A conversation outside the organization has nothing to unblock.
+    const plain = ThreadId.make("notice-plain");
+    const project = (yield* threads.getThreadProjection(lead)).thread.projectId;
+    yield* orchestrator.dispatch({
+      type: "thread.create",
+      commandId: CommandId.make("notice-create-plain"),
+      threadId: plain,
+      projectId: project,
+      title: "plain",
+      modelSelection,
+      runtimeMode: "full-access",
+      interactionMode: "default",
+      branch: null,
+      worktreePath: null,
+      createdBy: "user",
+      creationSource: "web",
+    });
+    yield* orchestrator.dispatch({
+      type: "message.dispatch",
+      commandId: CommandId.make("plain-message"),
+      messageId: MessageId.make("plain-message"),
+      threadId: plain,
+      text: "Hello",
+      attachments: [],
+      dispatchMode: { type: "start_immediately" },
+      createdBy: "user",
+      creationSource: "web",
+    });
+    assert.isUndefined(
+      (yield* threads.getThreadProjection(plain)).thread.organization ?? undefined,
+    );
+  }).pipe(Effect.provide(taskNoticeLayer)),
+);
+
+it.effect("the Chief is not woken by its own task updates", () =>
+  Effect.gen(function* () {
+    const { chief, lead, block, noticeIds } = yield* taskNoticeSetup;
+    yield* block(lead, "chief-blocks-lead", chief);
+    assert.deepEqual(yield* noticeIds(chief), []);
+  }).pipe(Effect.provide(taskNoticeLayer)),
+);
+
+it.effect("queued Chief notices merge into one turn with each task's latest state", () =>
+  Effect.gen(function* () {
+    const { chief, lead, executor, update, block, notices, noticeIds, chiefRuns } =
+      yield* taskNoticeSetup;
+    // The first notice starts a Chief turn; the next one queues behind it.
+    yield* update(lead, "lead-claim", { state: "working" });
+    yield* block(executor, "executor-blocked");
+    yield* block(lead, "lead-blocked");
+    yield* update(lead, "lead-unblocked", { state: "working", notes: null });
+    assert.sameMembers(yield* noticeIds(chief), [
+      "organization:lead-claim",
+      "organization:executor-blocked",
+    ]);
+    const runs = yield* chiefRuns;
+    assert.equal(runs.length, 2);
+    const queued = runs.filter((run) => run.status === "queued");
+    assert.deepEqual(
+      queued.map((run) => run.userMessageId),
+      ["organization:executor-blocked"],
+    );
+    const merged = (yield* notices(chief)).find(
+      (message) => message.id === "organization:executor-blocked",
+    )!;
+    const lines = merged.text.split("\n").filter((line) => line.startsWith("- ["));
+    assert.deepEqual(lines, [
+      `- [${executor}] blocked: ${executor} work. Needs input.`,
+      `- [${lead}] working: ${lead} work.`,
+    ]);
+    assert.equal(merged.notification?.outcome, "failed");
+    assert.equal(merged.notification?.summary, "2 task updates");
+    assert.notInclude(merged.text, "Explain the outcome");
+    assert.include(merged.text, "end your turn without a message");
+  }).pipe(Effect.provide(taskNoticeLayer)),
+);
+
+it.effect(
+  "the Chief and its leads ask the user through a durable question only the user answers",
+  () =>
+    Effect.gen(function* () {
+      const { orchestrator, chief, lead, executor } = yield* taskNoticeSetup;
+      // An ordinary conversation in the same project, outside the organization.
+      const plain = ThreadId.make("notice-plain-agent");
+      yield* orchestrator.dispatch({
+        type: "thread.create",
+        commandId: CommandId.make("notice-create-plain-agent"),
+        threadId: plain,
+        projectId: (yield* orchestrator.getThreadProjection(chief)).thread.projectId,
+        title: "plain",
+        modelSelection,
+        runtimeMode: "full-access",
+        interactionMode: "default",
+        branch: null,
+        worktreePath: null,
+        createdBy: "user",
+        creationSource: "web",
+      });
+      for (const id of [chief, lead, executor, plain])
+        yield* orchestrator.dispatch({
+          type: "message.dispatch",
+          commandId: CommandId.make(`ask-start-${id}`),
+          messageId: MessageId.make(`ask-start-${id}`),
+          threadId: id,
+          text: "Work",
+          attachments: [],
+          dispatchMode: { type: "start_immediately" },
+          createdBy: "user",
+          creationSource: "web",
+        });
+      const server = yield* McpServer.McpServer;
+      const call = (actor: ThreadId, name: string, args: Record<string, unknown>) =>
+        server.callTool({ name, arguments: args }).pipe(
+          Effect.provideService(McpInvocationContext.McpInvocationContext, {
+            environmentId: EnvironmentId.make("organization-test"),
+            threadId: actor,
+            providerSessionId: `session-${actor}`,
+            providerInstanceId: modelSelection.instanceId,
+            capabilities: new Set(["orchestration"] as const),
+            issuedAt: 1,
+          }),
+          Effect.provideService(McpSchema.McpServerClient, mcpClient),
+        );
+      const ask = (actor: ThreadId, clientRequestId: string) =>
+        call(actor, "t3_organization_ask_user", {
+          clientRequestId,
+          questions: [
+            {
+              id: "release",
+              header: "Release",
+              question: "Ship the outcome now?",
+              options: [
+                { label: "Ship", description: "Merge today" },
+                { label: "Wait", description: "Hold for review" },
+              ],
+            },
+          ],
+        });
+      const content = (result: { structuredContent?: unknown }) =>
+        result.structuredContent as { requestId: string; threadId: string; code?: string };
+      const pending = orchestrator
+        .getThreadProjection(chief)
+        .pipe(
+          Effect.map((projection) =>
+            projection.runtimeRequests.filter((request) => request.status === "pending"),
+          ),
+        );
+
+      const first = yield* ask(chief, "decide-release");
+      assert.isFalse(first.isError);
+      const replay = yield* ask(chief, "decide-release");
+      assert.equal(content(replay).requestId, content(first).requestId);
+      assert.lengthOf(yield* pending, 1);
+
+      // A lead's question opens where the user talks to the organization.
+      const fromLead = yield* ask(lead, "lead-scope");
+      assert.isFalse(fromLead.isError);
+      assert.equal(content(fromLead).threadId, chief);
+
+      const denied = yield* ask(executor, "executor-question");
+      assert.equal(content(denied).code, "capability_denied");
+
+      yield* ask(chief, "third");
+      const capped = yield* ask(chief, "fourth");
+      assert.equal(content(capped).code, "orchestration_error");
+      assert.include(
+        (capped.structuredContent as { message: string }).message,
+        "unanswered questions",
+      );
+      assert.lengthOf(yield* pending, 3);
+
+      // No agent answers a question the server opened for the user, in or out of the organization.
+      for (const actor of [chief, lead, plain]) {
+        const selfAnswer = yield* call(actor, "t3_pending_request_respond", {
+          threadId: chief,
+          requestId: content(first).requestId,
+          answers: { release: "Ship" },
+        });
+        assert.equal(content(selfAnswer).code, "capability_denied", actor);
+      }
+      assert.lengthOf(yield* pending, 3);
+
+      // An agent that may answer (a provider's question, outside the organization) answers as
+      // itself: the answer is its message, not the user's.
+      const now = yield* DateTime.now;
+      const providerRequest = RuntimeRequestId.make("provider-question");
+      const providerNode = NodeId.make("provider-question-node");
+      yield* (yield* EventSink.EventSinkV2).write({
+        commandId: CommandId.make("seed-provider-question"),
+        events: [
+          {
+            id: EventId.make("seed-provider-question-node"),
+            type: "node.updated",
+            threadId: executor,
+            nodeId: providerNode,
+            occurredAt: now,
+            payload: {
+              id: providerNode,
+              threadId: executor,
+              runId: null,
+              parentNodeId: null,
+              rootNodeId: providerNode,
+              kind: "user_input_request",
+              status: "waiting",
+              countsForRun: false,
+              providerThreadId: null,
+              providerTurnId: null,
+              nativeItemRef: null,
+              runtimeRequestId: providerRequest,
+              checkpointScopeId: null,
+              startedAt: now,
+              completedAt: null,
+            },
+          },
+          {
+            id: EventId.make("seed-provider-question-request"),
+            type: "runtime-request.updated",
+            threadId: executor,
+            nodeId: providerNode,
+            occurredAt: now,
+            payload: {
+              id: providerRequest,
+              nodeId: providerNode,
+              providerTurnId: null,
+              nativeRequestRef: { driver, nativeId: "native-question", strength: "strong" },
+              kind: "user_input",
+              status: "pending",
+              responseCapability: { type: "message" },
+              createdAt: now,
+              resolvedAt: null,
+            },
+          },
+          {
+            id: EventId.make("seed-provider-question-item"),
+            type: "turn-item.updated",
+            threadId: executor,
+            nodeId: providerNode,
+            occurredAt: now,
+            payload: {
+              id: TurnItemId.make("provider-question-item"),
+              type: "user_input_request",
+              threadId: executor,
+              runId: null,
+              nodeId: providerNode,
+              providerThreadId: null,
+              providerTurnId: null,
+              nativeItemRef: null,
+              parentItemId: null,
+              ordinal: 999,
+              status: "waiting",
+              title: null,
+              startedAt: now,
+              completedAt: null,
+              updatedAt: now,
+              requestId: providerRequest,
+              responseMode: "message",
+              questions: [{ id: "pick", header: "Pick", question: "Which one?", options: [] }],
+            },
+          },
+        ],
+      });
+      const agentResponse = yield* call(plain, "t3_pending_request_respond", {
+        threadId: executor,
+        requestId: providerRequest,
+        answers: { pick: "the first" },
+      });
+      assert.isFalse(agentResponse.isError);
+      const agentAnswer = (yield* orchestrator.getThreadProjection(executor)).messages.find(
+        (message) => message.id === `async-answer:${providerRequest}`,
+      );
+      assert.equal(agentAnswer?.createdBy, "agent");
+      assert.equal(agentAnswer?.senderThreadId, plain);
+
+      yield* orchestrator.dispatch({
+        type: "runtime-request.respond",
+        commandId: CommandId.make("user-answers-release"),
+        threadId: chief,
+        requestId: content(first).requestId as never,
+        answers: { release: "Ship" },
+      });
+      const answered = yield* orchestrator.getThreadProjection(chief);
+      assert.lengthOf(yield* pending, 2);
+      assert.isTrue(
+        answered.messages.some(
+          (message) =>
+            message.id === `async-answer:${content(first).requestId}` &&
+            message.createdBy === "user",
+        ),
+      );
+    }).pipe(Effect.provide(NativeToolkitLayer.pipe(Layer.provideMerge(taskNoticeLayer)))),
 );

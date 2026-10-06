@@ -319,10 +319,10 @@ const program = Effect.gen(function* () {
       threadId,
       messageId: MessageId.make(yield* uuid()),
       text: multiRepo
-        ? `Run the isolated multi-repo organization smoke. The project root is a plain folder of Git repositories, not a repository itself. Delegate exactly one project lead. The lead must delegate exactly one executor with delegate_task repository="${MULTI_REPO_TARGET}" to create only smoke-test.txt in ${MULTI_REPO_TARGET} with exactly organization works followed by one newline (19 UTF-8 bytes; SHA256 a74f3d39459e0245fe64e6360b24c033930204d115611ad5f5083c4fcb600707), then an independent review of that submission. Use the configured role models: lead ${describe(roleModel("lead"))}, executor ${describe(executorModel)}, reviewer ${describe(roleModel("reviewer"))}. No other files or repositories, no research, installation, external source access or credentials. Finish at the reviewed lead outcome awaiting my acceptance; never accept it on my behalf.`
+        ? `Run the isolated multi-repo organization smoke. The project root is a plain folder of Git repositories, not a repository itself. Delegate exactly one project lead. The lead must delegate exactly one executor with delegate_task repository="${MULTI_REPO_TARGET}" to create only smoke-test.txt in ${MULTI_REPO_TARGET} with exactly organization works followed by one newline (19 UTF-8 bytes; SHA256 a74f3d39459e0245fe64e6360b24c033930204d115611ad5f5083c4fcb600707), then an independent review of that submission. Use the configured role models: lead ${describe(roleModel("lead"))}, executor ${describe(executorModel)}, reviewer ${describe(roleModel("reviewer"))}. No other files or repositories, no research, installation, external source access or credentials. Open no pull request: the server accepts the outcome after its independent outcome review. Never accept it yourself.`
         : resumeChief
-          ? "The organization review lookup defect has been repaired and independently reviewed. Recover this existing isolated smoke workstream: ask the same project lead to resume its same assigned reviewer on the existing smoke-test.txt artifact. Do not create another Chief, outcome or executor task. Do not redo executor work unless independent review establishes a real artifact correction is necessary. Use the existing native task IDs and review assignment; no orgctl or duplicate coordinator. Finish the existing reviewed lead outcome awaiting my final acceptance, never accept it on my behalf. The only permitted artifact remains smoke-test.txt with exactly organization works followed by a newline, 19 bytes and SHA256 a74f3d39459e0245fe64e6360b24c033930204d115611ad5f5083c4fcb600707. No assets/research/credentials/production."
-          : `Run the isolated organization smoke described in AGENTS.md. Coordinate through a project lead, an executor and an independent reviewer using native T3 tools. Change only smoke-test.txt to exactly organization works followed by one newline (19 UTF-8 bytes; SHA256 a74f3d39459e0245fe64e6360b24c033930204d115611ad5f5083c4fcb600707). Use the configured role models: lead ${describe(roleModel("lead"))}, executor ${describe(executorModel)}, reviewer ${describe(roleModel("reviewer"))}. No research, installation, external source access, or other files. Finish at reviewed final outcome awaiting my acceptance, do not accept on my behalf.`,
+          ? "The organization review lookup defect has been repaired and independently reviewed. Recover this existing isolated smoke workstream: ask the same project lead to resume its same assigned reviewer on the existing smoke-test.txt artifact. Do not create another Chief, outcome or executor task. Do not redo executor work unless independent review establishes a real artifact correction is necessary. Use the existing native task IDs and review assignment; no orgctl or duplicate coordinator. Finish the existing lead outcome through its independent outcome review; open no pull request, so the server accepts it after that review. Never accept it yourself. The only permitted artifact remains smoke-test.txt with exactly organization works followed by a newline, 19 bytes and SHA256 a74f3d39459e0245fe64e6360b24c033930204d115611ad5f5083c4fcb600707. No assets/research/credentials/production."
+          : `Run the isolated organization smoke described in AGENTS.md. Coordinate through a project lead, an executor and an independent reviewer using native T3 tools. Change only smoke-test.txt to exactly organization works followed by one newline (19 UTF-8 bytes; SHA256 a74f3d39459e0245fe64e6360b24c033930204d115611ad5f5083c4fcb600707). Use the configured role models: lead ${describe(roleModel("lead"))}, executor ${describe(executorModel)}, reviewer ${describe(roleModel("reviewer"))}. No research, installation, external source access, or other files. Open no pull request: the server accepts the outcome after its independent outcome review. Never accept it yourself.`,
       attachments: [],
       dispatchMode: { type: queueBehindActive ? "queue_after_active" : "start_immediately" },
     });
@@ -351,13 +351,13 @@ const program = Effect.gen(function* () {
     );
     if (
       thread.organization.role === "lead" &&
-      task?.state === "awaiting_review" &&
+      (task?.state === "awaiting_review" || task?.state === "accepted") &&
       task.revision &&
       task.reviewedRevision === task.revision
     ) {
       reviewedOutcome = true;
       console.log(
-        `Pilot reviewed outcome ready for owner acceptance: ${thread.id}, revision=${task.revision}, files=${task.files?.length ?? 0}`,
+        `Pilot reviewed outcome ${task.state === "accepted" ? "accepted by the server" : "awaiting server acceptance"}: ${thread.id}, revision=${task.revision}, files=${task.files?.length ?? 0}`,
       );
     }
   };

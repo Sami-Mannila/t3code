@@ -26,7 +26,13 @@ import {
   OrchestratorMcpThreadWaitResult,
   ThreadMetadataMcpUpdateInput,
   ThreadMetadataMcpUpdateResult,
+  OrchestratorMcpTarget,
+  ModelSelection,
+  RunId,
+  ThreadId,
+  TrimmedNonEmptyString,
 } from "@t3tools/contracts";
+import * as Schema from "effect/Schema";
 import { Tool, Toolkit } from "effect/unstable/ai";
 
 import * as McpInvocationContext from "../../McpInvocationContext.ts";
@@ -237,7 +243,31 @@ const ThreadInterruptTool = Tool.make("t3_thread_interrupt", {
   .annotate(Tool.Title, "Interrupt a T3 thread")
   .annotate(Tool.Destructive, true);
 
+const OrganizationExtendLeadTool = Tool.make("organization_extend_lead", {
+  description:
+    "Chief only: give one of your idle leads a new round of work when it continues that lead's workstream or the lead's scope was too narrow, instead of delegating another lead. The lead's current round must be accepted, awaiting review, blocked, changes requested or queued. Its finished round is recorded with its revision, review and pull requests and stays exactly as it was: a round that was not accepted yet is not accepted later, even when its pull requests merge; the new round starts unreviewed, the brief is sent to the lead, and the server accepts the new round on its own review and pull requests. target switches the lead's provider or model, validated like delegate_task target (provider_unavailable or model_unavailable, never substituted); use it when the lead's provider is unavailable rather than replacing the lead. clientRequestId makes retries use the same commands.",
+  parameters: Schema.Struct({
+    threadId: ThreadId,
+    brief: TrimmedNonEmptyString,
+    target: Schema.optional(OrchestratorMcpTarget),
+    clientRequestId: TrimmedNonEmptyString,
+  }),
+  success: Schema.Struct({
+    threadId: ThreadId,
+    round: Schema.Number,
+    modelSelection: ModelSelection,
+    runId: RunId,
+    delivery: Schema.String,
+  }),
+  failure: OrchestratorMcpFailure,
+  failureMode: "return",
+  dependencies,
+})
+  .annotate(Tool.Title, "Extend an organization lead")
+  .annotate(Tool.Destructive, true);
+
 export const OrchestratorToolkit = Toolkit.make(
+  OrganizationExtendLeadTool,
   OrchestratorCapabilitiesTool,
   DelegateTaskTool,
   TaskStatusTool,

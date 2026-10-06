@@ -61,6 +61,11 @@ export function withCreationProvenance(
       const { organizationActorThreadId: _actor, ...userCommand } = command;
       return userCommand;
     }
+    case "runtime-request.respond": {
+      if (provenance.createdBy !== "user") return command;
+      const { respondedByThreadId: _agent, ...userCommand } = command;
+      return userCommand;
+    }
     case "thread.create":
     case "message.dispatch":
     case "thread.fork":
@@ -503,8 +508,6 @@ const make = Effect.gen(function* () {
       const archiving = command.type === "thread.workstream.archive";
       if (lead?.organization?.role !== "lead")
         return yield* reject("Only a lead's workstream can be archived or restored.");
-      if (archiving && lead.organization.task?.state !== "accepted")
-        return yield* reject("Archive a workstream once the user has accepted its lead's outcome.");
       const subtree = workstreamThreads(lead.id, threads);
       if (archiving) {
         const busy = subtree.find(
@@ -581,27 +584,44 @@ const make = Effect.gen(function* () {
           revision: string;
           files: Array<{ path: string; sha256: string; bytes: number }>;
         };
+        const previous = current.thread.organization?.task;
+        const submission =
+          task.state === "awaiting_review" &&
+          task.reviewedRevision === null &&
+          command.organizationActorThreadId === command.threadId;
         if (lead) {
           const shell = yield* orchestrator.getShellSnapshot();
+          // A submission consolidates every implementation task; review and acceptance verify
+          // the set that submitted revision was built from, so later work is its own scope.
+          const reviewedSet = new Set(previous?.dependencyThreadIds ?? []);
+          // Work an earlier round of an extended lead was built from stays with that round.
+          const earlierRounds = new Set(
+            (previous?.rounds ?? []).flatMap((round) => round.dependencyThreadIds),
+          );
           const children = shell.threads
             .filter(
               (item) =>
                 item.organization?.parentThreadId === current.thread.id &&
                 item.organization.role === "executor" &&
-                item.organization.task,
+                item.organization.task &&
+                (submission ? !earlierRounds.has(item.id) : reviewedSet.has(item.id)),
             )
             .toSorted((a, b) => a.id.localeCompare(b.id));
-          if (
-            !children.length ||
-            children.some(
-              (child) => child.organization?.task?.state !== "accepted" || !child.worktreePath,
-            )
-          )
+          const unready = children.find(
+            (child) => child.organization?.task?.state !== "accepted" || !child.worktreePath,
+          );
+          const missing = submission
+            ? undefined
+            : [...reviewedSet].find((id) => !children.some((child) => child.id === id));
+          if (!children.length || unready || missing)
             return yield* new Orchestrator.OrchestratorDispatchError({
               commandId: command.commandId,
               commandType: command.type,
-              cause:
-                "Outcome consolidation requires independently accepted implementation artifacts.",
+              cause: unready
+                ? `Outcome consolidation requires independently accepted implementation artifacts; "${unready.title}" is ${unready.organization?.task?.state.replaceAll("_", " ") ?? "missing"}${unready.worktreePath ? "" : " and has no worktree"}.`
+                : missing
+                  ? `Outcome consolidation requires its reviewed implementation task ${missing}, which is no longer an executor under this lead.`
+                  : "Outcome consolidation requires independently accepted implementation artifacts.",
             });
           const digest = NodeCrypto.createHash("sha256");
           const files: Array<{ path: string; sha256: string; bytes: number }> = [];
@@ -631,11 +651,6 @@ const make = Effect.gen(function* () {
           }
           evidence = { revision: digest.digest("hex"), files };
         } else evidence = yield* readArtifacts(current.thread.worktreePath!, task.manifest ?? []);
-        const previous = current.thread.organization?.task;
-        const submission =
-          task.state === "awaiting_review" &&
-          task.reviewedRevision === null &&
-          command.organizationActorThreadId === command.threadId;
         if (!submission && evidence.revision !== previous?.revision)
           return yield* new Orchestrator.OrchestratorDispatchError({
             commandId: command.commandId,

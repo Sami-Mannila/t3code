@@ -2,6 +2,7 @@ import {
   ScheduledTaskId,
   OrganizationThread,
   OrganizationRole,
+  OrchestrationV2UserInputQuestion,
   ScheduledTask,
   OrchestrationSearchThreadsInput,
   OrchestrationSearchThreadsResult,
@@ -263,7 +264,7 @@ const ScheduledTaskRunTool = Tool.make("run_scheduled_task_now", {
 const OrganizationTaskTool = Tool.make("t3_organization_task", {
   ...commandTool,
   description:
-    "Read or update a canonical organization task. Actor identity is bound to this conversation. Omit threadId to use your task; reviewers automatically target their explicitly assigned submission (their own conversation ID is an alias for that target). Other reviewer targets are rejected. Submit hashes actual manifest files; reviewers must supply the exact revision returned by read when calling accept_review or request_changes; mismatched revisions are rejected; lead outcomes require user acceptance. Read results distinguish reviewAssignment (current assigned reviewer) from reviewAttestation (completed review); null task.reviewerThreadId is normal before acceptance. artifactSources gives each source's repository (relative to the project root), branch and physical worktree location, including child sources for a consolidated outcome. Keep user-facing updates in the Chief conversation.",
+    "Read or update a canonical organization task. Actor identity is bound to this conversation. Omit threadId to use your task; reviewers automatically target their explicitly assigned submission (their own conversation ID is an alias for that target). Other reviewer targets are rejected. Submit hashes actual manifest files; reviewers must supply the exact revision returned by read when calling accept_review or request_changes; mismatched revisions are rejected; the server accepts a reviewed lead outcome when every pull request it opened has merged, or after that review when it opened none; agents never accept outcomes. Read results distinguish reviewAssignment (current assigned reviewer) from reviewAttestation (completed review); null task.reviewerThreadId is normal before acceptance. artifactSources gives each source's repository (relative to the project root), branch and physical worktree location, including child sources for a consolidated outcome. Keep user-facing updates in the Chief conversation.",
   parameters: Schema.Struct({
     threadId: Schema.optional(ThreadId),
     action: Schema.Literals([
@@ -326,8 +327,20 @@ const OrganizationTaskTool = Tool.make("t3_organization_task", {
   }),
 }).annotate(Tool.Destructive, true);
 
+const OrganizationAskUserTool = Tool.make("t3_organization_ask_user", {
+  ...commandTool,
+  description:
+    "Ask the user a decision question in the Chief conversation. The user sees a question box that stays open across turns and restarts until they answer or dismiss it; the answer arrives in the Chief conversation as their message. Use only when the user must decide; end your turn after asking instead of restating the question. Chief and leads may ask; a lead's question opens in its Chief's conversation. At most 3 questions may be open per conversation. Reusing clientRequestId returns the same question.",
+  parameters: Schema.Struct({
+    questions: Schema.NonEmptyArray(OrchestrationV2UserInputQuestion),
+    clientRequestId: TrimmedNonEmptyString,
+  }),
+  success: Schema.Struct({ requestId: RuntimeRequestId, threadId: ThreadId }),
+}).annotate(Tool.Destructive, false);
+
 export const ThreadToolkit = Toolkit.make(
   OrganizationTaskTool,
+  OrganizationAskUserTool,
   ScheduledTaskRunTool,
   ThreadSearchTool,
   ThreadForkTool,

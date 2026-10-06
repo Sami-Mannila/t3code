@@ -33,6 +33,7 @@ import {
   PullRequestTargetIncompleteError,
   PullRequestHostRequiredError,
   PullRequestUnlinkFailedError,
+  PullRequestUnlinkRefusedError,
   PullRequestListFailedError,
   PullRequestNotOpenError,
   type PullRequestTargetInput,
@@ -286,6 +287,8 @@ const make = Effect.gen(function* () {
     unlink_pull_request: (input) =>
       Effect.gen(function* () {
         const thread = yield* requireThread(PullRequestUnlinkFailedError);
+        // An organization agent cannot lift the pull request gate on its own outcome.
+        if (thread.organization) return yield* new PullRequestUnlinkRefusedError();
         const project = yield* projectOf(thread, PullRequestUnlinkFailedError);
         const target = yield* resolveTarget(input, project);
         if (!threadPullRequestsOf(thread).some((link) => threadPullRequestKeysEqual(link, target)))

@@ -2,6 +2,7 @@ import * as Equal from "effect/Equal";
 import { resolveOrganizationRoleModelSelection } from "@t3tools/shared/serverSettings";
 import {
   DEFAULT_SERVER_SETTINGS,
+  ORGANIZATION_TASK_ROUND_LIMIT,
   type OrganizationRepositoryPath,
   type OrganizationRole,
   type OrganizationTask,
@@ -10,6 +11,120 @@ import {
   type ServerSettings,
   type ThreadId,
 } from "@t3tools/contracts";
+
+/** A lead whose current round is in none of these is still working on it. */
+export const ORGANIZATION_EXTENDABLE_STATES: ReadonlySet<string> = new Set([
+  "accepted",
+  "awaiting_review",
+  "blocked",
+  "changes_requested",
+  "queued",
+]);
+
+/**
+ * A lead's task for its next round: the finished round is recorded (bounded) as it was, and the
+ * new one starts unreviewed with the brief and no implementation tasks of its own yet.
+ */
+export function organizationExtendedTask(
+  task: OrganizationTask,
+  input: {
+    readonly leadThreadId: ThreadId;
+    readonly brief: string;
+    readonly now: string;
+    readonly pullRequests: ReadonlyArray<number>;
+  },
+): OrganizationTask {
+  const round = (task.rounds?.at(-1)?.round ?? 0) + 1;
+  const { lastReview: _lastReview, files: _files, manifest: _manifest, ...kept } = task;
+  return {
+    ...kept,
+    state: "working",
+    ownerThreadId: input.leadThreadId,
+    revision: null,
+    reviewedRevision: null,
+    reviewerThreadId: null,
+    dependencyThreadIds: [],
+    notes: `Round ${round + 1}: ${input.brief.trim()}`.slice(0, 2_000),
+    roundStartedAt: input.now,
+    rounds: [
+      ...(task.rounds ?? []),
+      {
+        round,
+        state: task.state,
+        revision: task.revision,
+        reviewedRevision: task.reviewedRevision,
+        dependencyThreadIds: task.dependencyThreadIds,
+        pullRequests: [...input.pullRequests],
+        summary: task.notes,
+        endedAt: input.now,
+      },
+    ].slice(-ORGANIZATION_TASK_ROUND_LIMIT),
+  };
+}
+
+/**
+ * New instructions to a blocked lead or executor unblock it at once, so its label never lags the
+ * brief it was given: a message from the user (including an answer to its question), or one its
+ * own coordinator sent. Server notices, notifications, delegated results, scheduled runs and the
+ * agent's own or other agents' messages do not. Returns the unblocked task and who acted, or
+ * null when nothing changes.
+ */
+export function organizationInstructionUnblock(input: {
+  readonly thread: Pick<OrchestrationV2AppThread, "id" | "organization">;
+  readonly message: {
+    readonly messageId: string;
+    readonly createdBy: string;
+    readonly creationSource: string;
+    readonly senderThreadId?: ThreadId | undefined;
+    readonly notification?: unknown;
+    readonly delegatedCompletion?: unknown;
+    readonly scheduledTaskId?: unknown;
+    readonly usageLimitContinuationOfRunId?: unknown;
+    readonly restartContinuationOfRunId?: unknown;
+  };
+  readonly coordinatorLabel: string;
+  readonly queued: boolean;
+}): { readonly task: OrganizationTask; readonly actorThreadId: ThreadId | undefined } | null {
+  const org = input.thread.organization;
+  const task = org?.task;
+  if (!task || task.state !== "blocked" || (org.role !== "lead" && org.role !== "executor"))
+    return null;
+  const { message } = input;
+  if (
+    isOrganizationNoticeMessageId(message.messageId) ||
+    message.notification !== undefined ||
+    message.delegatedCompletion !== undefined ||
+    message.scheduledTaskId !== undefined ||
+    // Recovery resumes the same work; it is not a new instruction.
+    message.usageLimitContinuationOfRunId !== undefined ||
+    message.restartContinuationOfRunId !== undefined
+  )
+    return null;
+  // An answer to the conversation's question unblocks only when the user gave it.
+  if (message.messageId.startsWith("async-answer:") && message.createdBy !== "user") return null;
+  const fromUser = message.createdBy === "user";
+  const fromCoordinator =
+    message.createdBy === "agent" &&
+    message.creationSource !== "server" &&
+    message.senderThreadId !== undefined &&
+    message.senderThreadId === org.parentThreadId;
+  if (!fromUser && !fromCoordinator) return null;
+  return {
+    actorThreadId: fromUser ? undefined : org.parentThreadId!,
+    task: {
+      ...task,
+      ownerThreadId: input.thread.id,
+      // A correction round resumes as one; otherwise the work runs or waits its turn.
+      state:
+        task.lastReview !== undefined && task.lastReview.revision === task.revision
+          ? "changes_requested"
+          : input.queued
+            ? "queued"
+            : "working",
+      notes: `Unblocked by new instructions from ${fromUser ? "the user" : input.coordinatorLabel}.`,
+    },
+  };
+}
 
 /** Shared by every canonical command, including commands originating through MCP. */
 export function organizationProblem(input: {
@@ -71,6 +186,28 @@ export function organizationProblem(input: {
     return "Only the task's owner or direct coordinator can update this work.";
   if (old && (old.repository ?? ".") !== (task.repository ?? "."))
     return "A task's repository is fixed when it is delegated; delegate a new task for another repository.";
+  const lastRound = (value: OrganizationTask | undefined) => value?.rounds?.at(-1)?.round ?? 0;
+  // A lead extended by its Chief starts a new round; the finished one is recorded, not undone.
+  const extending = !!old && lastRound(task) === lastRound(old) + 1;
+  if (extending) {
+    if (next.role !== "lead" || !actor || actor.id !== next.parentThreadId)
+      return "Only a lead's Chief can extend it with a new round.";
+    if (!ORGANIZATION_EXTENDABLE_STATES.has(old.state))
+      return "A lead can be extended once its current round is not in progress.";
+    if (
+      !["queued", "working"].includes(task.state) ||
+      task.ownerThreadId !== thread.id ||
+      task.revision !== null ||
+      task.reviewedRevision !== null ||
+      task.reviewerThreadId !== null ||
+      task.dependencyThreadIds.length > 0
+    )
+      return "A new round starts unreviewed, owned by the lead, with no implementation tasks yet.";
+  } else if (
+    old &&
+    (!Equal.equals(old.rounds, task.rounds) || old.roundStartedAt !== task.roundStartedAt)
+  )
+    return "Earlier rounds are recorded only when the Chief extends a lead.";
   if (
     old &&
     (old.title !== task.title ||
@@ -123,11 +260,11 @@ export function organizationProblem(input: {
     };
     if (visits(id)) return "Task dependencies cannot form a cycle.";
   }
-  if (
-    ["working", "awaiting_review", "accepted"].includes(task.state) &&
-    task.dependencyThreadIds.some((id) => related(id)?.organization?.task?.state !== "accepted")
-  )
-    return "All dependencies must be accepted before this task can execute or be accepted.";
+  const unaccepted = ["working", "awaiting_review", "accepted"].includes(task.state)
+    ? task.dependencyThreadIds.find((id) => related(id)?.organization?.task?.state !== "accepted")
+    : undefined;
+  if (unaccepted)
+    return `All dependencies must be accepted before this task can execute or be accepted; ${unaccepted} is ${related(unaccepted)?.organization?.task?.state.replaceAll("_", " ") ?? "missing"}.`;
   if (task.state === "working" && task.ownerThreadId !== thread.id)
     return "Implementation work remains with the original worker, not the reviewer or coordinator.";
   if (task.revision !== old?.revision && task.reviewedRevision !== null)
@@ -151,16 +288,12 @@ export function organizationProblem(input: {
   }
   if (task.state === "accepted" && old?.state !== "accepted") {
     if (next.role === "lead") {
-      if (actorThreadId) return "Final outcome acceptance requires the user, not an agent.";
-      if (
-        input.threads.some(
-          (item) =>
-            item.organization?.parentThreadId === thread.id &&
-            item.organization.task &&
-            item.organization.task.state !== "accepted",
-        )
-      )
-        return "All implementation tasks must be independently accepted before final outcome acceptance.";
+      // The server accepts an outcome after its pull requests merge, or after review when it
+      // has none; agents never do. Its reviewed set is the dependencies checked above, so work
+      // the lead started after review is separate scope and does not block it.
+      if (actorThreadId) return "Final outcome acceptance belongs to the server, not an agent.";
+      if (task.dependencyThreadIds.length === 0)
+        return "An outcome is accepted only with the implementation tasks it was reviewed with.";
     } else if (!actor || actor.organization?.role !== "reviewer" || actor.id !== old?.ownerThreadId)
       return "Only the assigned independent reviewer accepts an executor submission.";
     if (
@@ -174,6 +307,7 @@ export function organizationProblem(input: {
   if (
     old?.state === "accepted" &&
     task.state !== "accepted" &&
+    !extending &&
     !(
       actor?.id === next.parentThreadId &&
       task.state === "changes_requested" &&
@@ -370,6 +504,82 @@ const roleModels = (
     .join(", ");
 
 /**
+ * Whether a task update is news for the Chief. The Chief hears its direct leads' state changes
+ * and newly reviewed outcomes, and any task in the project becoming blocked (or re-blocked with
+ * new notes). Notes, manifest, ownership and executor churn reach the parent lead instead.
+ */
+export function organizationChiefNoticeRelevant(
+  previous: OrganizationTask | undefined,
+  next: OrganizationTask,
+  reportsToChief: boolean,
+): boolean {
+  if (next.state === "blocked" && (previous?.state !== "blocked" || previous.notes !== next.notes))
+    return true;
+  if (!reportsToChief) return false;
+  return (
+    previous?.state !== next.state ||
+    (next.reviewedRevision !== null && previous.reviewedRevision !== next.reviewedRevision)
+  );
+}
+
+/** Chief notice ids; a queued notice is merged into rather than followed by another turn. */
+export const ORGANIZATION_CHIEF_NOTICE_PREFIX = "organization:";
+/** A pull request that closed without merging and holds an outcome. */
+export const ORGANIZATION_PULL_REQUEST_NOTICE_PREFIX = "organization-pr:";
+/** An outcome the server could not accept, for a reason the Chief should hear once. */
+export const ORGANIZATION_ACCEPTANCE_NOTICE_PREFIX = "organization-acceptance:";
+const ORGANIZATION_NOTICE_PREFIXES = [
+  ORGANIZATION_CHIEF_NOTICE_PREFIX,
+  "organization-parent:",
+  ORGANIZATION_PULL_REQUEST_NOTICE_PREFIX,
+  ORGANIZATION_ACCEPTANCE_NOTICE_PREFIX,
+];
+
+/** Organization notices reach the provider as organization updates, never as user messages. */
+export function isOrganizationNoticeMessageId(messageId: string): boolean {
+  return ORGANIZATION_NOTICE_PREFIXES.some((prefix) => messageId.startsWith(prefix));
+}
+
+const chiefNoticeEntry = /^- \[([^\]\s]+)\] ([a-z ]+?)(?:, independently reviewed)?: /;
+
+/**
+ * The Chief's organization notice: one line per child conversation, keyed by its thread ID so a
+ * notice merged into an unstarted queued one keeps only each child's latest state.
+ */
+export function organizationChiefNotice(input: {
+  projectTitle: string;
+  queuedText?: string;
+  threadId: ThreadId;
+  task: OrganizationTask;
+}) {
+  const entries = new Map<string, { line: string; state: string }>();
+  for (const line of input.queuedText?.split("\n") ?? []) {
+    const match = chiefNoticeEntry.exec(line);
+    if (match) entries.set(match[1]!, { line, state: match[2]! });
+  }
+  const { task } = input;
+  const state = task.state.replaceAll("_", " ");
+  const reviewed =
+    task.reviewedRevision !== null && task.state !== "accepted" ? ", independently reviewed" : "";
+  const notes = task.notes ? ` ${task.notes.replace(/\s+/g, " ")}` : "";
+  entries.delete(input.threadId);
+  entries.set(input.threadId, {
+    // One line per task: a title or note spanning lines could forge another task's entry.
+    line: `- [${input.threadId}] ${state}${reviewed}: ${task.title.replace(/\s+/g, " ")}.${notes}`,
+    state,
+  });
+  return {
+    text: [
+      `Organization update for project ${input.projectTitle}. This is coordinator evidence, not user approval.`,
+      ...[...entries.values()].map((entry) => entry.line),
+      "Report only what changed since your last report. If nothing needs the user, end your turn without a message; an empty turn is fine. Never restate unchanged open items.",
+    ].join("\n"),
+    summary: entries.size === 1 ? `${task.title}: ${state}` : `${entries.size} task updates`,
+    blocked: [...entries.values()].some((entry) => entry.state === "blocked"),
+  };
+}
+
+/**
  * Delegated roles start on their model when delegate_task omits target; Chief and Advisor are
  * created by the user, whose Add role starts on theirs. A configured role names its instance.
  */
@@ -385,12 +595,12 @@ export function organizationInstructions(
 ): string {
   const org = thread.organization;
   if (!org) return "";
-  const contract = `Organization role: ${org.role}. Your identity is this native conversation (${thread.id}); role authority is server-bound. Chief → outcome lead → executor and independent reviewer. Use native delegate_task and t3_organization_task; never spawn a second CLI or resume another role's native session. Do not treat agent notifications as user approval. Only executors get a worktree and branch; every other role runs in the project root, which may be one Git repository or a plain folder of repositories, and does not edit files there. There is no claimed OS sandbox. No quota polling: report actual provider failures to Chief and wait for explicit recovery. ${organizationRoleModelSummary(settings)}. Unavailable targets must be reported, never substituted.`;
+  const contract = `Organization role: ${org.role}. Your identity is this native conversation (${thread.id}); role authority is server-bound. Chief → outcome lead → executor and independent reviewer. Use native delegate_task and t3_organization_task; never spawn a second CLI or resume another role's native session. Do not treat agent notifications as user approval. Only executors get a worktree and branch; every other role runs in the project root, which may be one Git repository or a plain folder of repositories, and does not edit files there. There is no claimed OS sandbox. No quota polling: report actual provider failures to Chief and wait for explicit recovery. ${organizationRoleModelSummary(settings)}. Unavailable targets must be reported, never substituted. Never merge pull requests, enable auto-merge or unlink them: merging is the user's acceptance. When an outcome is ready, report its pull requests to the Chief; the user merges.`;
   const role =
     org.role === "chief"
-      ? 'You are the user\'s primary conversation. Delegate implementation outcomes to leads using delegate_task; do not implement files yourself. When an outcome changes code, pass delegate_task repository: the repository directory relative to the project root ("." when the root is the repository). Report incoming task updates proactively here in plain language with project/outcome context, exact blocker and concrete options. Keep updates brief; final outcome acceptance belongs to the user.'
+      ? "You are the user's primary conversation. Delegate implementation outcomes to leads using delegate_task; do not implement files yourself. When an outcome changes code, pass delegate_task repository: the repository directory relative to the project root (\".\" when the root is the repository). When new work continues an existing workstream, or a lead's scope turned out too narrow, extend that lead with organization_extend_lead instead of delegating another lead; delegate a new lead only for unrelated work. When a lead's provider is unavailable, extend it with a different target rather than replacing it. Organization updates arrive only when a lead's state changes, an outcome is reviewed or a task is blocked. Report only what changed since your last report, in plain language with project/outcome context, the exact blocker and concrete options. If nothing needs the user, end the turn without a message; never restate unchanged open items. When the user must decide, ask with t3_organization_ask_user (concrete options, one question per decision) and end the turn; the question stays open until they answer, so do not repeat it. Keep updates brief. Never accept outcomes and never ask the user to accept one: the server accepts a reviewed outcome when every pull request it opened has merged (merging is the user's gate), or after its independent review when it opened none."
       : org.role === "lead"
-        ? `Plan and delegate implementation using delegate_task. Each implementation task works in one repository: pass repository relative to the project root (omitted, it uses ${org.task?.repository ? `your repository "${org.task.repository}"` : '"."'}); the server rejects a directory that is not a Git repository and lists the ones it found. Supply dependencyThreadIds atomically in delegate_task when creating dependent implementation work; it waits until dependencies have current independent acceptance. Do not implement or copy child artifacts. Once a child submits, delegate_task(role=review, reviewTaskThreadId=child conversation ID) creates an independent reviewer. After all children are independently accepted, submit your own outcome with t3_organization_task(action=submit); the server aggregates their current manifests. Delegate an independent outcome review targeting your own conversation. Ask Chief for final user acceptance; never accept an outcome yourself.`
+        ? `Plan and delegate implementation using delegate_task. Each implementation task works in one repository: pass repository relative to the project root (omitted, it uses ${org.task?.repository ? `your repository "${org.task.repository}"` : '"."'}); the server rejects a directory that is not a Git repository and lists the ones it found. Supply dependencyThreadIds atomically in delegate_task when creating dependent implementation work; it waits until dependencies have current independent acceptance. Do not implement or copy child artifacts. Once a child submits, delegate_task(role=review, reviewTaskThreadId=child conversation ID) creates an independent reviewer. After all children are independently accepted, submit your own outcome with t3_organization_task(action=submit); the server aggregates their current manifests. Delegate an independent outcome review targeting your own conversation. Never accept an outcome yourself and do not ask for acceptance: after the independent outcome review the server accepts it once every pull request your outcome opened has merged, or on that review alone when it opened none. Work you start after the review is separate scope with its own review. Your Chief may extend you with a new round and brief: plan and delegate new executors for it; earlier rounds' accepted work stays as it is.`
         : org.role === "executor"
           ? `Implement only your delegated task in your worktree${thread.worktreePath ? ` ${thread.worktreePath}` : ""}${thread.branch ? ` on branch ${thread.branch}` : ""}, created from repository "${organizationRepository(thread)}" under the project root. Manifest paths are relative to that worktree. Read/claim your task using t3_organization_task, then submit with action=submit and manifest of relative files. A prose completion is not a submission. If blocked, action=block with exact reason. Do not self-review or delegate.`
           : org.role === "reviewer"

@@ -2847,6 +2847,11 @@ export const OrchestrationV2Command = Schema.Union([
     decision: Schema.optional(ProviderApprovalDecision),
     answers: Schema.optional(ProviderUserInputAnswers),
     attachmentsByQuestionId: Schema.optional(UserInputAttachments),
+    /**
+     * The agent conversation that answered, set by the server for MCP answers; absent means the
+     * user. The user endpoint strips it, so clients cannot claim an agent answered.
+     */
+    respondedByThreadId: Schema.optional(ThreadId),
   }),
   Schema.Struct({
     type: Schema.Literal("thread.user-input.dismiss"),
@@ -2966,6 +2971,18 @@ const OrchestrationV2InternalCommand = Schema.Union([
         notification: OrchestrationV2Notification,
       }),
     ),
+  }),
+  /**
+   * Opens a question for the user that no provider turn waits on. It is answered by message, so
+   * it stays open across turn ends, restarts and session release until the user replies or
+   * dismisses it.
+   */
+  Schema.Struct({
+    type: Schema.Literal("thread.user-input.request"),
+    commandId: CommandId,
+    threadId: ThreadId,
+    requestId: RuntimeRequestId,
+    questions: Schema.NonEmptyArray(OrchestrationV2UserInputQuestion),
   }),
   /** Records that the provider rollback `requestId` failed for good. */
   Schema.Struct({

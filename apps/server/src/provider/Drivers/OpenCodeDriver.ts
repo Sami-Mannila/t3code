@@ -63,6 +63,7 @@ import {
 } from "../ProviderDriver.ts";
 import { withInstanceIdentity } from "./instanceIdentity.ts";
 import { mergeProviderInstanceEnvironment } from "../ProviderInstanceEnvironment.ts";
+import { agentCommandGuardDirectory, withAgentCommandGuard } from "../AgentCommandGuard.ts";
 import {
   enrichProviderSnapshotWithVersionAdvisory,
   makeCachedProviderMaintenanceResolution,
@@ -201,7 +202,10 @@ export const OpenCodeDriver: ProviderDriver<OpenCodeSettings, OpenCodeDriverEnv>
       const serverConfig = yield* ServerConfig.ServerConfig;
       const httpClient = yield* HttpClient.HttpClient;
       const serverSettings = yield* ServerSettings.ServerSettingsService;
-      const processEnv = mergeProviderInstanceEnvironment(environment);
+      const processEnv = yield* withAgentCommandGuard(
+        mergeProviderInstanceEnvironment(environment),
+        agentCommandGuardDirectory(serverConfig.stateDir),
+      );
       const continuationIdentity = defaultProviderContinuationIdentity({
         driverKind: DRIVER_KIND,
         instanceId,

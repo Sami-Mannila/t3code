@@ -231,7 +231,17 @@ describe("workstream archive", () => {
     }),
   );
 
-  it.effect("refuses before the outcome is accepted, while work runs, or for agents", () =>
+  it.effect("archives an idle workstream whatever its lead's task state", () =>
+    Effect.gen(function* () {
+      for (const state of ["queued", "blocked", "awaiting_review", "changes_requested"] as const) {
+        const { dispatch, dispatched } = harness(organization(state));
+        yield* dispatch(workstream("thread.workstream.archive", "lead-a"));
+        expect(dispatched.at(-1), state).toBe("thread.archive:lead-a");
+      }
+    }),
+  );
+
+  it.effect("refuses while work runs, or for agents", () =>
     Effect.gen(function* () {
       const refused = (
         threads: Array<OrchestrationV2ThreadShell>,
@@ -244,12 +254,6 @@ describe("workstream archive", () => {
           return String((error as { readonly cause?: unknown }).cause);
         });
 
-      expect(
-        yield* refused(
-          organization("awaiting_review"),
-          workstream("thread.workstream.archive", "lead-a"),
-        ),
-      ).toContain("accepted");
       const running = organization();
       running[3] = { ...running[3]!, status: "running" };
       expect(yield* refused(running, workstream("thread.workstream.archive", "lead-a"))).toContain(

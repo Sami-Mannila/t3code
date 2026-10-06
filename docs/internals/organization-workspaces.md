@@ -31,7 +31,24 @@ repositories, so worktrees are tied to tasks, not to the root.
   ([`idleWorktreeRemovable`](../../apps/server/src/storageCleanup.ts)) must not remove an
   executor checkout that review or outcome consolidation still reads: tasks awaiting review or
   accepted keep their worktree until the lead's own task is accepted or either thread is
-  archived. Removal and preparation take the same workspace lease, and removal re-checks for a
+  archived. No user or agent accepts a lead: the
+  [acceptance reactor](../../apps/server/src/orchestration-v2/OrganizationOutcomeAcceptanceReactor.ts)
+  does, once the reviewed revision's dependency tasks are accepted and every pull request the
+  outcome owns has merged, or on the review alone when it owns none. A thread owns only links
+  added after it was created; delegated roles start with no links, since inherited ones would
+  gate the wrong work. An open pull request from a reviewed executor's branch counts even when
+  nobody linked it; a legacy single link on the lead counts unless its parent has the same one.
+  Each attempt's command id hashes the inputs it decided on, so a refused acceptance is
+  reported to the Chief once and a later attempt can still succeed.
+- A merged pull request has to mean the user accepted the work, so agents must not merge.
+  No MCP tool merges or lets an organization agent unlink, and provider sessions get a `gh`
+  shim first on PATH
+  ([`AgentCommandGuard`](../../apps/server/src/provider/AgentCommandGuard.ts)) that refuses
+  `gh pr merge` (whatever flags come between), merge and auto-merge API calls, and aliases that
+  expand to a merge. It is not a sandbox. Known ways around it: the host API without `gh` (curl
+  with a token, a query read from a file), `git push` straight to the base branch, the real
+  `gh` by absolute path, aliases defined before, `gh` extensions, and login shells that prepend their own PATH;
+  on macOS a profile running `brew shellenv` can put Homebrew's `gh` ahead of the shim. Removal and preparation take the same workspace lease, and removal re-checks for a
   queued or active run as its last step, so a run that is preparing keeps its checkout.
 - A Git exit during preparation is usually deterministic, so the effect worker fails the run on the
   first attempt, with the command's stderr in the task notes that reach the parent and the Chief.

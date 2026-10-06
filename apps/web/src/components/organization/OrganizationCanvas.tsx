@@ -17,10 +17,6 @@ import { CheckIcon } from "lucide-react";
 import { Button } from "~/components/ui/button";
 import { Tooltip, TooltipPopup, TooltipTrigger } from "~/components/ui/tooltip";
 import { canArchiveWorkstream } from "@t3tools/shared/organizationWorkstream";
-import {
-  OrganizationAcceptDialog,
-  type OrganizationAcceptTarget,
-} from "./OrganizationAcceptDialog";
 import { OrganizationArchiveDialog } from "./OrganizationArchiveDialog";
 import { fitOrganization, resizeOrganization, zoomOrganization } from "./organizationCamera";
 import {
@@ -284,9 +280,7 @@ function LeadCard(props: {
   card: OrganizationLeadCard;
   highlightThreadId: string | null;
   onOpenThread: (thread: Shell) => void;
-  onAccept: (target: OrganizationAcceptTarget) => void;
   onArchive: (lead: Shell) => void;
-  acceptDisabled: boolean;
 }) {
   const { card } = props;
   const { lead, outcome } = card;
@@ -312,11 +306,10 @@ function LeadCard(props: {
       </button>
       {outcome ? (
         <div className={styles["org-outcome"]}>
-          Outcome
-          <Pill
-            state={outcome.state}
-            {...(card.canAccept ? { label: "reviewed · awaiting you" } : {})}
-          />
+          {outcome.rounds?.length
+            ? `Outcome · round ${outcome.rounds.at(-1)!.round + 1}`
+            : "Outcome"}
+          <Pill state={outcome.state} {...(card.outcomeWait ? { label: card.outcomeWait } : {})} />
           {outcome.title !== lead.title ? (
             <Truncated className={styles["org-outcome-title"]} text={outcome.title} />
           ) : null}
@@ -331,16 +324,24 @@ function LeadCard(props: {
         />
       ) : null}
       <EarlierRounds rounds={card.outcomeEarlierRounds} onOpenThread={props.onOpenThread} />
-      {card.canAccept ? (
-        <div className={styles["org-accept"]}>
-          <Button
-            size="sm"
-            disabled={props.acceptDisabled}
-            onClick={() => props.onAccept({ threadId: lead.id, revision: outcome!.revision! })}
-          >
-            Accept reviewed outcome
-          </Button>
-        </div>
+      {outcome?.rounds?.length ? (
+        <details className={styles["org-rounds"]}>
+          <summary>
+            {outcome.rounds.length === 1
+              ? "1 earlier round"
+              : `${outcome.rounds.length} earlier rounds`}
+          </summary>
+          {outcome.rounds.map((round) => (
+            <div key={round.round} className={styles["org-review"]}>
+              <span className={styles["org-sub-truncate"]}>
+                round {round.round} · {round.state.replaceAll("_", " ")}
+                {round.pullRequests.length
+                  ? ` · ${round.pullRequests.map((number) => `#${number}`).join(", ")}`
+                  : ""}
+              </span>
+            </div>
+          ))}
+        </details>
       ) : null}
       {canArchiveWorkstream(lead.source) ? (
         <div className={styles["org-accept"]}>
@@ -403,8 +404,6 @@ export function OrganizationCanvas(props: {
   /** The conversation beside the panel, outlined where it appears. */
   highlightThreadId?: string | null;
   onOpenThread: (thread: Shell) => void;
-  /** Disables acceptance when the server cannot take it. */
-  acceptDisabled?: boolean;
 }) {
   const refs = useMemo(
     () => [scopeProjectRef(props.environmentId, props.projectId)],
@@ -415,7 +414,6 @@ export function OrganizationCanvas(props: {
     () => organizationModel(threads, props.environmentId, props.projectId, props.workstream ?? ""),
     [threads, props.environmentId, props.projectId, props.workstream],
   );
-  const [accepting, setAccepting] = useState<OrganizationAcceptTarget | null>(null);
   const [archiving, setArchiving] = useState<Shell | null>(null);
   const highlight = props.highlightThreadId ?? null;
   // Up to three lead cards per row; more wrap onto the next.
@@ -448,9 +446,7 @@ export function OrganizationCanvas(props: {
             card={card}
             highlightThreadId={highlight}
             onOpenThread={props.onOpenThread}
-            onAccept={setAccepting}
             onArchive={setArchiving}
-            acceptDisabled={props.acceptDisabled ?? false}
           />
         ))}
         {model.unassigned.length > 0 ? (
@@ -486,11 +482,6 @@ export function OrganizationCanvas(props: {
           {cards}
         </PannableWorld>
       )}
-      <OrganizationAcceptDialog
-        target={accepting}
-        threads={threads}
-        onClose={() => setAccepting(null)}
-      />
       <OrganizationArchiveDialog
         lead={archiving}
         threads={threads}

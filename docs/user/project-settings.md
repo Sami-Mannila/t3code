@@ -108,7 +108,9 @@ may need the inactivity rule instead.
 Separately from these policies, the server removes a worktree after an hour without activity
 when its thread is settled, or when it belongs to an organization reviewer, lead, or executor
 whose task is not in progress. An executor's submitted or accepted work stays until its lead's
-outcome is accepted or either thread is archived. Unsettled threads keep their worktrees, and
+outcome is accepted or either thread is archived. The server accepts a reviewed outcome when
+every pull request it opened has merged, or right after its independent review when it opened
+none. Unsettled threads keep their worktrees, and
 the same safety checks apply: uncommitted changes, untracked files, and ignored output other
 than `node_modules`, `__pycache__`, or `.venv` keep the checkout.
 

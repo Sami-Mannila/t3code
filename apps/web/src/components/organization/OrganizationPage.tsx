@@ -272,7 +272,6 @@ export function OrganizationPage() {
           environmentId={project.environmentId}
           projectId={project.id}
           workstream={workstream}
-          acceptDisabled={!supported || !connected}
           onOpenThread={(thread) => {
             void navigate({
               to: "/$environmentId/$threadId",

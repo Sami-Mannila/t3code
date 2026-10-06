@@ -6,6 +6,7 @@ import {
   type OrchestrationV2ServerCommand as OrchestrationCommand,
   type OrchestrationProjectShell,
   type ThreadPullRequestLink,
+  type OrganizationThread,
 } from "@t3tools/contracts";
 import { describe, expect, it } from "@effect/vitest";
 import * as Crypto from "effect/Crypto";
@@ -128,6 +129,7 @@ interface HarnessOptions {
   readonly project?: OrchestrationProjectShell | null;
   /** A rejection the orchestrator reports as the dispatch error's cause. */
   readonly reject?: (command: OrchestrationCommand) => string | null;
+  readonly organization?: OrganizationThread;
 }
 
 const makeHarness = Effect.fn("makePullRequestsToolkitHarness")(function* (
@@ -154,7 +156,14 @@ const makeHarness = Effect.fn("makePullRequestsToolkitHarness")(function* (
     }),
     Layer.mock(Orchestrator.OrchestratorV2)({
       getThreadShell: (id) =>
-        Effect.succeed(id === THREAD_ID && thread ? v2PullRequestThread(thread) : null),
+        Effect.succeed(
+          id === THREAD_ID && thread
+            ? {
+                ...v2PullRequestThread(thread),
+                ...(options.organization ? { organization: options.organization } : {}),
+              }
+            : null,
+        ),
       dispatch,
     }),
     Layer.succeed(Crypto.Crypto, testCrypto),
@@ -406,6 +415,20 @@ describe("pull request toolkit handlers", () => {
       expect(yield* Ref.get(harness.commands)).toMatchObject([
         { type: "thread.pull-request.unlink", number: 5 },
       ]);
+    }),
+  );
+
+  it.effect("refuses to unlink on an organization conversation, whose links gate acceptance", () =>
+    Effect.gen(function* () {
+      const harness = yield* makeHarness({
+        thread: makeThread([makeLink(5)]),
+        organization: { role: "executor", parentThreadId: ThreadId.make("lead") },
+      });
+      const error = yield* harness
+        .call("unlink_pull_request", { repository: "t3tools/t3code", number: 5 })
+        .pipe(Effect.flip);
+      expect(error).toMatchObject({ _tag: "PullRequestUnlinkRefusedError" });
+      expect(yield* Ref.get(harness.commands)).toEqual([]);
     }),
   );
 
