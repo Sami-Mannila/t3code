@@ -168,7 +168,6 @@ export interface LocalFileTracerOptions extends TraceSinkOptions {
 export const VERBOSE_TRACE_SPAN_NAMES: ReadonlyArray<string> = [
   "sql.execute",
   "sql.transaction",
-  "db.transaction.commit",
   "OrchestrationEventStore.rowToV2StoredEvent",
 ];
 export const VERBOSE_TRACE_SPAN_PREFIXES: ReadonlyArray<string> = [
