@@ -54,6 +54,8 @@ export class OrganizationOutcomeAcceptanceReactor extends Context.Service<
 
 /** Bursts of task and pull request updates in one project are swept once. */
 const SWEEP_DEBOUNCE = Duration.seconds(3);
+/** A refused acceptance whose inputs did not change is retried once per this window. */
+const ATTEMPT_BUCKET_MS = 3_600_000;
 /** How long a branch's pull request lookup is reused. */
 const BRANCH_LOOKUP_TTL_MS = 60_000;
 
@@ -91,17 +93,31 @@ export const make = Effect.gen(function* () {
   const vcs = yield* GitManager.GitManager;
   const branchLookups = new Map<string, { at: number; value: OutcomePullRequest | null }>();
 
-  /** The pull request open from an implementation task's branch, linked or not. */
-  const branchPullRequest = (thread: OrchestrationV2ThreadShell) =>
+  /**
+   * The pull request open from an implementation task's branch, linked or not. `undefined`
+   * when the host could not be asked: the lead then waits for a later sweep, since only a real
+   * "no pull request" answer may let it through. Failures are not cached.
+   */
+  const branchPullRequest = (
+    thread: OrchestrationV2ThreadShell,
+  ): Effect.Effect<OutcomePullRequest | null | undefined> =>
     Effect.gen(function* () {
       if (!thread.branch || !thread.worktreePath) return null;
       const key = `${thread.worktreePath}\0${thread.branch}`;
       const now = yield* Clock.currentTimeMillis;
       const cached = branchLookups.get(key);
       if (cached && now - cached.at < BRANCH_LOOKUP_TTL_MS) return cached.value;
-      const found = yield* vcs
+      const lookup = yield* vcs
         .branchPullRequest({ cwd: thread.worktreePath, branch: thread.branch })
-        .pipe(Effect.orElseSucceed(() => null));
+        .pipe(Effect.result);
+      if (lookup._tag === "Failure") {
+        yield* Effect.logWarning("Organization branch pull request lookup failed", {
+          threadId: thread.id,
+          cause: lookup.failure,
+        });
+        return undefined;
+      }
+      const found = lookup.success;
       const parsed = found ? parseChangeRequestUrl(found.url) : null;
       const value: OutcomePullRequest | null =
         found === null
@@ -183,13 +199,19 @@ export const make = Effect.gen(function* () {
       const withBranches = yield* Effect.forEach(task.dependencyThreadIds, (id) =>
         Effect.gen(function* () {
           const thread = byId.get(id);
-          if (!thread) return undefined;
-          return { ...outcomeThread(thread), branchPullRequest: yield* branchPullRequest(thread) };
+          if (!thread) return { thread: undefined, unknown: false };
+          const found = yield* branchPullRequest(thread);
+          return {
+            thread: { ...outcomeThread(thread), branchPullRequest: found ?? null },
+            unknown: found === undefined,
+          };
         }),
       );
+      // A branch the host could not be asked about may carry an open pull request.
+      if (withBranches.some((entry) => entry.unknown)) continue;
       const enriched = [
         ...candidates.filter((thread) => !task.dependencyThreadIds.includes(thread.id)),
-        ...withBranches.filter((thread) => thread !== undefined),
+        ...withBranches.flatMap((entry) => (entry.thread ? [entry.thread] : [])),
       ];
       gate = organizationOutcomeGate(outcomeThread(lead), enriched);
       const chief = live.find(
@@ -208,8 +230,9 @@ export const make = Effect.gen(function* () {
         continue;
       }
       if (gate.kind !== "ready") continue;
-      // Each attempt is its own command: the inputs it decided on name it, so a refusal never
-      // blocks a later attempt once its cause is fixed.
+      // Each attempt is its own command: the inputs it decided on and the hour name it. A
+      // refusal the orchestrator records under that id cannot block a later attempt: changed
+      // inputs retry at once, and a transient cause (a file read, a missing worktree) next hour.
       const attempt = digest(
         [
           revision,
@@ -223,6 +246,7 @@ export const make = Effect.gen(function* () {
           ...ownedOutcomePullRequests(outcomeThread(lead), enriched).map(
             (pullRequest) => `${pullRequest.key} ${pullRequest.state}`,
           ),
+          String(Math.floor((yield* Clock.currentTimeMillis) / ATTEMPT_BUCKET_MS)),
         ].join("\n"),
       );
       const note = organizationAcceptanceNote(gate);

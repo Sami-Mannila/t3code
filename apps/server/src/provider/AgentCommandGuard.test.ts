@@ -67,6 +67,19 @@ describe("agent gh shim", () => {
         ["api", "/repos/acme/app/pulls/12/merge", "-f", "merge_method=squash"],
         ["api", "graphql", "-f", "query=mutation { mergePullRequest(input: {}) { x } }"],
         ["api", "graphql", "-f", "query=mutation { enablePullRequestAutoMerge(input: {}) { x } }"],
+        // Flag values between pr and merge do not hide it.
+        ["pr", "-R", "acme/app", "merge", "12"],
+        ["pr", "--repo", "acme/app", "merge", "12"],
+        ["pr", "--repo=acme/app", "merge", "12"],
+        ["pr", "--unknown-flag", "merge"],
+        // Aliases that expand to a merge.
+        ["alias", "set", "ship", "pr merge --squash"],
+        ["alias", "set", "--clobber", "ship", "api repos/acme/app/pulls/12/merge -X PUT"],
+        ["alias", "import", "-"],
+        ["alias", "import"],
+        // The merges API merges a branch into another.
+        ["api", "-X", "POST", "repos/acme/app/merges"],
+        ["api", "repos/acme/app/merges?x=1"],
       ]) {
         const result = yield* gh(...args);
         expect(result.code, args.join(" ")).toBe(1);
@@ -85,6 +98,11 @@ describe("agent gh shim", () => {
         ["pr", "list", "--search", "merge"],
         ["api", "repos/acme/app/pulls/12"],
         ["api", "graphql", "-f", "query={ viewer { login } }"],
+        ["pr", "-R", "acme/app", "view", "12"],
+        ["pr", "create", "--body", "merge"],
+        ["alias", "set", "co", "pr checkout"],
+        ["alias", "list"],
+        ["api", "repos/acme/app/commits"],
       ]) {
         const result = yield* gh(...args);
         expect(result.code, args.join(" ")).toBe(0);

@@ -30,6 +30,7 @@ import {
   RunId,
   RuntimeRequestId,
   ThreadId,
+  TurnItemId,
 } from "@t3tools/contracts";
 import * as DateTime from "effect/DateTime";
 import * as Effect from "effect/Effect";
@@ -2171,6 +2172,97 @@ it.effect(
         assert.equal(content(selfAnswer).code, "capability_denied", actor);
       }
       assert.lengthOf(yield* pending, 3);
+
+      // An agent that may answer (a provider's question, outside the organization) answers as
+      // itself: the answer is its message, not the user's.
+      const now = yield* DateTime.now;
+      const providerRequest = RuntimeRequestId.make("provider-question");
+      const providerNode = NodeId.make("provider-question-node");
+      yield* (yield* EventSink.EventSinkV2).write({
+        commandId: CommandId.make("seed-provider-question"),
+        events: [
+          {
+            id: EventId.make("seed-provider-question-node"),
+            type: "node.updated",
+            threadId: executor,
+            nodeId: providerNode,
+            occurredAt: now,
+            payload: {
+              id: providerNode,
+              threadId: executor,
+              runId: null,
+              parentNodeId: null,
+              rootNodeId: providerNode,
+              kind: "user_input_request",
+              status: "waiting",
+              countsForRun: false,
+              providerThreadId: null,
+              providerTurnId: null,
+              nativeItemRef: null,
+              runtimeRequestId: providerRequest,
+              checkpointScopeId: null,
+              startedAt: now,
+              completedAt: null,
+            },
+          },
+          {
+            id: EventId.make("seed-provider-question-request"),
+            type: "runtime-request.updated",
+            threadId: executor,
+            nodeId: providerNode,
+            occurredAt: now,
+            payload: {
+              id: providerRequest,
+              nodeId: providerNode,
+              providerTurnId: null,
+              nativeRequestRef: { driver, nativeId: "native-question", strength: "strong" },
+              kind: "user_input",
+              status: "pending",
+              responseCapability: { type: "message" },
+              createdAt: now,
+              resolvedAt: null,
+            },
+          },
+          {
+            id: EventId.make("seed-provider-question-item"),
+            type: "turn-item.updated",
+            threadId: executor,
+            nodeId: providerNode,
+            occurredAt: now,
+            payload: {
+              id: TurnItemId.make("provider-question-item"),
+              type: "user_input_request",
+              threadId: executor,
+              runId: null,
+              nodeId: providerNode,
+              providerThreadId: null,
+              providerTurnId: null,
+              nativeItemRef: null,
+              parentItemId: null,
+              ordinal: 999,
+              status: "waiting",
+              title: null,
+              startedAt: now,
+              completedAt: null,
+              updatedAt: now,
+              requestId: providerRequest,
+              responseMode: "message",
+              questions: [{ id: "pick", header: "Pick", question: "Which one?", options: [] }],
+            },
+          },
+        ],
+      });
+      const agentResponse = yield* call(plain, "t3_pending_request_respond", {
+        threadId: executor,
+        requestId: providerRequest,
+        answers: { pick: "the first" },
+      });
+      assert.isFalse(agentResponse.isError);
+      const agentAnswer = (yield* orchestrator.getThreadProjection(executor)).messages.find(
+        (message) => message.id === `async-answer:${providerRequest}`,
+      );
+      assert.equal(agentAnswer?.createdBy, "agent");
+      assert.equal(agentAnswer?.senderThreadId, plain);
 
       yield* orchestrator.dispatch({
         type: "runtime-request.respond",

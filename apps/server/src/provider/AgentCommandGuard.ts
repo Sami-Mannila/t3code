@@ -9,9 +9,10 @@ import * as Path from "effect/Path";
  * otherwise runs the real `gh`. The user's own terminals and the server's own `gh` calls (the
  * user's merge button) keep the real one.
  *
- * Residual risk: an agent can still reach the host API without `gh` (curl with a token, a
- * different CLI, a GraphQL query read from a file). The shim stops the ordinary path and says
- * why; it is not a sandbox.
+ * It is not a sandbox; it stops the ordinary path and says why. Known ways around it: the host
+ * API without `gh` (curl with a token, another CLI, a query read from a file), `git push` to the
+ * base branch, the real `gh` by absolute path, aliases the user defined before, and shells whose
+ * login profile prepends its own PATH (on macOS `brew shellenv` can put Homebrew's `gh` first).
  */
 export const AGENT_MERGE_REFUSAL =
   "Merging is reserved for the user; ask the Chief to request a merge.";
@@ -25,25 +26,69 @@ refuse() {
   echo "${AGENT_MERGE_REFUSAL}" >&2
   exit 1
 }
-positional=()
-for arg in "$@"; do
-  case "$arg" in
-    -*) ;;
-    *) positional+=("$arg") ;;
+# Flags whose value is the next argument; a value is never a command word.
+takes_value() {
+  case "$1" in
+    -R|--repo|--hostname|-X|--method|-H|--header|-f|--raw-field|-F|--field|--input|-q|--jq|-t|--template|--title|-b|--body|--body-file|-B|--base|--head|-l|--label|-a|--assignee|-r|--reviewer|-m|--milestone|-p|--project|-S|--search|-s|--state|-L|--limit|-A|--author|--json|--subject|--match-head-commit|--cache|--preview) return 0 ;;
   esac
+  return 1
+}
+args=("$@")
+count=\${#args[@]}
+words=()
+i=0
+while [ "$i" -lt "$count" ]; do
+  arg="\${args[i]}"
+  case "$arg" in
+    --)
+      i=$((i + 1))
+      while [ "$i" -lt "$count" ]; do
+        words+=("\${args[i]}")
+        i=$((i + 1))
+      done
+      ;;
+    --*=* | -?=*) ;;
+    -*) if takes_value "$arg"; then i=$((i + 1)); fi ;;
+    *) words+=("$arg") ;;
+  esac
+  i=$((i + 1))
 done
-for ((i = 0; i + 1 < \${#positional[@]}; i++)); do
-  if [ "\${positional[i]}" = "pr" ] && [ "\${positional[i + 1]}" = "merge" ]; then
-    refuse
-  fi
-done
-if [ "\${positional[0]}" = "api" ]; then
-  for arg in "$@"; do
-    case "$arg" in
-      *pulls/*/merge*|*mergePullRequest*|*enablePullRequestAutoMerge*) refuse ;;
+mentions_merge() {
+  case "$1" in
+    *merge* | *Merge* | *MERGE*) return 0 ;;
+  esac
+  return 1
+}
+case "\${words[0]}" in
+  pr)
+    # "merge" anywhere after pr, flag values aside: gh pr -R o/r merge, gh pr --repo o/r merge.
+    for word in "\${words[@]:1}"; do
+      [ "$word" = "merge" ] && refuse
+    done
+    ;;
+  alias)
+    # An alias that expands to a merge would run it under another name.
+    case "\${words[1]}" in
+      set)
+        for arg in "\${args[@]}"; do mentions_merge "$arg" && refuse; done
+        ;;
+      import)
+        [ "\${#words[@]}" -le 2 ] && refuse
+        for word in "\${words[@]:2}"; do
+          [ "$word" = "-" ] && refuse
+          [ -f "$word" ] && grep -qi merge "$word" && refuse
+        done
+        ;;
     esac
-  done
-fi
+    ;;
+  api)
+    for arg in "\${args[@]}"; do
+      case "$arg" in
+        *pulls/*/merge* | */merges | */merges[?]* | *mergePullRequest* | *enablePullRequestAutoMerge*) refuse ;;
+      esac
+    done
+    ;;
+esac
 guard_dir="\${${SHIM_DIRECTORY_VARIABLE}:-$(cd "$(dirname "$0")" && pwd)}"
 IFS=: read -r -a entries <<< "$PATH"
 for entry in "\${entries[@]}"; do

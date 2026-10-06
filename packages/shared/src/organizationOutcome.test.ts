@@ -74,6 +74,29 @@ describe("organization outcome gate", () => {
     });
   });
 
+  it("treats a server shell's epoch-dated legacy entry as a link of unknown time", () => {
+    // Server shells always fill pullRequests; a legacy link appears there linked at the epoch.
+    const entry = {
+      host: "github.com",
+      repository: "acme/app",
+      number: 7,
+      url: legacyLink.url,
+      source: "manual" as const,
+      linkedAt: "1970-01-01T00:00:00.000Z",
+      snapshot: null,
+      stack: null,
+    };
+    const owned = threads({ pullRequests: [entry] }, { pullRequests: [] });
+    expect(organizationOutcomeGate(owned.lead, owned.all)).toMatchObject({
+      kind: "waiting_for_pull_requests",
+      pullRequests: [{ number: 7 }],
+    });
+    const inherited = threads({ pullRequests: [entry] }, { pullRequests: [entry] });
+    expect(organizationOutcomeGate(inherited.lead, inherited.all)).toMatchObject({
+      kind: "ready",
+    });
+  });
+
   it("holds the outcome on an executor branch's pull request nobody linked", () => {
     const { lead: leadThread, all } = threads({ pullRequests: [] });
     const withBranch = all.map((thread) =>

@@ -83,16 +83,18 @@ export function ownedOutcomePullRequests(
   const linkKeys = (thread: OutcomeThread | undefined) =>
     new Set(thread ? threadPullRequestsOf(thread).map(threadPullRequestKeyOf) : []);
   for (const owner of owners) {
-    // A legacy single link has no link time. On the lead it counts unless its parent holds the
-    // same link (inherited); it then holds acceptance until it syncs, which is the safe side.
-    const legacy = owner.pullRequests === undefined && owner === lead;
-    const inherited = legacy
-      ? linkKeys(byId.get(owner.organization?.parentThreadId ?? ("" as ThreadId)))
-      : new Set<string>();
-    const links = legacy ? threadPullRequestsOf(owner) : (owner.pullRequests ?? []);
-    for (const link of visibleThreadPullRequests(links)) {
+    const parent = byId.get(owner.organization?.parentThreadId ?? ("" as ThreadId));
+    let inherited: Set<string> | undefined;
+    for (const link of visibleThreadPullRequests(threadPullRequestsOf(owner))) {
       const key = threadPullRequestKeyOf(link);
-      if (legacy ? inherited.has(key) : Date.parse(link.linkedAt) < since(owner)) continue;
+      const linkedAtMs = Date.parse(link.linkedAt);
+      // A legacy single link carries the epoch (or nothing) as its link time: the time is
+      // unknown. It counts unless the parent holds the same link, which means it was inherited;
+      // an owned one holds acceptance until it syncs, which is the safe side.
+      if (linkedAtMs === 0 || Number.isNaN(linkedAtMs)) {
+        inherited ??= linkKeys(parent);
+        if (inherited.has(key)) continue;
+      } else if (linkedAtMs < since(owner)) continue;
       add({ key, number: link.number, state: link.snapshot?.state ?? "unknown" });
     }
     if (owner !== lead && owner.branchPullRequest) add(owner.branchPullRequest);
