@@ -52,6 +52,18 @@ describe("applyUsageLimitsUpdate", () => {
     });
   });
 
+  it("fills an empty available snapshot from the first streamed window", () => {
+    // A Team account's probe publishes `{ windows: [] }` with no `unavailable`;
+    // the mid-turn event must be allowed to establish the rows.
+    const empty = { checkedAt, windows: [] };
+    const next = applyUsageLimitsUpdate({
+      previous: empty,
+      checkedAt: "2026-09-03T12:00:05.000Z",
+      update: { windows: [session] },
+    });
+    expect(next).toEqual({ checkedAt: "2026-09-03T12:00:05.000Z", windows: [session] });
+  });
+
   it("leaves an unsupported account and an empty update alone", () => {
     const unsupported = { checkedAt, windows: [], unavailable: { reason: "unsupported" as const } };
     expect(
@@ -85,5 +97,28 @@ describe("resolveUsageLimitsAfterProbe", () => {
     expect(resolveUsageLimitsAfterProbe({ published, probed: failed })).toBe(published);
     expect(resolveUsageLimitsAfterProbe({ published, probed: unsupported })).toBe(unsupported);
     expect(resolveUsageLimitsAfterProbe({ published: undefined, probed: failed })).toBe(failed);
+  });
+
+  it("keeps streamed windows when an available probe reports none", () => {
+    // A Team account's periodic get_usage returns `available: true` with no
+    // windows; that refresh must not wipe the rows a turn already streamed.
+    const probed = {
+      checkedAt: "2026-09-03T12:05:00.000Z",
+      windows: [],
+      resetCredits: { availableCount: 1 },
+    };
+    expect(resolveUsageLimitsAfterProbe({ published, probed })).toEqual({
+      ...published,
+      checkedAt: "2026-09-03T12:05:00.000Z",
+      resetCredits: { availableCount: 1 },
+    });
+  });
+
+  it("lets an available probe with windows replace the published ones", () => {
+    const probed = {
+      checkedAt: "2026-09-03T12:05:00.000Z",
+      windows: [{ ...session, usedPercent: 70 }],
+    };
+    expect(resolveUsageLimitsAfterProbe({ published, probed })).toBe(probed);
   });
 });
