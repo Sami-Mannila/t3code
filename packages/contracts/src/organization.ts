@@ -65,6 +65,11 @@ export const OrganizationTask = Schema.Struct({
   ),
   ownerThreadId: ThreadId,
   dependencyThreadIds: Schema.Array(ThreadId),
+  /**
+   * A research-only lead outcome's artifact: its findings text. Submitted when a lead has no
+   * implementation tasks, and the outcome's revision is a hash of it. Absent on other tasks.
+   */
+  findings: Schema.optional(TrimmedNonEmptyString.check(Schema.isMaxLength(20_000))),
   state: Schema.Literals([
     "queued",
     "working",

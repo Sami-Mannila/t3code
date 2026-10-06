@@ -613,43 +613,62 @@ const make = Effect.gen(function* () {
           const missing = submission
             ? undefined
             : [...reviewedSet].find((id) => !children.some((child) => child.id === id));
-          if (!children.length || unready || missing)
+          if (missing)
             return yield* new Orchestrator.OrchestratorDispatchError({
               commandId: command.commandId,
               commandType: command.type,
-              cause: unready
-                ? `Outcome consolidation requires independently accepted implementation artifacts; "${unready.title}" is ${unready.organization?.task?.state.replaceAll("_", " ") ?? "missing"}${unready.worktreePath ? "" : " and has no worktree"}.`
-                : missing
-                  ? `Outcome consolidation requires its reviewed implementation task ${missing}, which is no longer an executor under this lead.`
-                  : "Outcome consolidation requires independently accepted implementation artifacts.",
+              cause: `Outcome consolidation requires its reviewed implementation task ${missing}, which is no longer an executor under this lead.`,
             });
-          const digest = NodeCrypto.createHash("sha256");
-          const files: Array<{ path: string; sha256: string; bytes: number }> = [];
-          dependencyThreadIds.splice(
-            0,
-            dependencyThreadIds.length,
-            ...children.map((child) => child.id),
-          );
-          for (const child of children) {
-            const checked = yield* readArtifacts(
-              child.worktreePath!,
-              child.organization!.task!.manifest ?? [],
-            );
-            if (
-              checked.revision !== child.organization!.task!.revision ||
-              checked.revision !== child.organization!.task!.reviewedRevision
-            )
+          if (children.length && unready)
+            return yield* new Orchestrator.OrchestratorDispatchError({
+              commandId: command.commandId,
+              commandType: command.type,
+              cause: `Outcome consolidation requires independently accepted implementation artifacts; "${unready.title}" is ${unready.organization?.task?.state.replaceAll("_", " ") ?? "missing"}${unready.worktreePath ? "" : " and has no worktree"}.`,
+            });
+          if (!children.length) {
+            // A lead with no implementation children submits a research outcome: its findings are
+            // the artifact. The revision is a hash of them, so editing findings after submission
+            // invalidates the review, and re-verification recomputes the same revision.
+            if (!task.findings)
               return yield* new Orchestrator.OrchestratorDispatchError({
                 commandId: command.commandId,
                 commandType: command.type,
-                cause: "A reviewed child artifact changed; return it to its executor and reviewer.",
+                cause:
+                  "A lead with no implementation tasks submits its findings; pass findings to t3_organization_task(action=submit).",
               });
-            digest.update(child.id).update("\0").update(checked.revision).update("\0");
-            files.push(
-              ...checked.files.map((file) => ({ ...file, path: `${child.id}/${file.path}` })),
+            const digest = NodeCrypto.createHash("sha256");
+            digest.update("research-findings\0").update(task.findings);
+            evidence = { revision: digest.digest("hex"), files: [] };
+          } else {
+            const digest = NodeCrypto.createHash("sha256");
+            const files: Array<{ path: string; sha256: string; bytes: number }> = [];
+            dependencyThreadIds.splice(
+              0,
+              dependencyThreadIds.length,
+              ...children.map((child) => child.id),
             );
+            for (const child of children) {
+              const checked = yield* readArtifacts(
+                child.worktreePath!,
+                child.organization!.task!.manifest ?? [],
+              );
+              if (
+                checked.revision !== child.organization!.task!.revision ||
+                checked.revision !== child.organization!.task!.reviewedRevision
+              )
+                return yield* new Orchestrator.OrchestratorDispatchError({
+                  commandId: command.commandId,
+                  commandType: command.type,
+                  cause:
+                    "A reviewed child artifact changed; return it to its executor and reviewer.",
+                });
+              digest.update(child.id).update("\0").update(checked.revision).update("\0");
+              files.push(
+                ...checked.files.map((file) => ({ ...file, path: `${child.id}/${file.path}` })),
+              );
+            }
+            evidence = { revision: digest.digest("hex"), files };
           }
-          evidence = { revision: digest.digest("hex"), files };
         } else evidence = yield* readArtifacts(current.thread.worktreePath!, task.manifest ?? []);
         if (!submission && evidence.revision !== previous?.revision)
           return yield* new Orchestrator.OrchestratorDispatchError({

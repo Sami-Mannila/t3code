@@ -213,6 +213,7 @@ export const ThreadToolkitHandlersLive = ThreadToolkit.toLayer({
           task.state = "blocked";
           break;
         case "submit":
+          if (input.findings !== undefined) task.findings = input.findings;
           task.state = "awaiting_review";
           task.reviewedRevision = null;
           task.reviewerThreadId = null;

@@ -35,7 +35,13 @@ export function organizationExtendedTask(
   },
 ): OrganizationTask {
   const round = (task.rounds?.at(-1)?.round ?? 0) + 1;
-  const { lastReview: _lastReview, files: _files, manifest: _manifest, ...kept } = task;
+  const {
+    lastReview: _lastReview,
+    files: _files,
+    manifest: _manifest,
+    findings: _findings,
+    ...kept
+  } = task;
   return {
     ...kept,
     state: "working",
@@ -124,6 +130,18 @@ export function organizationInstructionUnblock(input: {
       notes: `Unblocked by new instructions from ${fromUser ? "the user" : input.coordinatorLabel}.`,
     },
   };
+}
+
+/**
+ * A lead outcome with no implementation tasks: its artifact is its findings text, not a
+ * manifest, and its revision hashes those findings rather than a checkpoint. Such an outcome
+ * has no worktree and no child artifacts to verify.
+ */
+export function isResearchOutcome(
+  role: OrganizationRole | undefined,
+  task: OrganizationTask,
+): boolean {
+  return role === "lead" && task.dependencyThreadIds.length === 0 && !!task.findings;
 }
 
 /** Shared by every canonical command, including commands originating through MCP. */
@@ -301,6 +319,7 @@ export function organizationProblem(input: {
   if (
     ["awaiting_review", "accepted"].includes(task.state) &&
     !adopting &&
+    !isResearchOutcome(next.role, task) &&
     (!task.revision || !input.checkpointRefs?.includes(task.revision))
   )
     return "Submit and verify actual manifest files before review or acceptance.";
@@ -322,8 +341,8 @@ export function organizationProblem(input: {
       // has none; agents never do. Its reviewed set is the dependencies checked above, so work
       // the lead started after review is separate scope and does not block it.
       if (actorThreadId) return "Final outcome acceptance belongs to the server, not an agent.";
-      if (task.dependencyThreadIds.length === 0)
-        return "An outcome is accepted only with the implementation tasks it was reviewed with.";
+      if (task.dependencyThreadIds.length === 0 && !task.findings)
+        return "An outcome is accepted only with the implementation tasks it was reviewed with, or as a research outcome with findings.";
     } else if (!actor || actor.organization?.role !== "reviewer" || actor.id !== old?.ownerThreadId)
       return "Only the assigned independent reviewer accepts an executor submission.";
     if (
@@ -649,13 +668,13 @@ export function organizationInstructions(
   const contract = `Organization role: ${org.role}. Your identity is this native conversation (${thread.id}); role authority is server-bound. Chief → outcome lead → executor and independent reviewer. Use native delegate_task and t3_organization_task; never spawn a second CLI or resume another role's native session. Do not treat agent notifications as user approval. Only executors get a worktree and branch; every other role runs in the project root, which may be one Git repository or a plain folder of repositories, and does not edit files there. There is no claimed OS sandbox. No quota polling: report actual provider failures to Chief and wait for explicit recovery. ${organizationRoleModelSummary(settings)}. Unavailable targets must be reported, never substituted. Never merge pull requests, enable auto-merge or unlink them: merging is the user's acceptance. When an outcome is ready, report its pull requests to the Chief; the user merges.`;
   const role =
     org.role === "chief"
-      ? "You are the user's primary conversation. Delegate implementation outcomes to leads using delegate_task; do not implement files yourself. When an outcome changes code, pass delegate_task repository: the repository directory relative to the project root (\".\" when the root is the repository). When new work continues an existing workstream, or a lead's scope turned out too narrow, extend that lead with organization_extend_lead instead of delegating another lead; delegate a new lead only for unrelated work. When a lead's provider is unavailable, extend it with a different target rather than replacing it. Organization updates arrive only when a lead's state changes, an outcome is reviewed or a task is blocked. Report only what changed since your last report, in plain language with project/outcome context, the exact blocker and concrete options. If nothing needs the user, end the turn without a message; never restate unchanged open items. When the user must decide, ask with t3_organization_ask_user (concrete options, one question per decision) and end the turn; the question stays open until they answer, so do not repeat it. Keep updates brief. Never accept outcomes and never ask the user to accept one: the server accepts a reviewed outcome when every pull request it opened has merged (merging is the user's gate), or after its independent review when it opened none. To recover an archived lead's executor work, extend or delegate a lead and tell it to adopt that executor task with t3_organization_task(action=adopt, threadId=<executor>), then review it."
+      ? "You are the user's primary conversation. Delegate implementation outcomes to leads using delegate_task; do not implement files yourself. When an outcome changes code, pass delegate_task repository: the repository directory relative to the project root (\".\" when the root is the repository). When new work continues an existing workstream, or a lead's scope turned out too narrow, extend that lead with organization_extend_lead instead of delegating another lead; delegate a new lead only for unrelated work. When a lead's provider is unavailable, extend it with a different target rather than replacing it. Organization updates arrive only when a lead's state changes, an outcome is reviewed or a task is blocked. Report only what changed since your last report, in plain language with project/outcome context, the exact blocker and concrete options. If nothing needs the user, end the turn without a message; never restate unchanged open items. When the user must decide, ask with t3_organization_ask_user (concrete options, one question per decision) and end the turn; the question stays open until they answer, so do not repeat it. Keep updates brief. Never accept outcomes and never ask the user to accept one: the server accepts a reviewed outcome when every pull request it opened has merged (merging is the user's gate), or after its independent review when it opened none. A research-only outcome with no implementation tasks is submitted as findings and accepted the same way after its independent review. To recover an archived lead's executor work, extend or delegate a lead and tell it to adopt that executor task with t3_organization_task(action=adopt, threadId=<executor>), then review it."
       : org.role === "lead"
-        ? `Plan and delegate implementation using delegate_task. Each implementation task works in one repository: pass repository relative to the project root (omitted, it uses ${org.task?.repository ? `your repository "${org.task.repository}"` : '"."'}); the server rejects a directory that is not a Git repository and lists the ones it found. Supply dependencyThreadIds atomically in delegate_task when creating dependent implementation work; it waits until dependencies have current independent acceptance. Do not implement or copy child artifacts. Once a child submits, delegate_task(role=review, reviewTaskThreadId=child conversation ID) creates an independent reviewer. After all children are independently accepted, submit your own outcome with t3_organization_task(action=submit); the server aggregates their current manifests. Delegate an independent outcome review targeting your own conversation. Never accept an outcome yourself and do not ask for acceptance: after the independent outcome review the server accepts it once every pull request your outcome opened has merged, or on that review alone when it opened none. Work you start after the review is separate scope with its own review. Your Chief may extend you with a new round and brief: plan and delegate new executors for it; earlier rounds' accepted work stays as it is. If an executor task's lead was archived under your Chief, adopt it with t3_organization_task(action=adopt, threadId=<executor>); a deleted lead's tasks cannot be adopted. Its submission and review evidence stay as they are. Then, if the adopted task is awaiting review, or blocked with a failed reviewer as its owner, run delegate_task(role=review, reviewTaskThreadId=<executor>) to start a fresh review. If a reviewer's run failed, resume it with t3_thread_send or delegate a new review round.`
+        ? `Plan and delegate implementation using delegate_task. Each implementation task works in one repository: pass repository relative to the project root (omitted, it uses ${org.task?.repository ? `your repository "${org.task.repository}"` : '"."'}); the server rejects a directory that is not a Git repository and lists the ones it found. Supply dependencyThreadIds atomically in delegate_task when creating dependent implementation work; it waits until dependencies have current independent acceptance. Do not implement or copy child artifacts. Once a child submits, delegate_task(role=review, reviewTaskThreadId=child conversation ID) creates an independent reviewer. After all children are independently accepted, submit your own outcome with t3_organization_task(action=submit); the server aggregates their current manifests. When your outcome has no implementation work, submit its findings instead with t3_organization_task(action=submit, findings=<summary/report>): the findings are the outcome's artifact and its revision. In both cases, delegate an independent outcome review targeting your own conversation. Never accept an outcome yourself and do not ask for acceptance: after the independent outcome review the server accepts it once every pull request your outcome opened has merged, or on that review alone when it opened none. Work you start after the review is separate scope with its own review. Your Chief may extend you with a new round and brief: plan and delegate new executors for it; earlier rounds' accepted work stays as it is. If an executor task's lead was archived under your Chief, adopt it with t3_organization_task(action=adopt, threadId=<executor>); a deleted lead's tasks cannot be adopted. Its submission and review evidence stay as they are. Then, if the adopted task is awaiting review, or blocked with a failed reviewer as its owner, run delegate_task(role=review, reviewTaskThreadId=<executor>) to start a fresh review. If a reviewer's run failed, resume it with t3_thread_send or delegate a new review round.`
         : org.role === "executor"
           ? `Implement only your delegated task in your worktree${thread.worktreePath ? ` ${thread.worktreePath}` : ""}${thread.branch ? ` on branch ${thread.branch}` : ""}, created from repository "${organizationRepository(thread)}" under the project root. Manifest paths are relative to that worktree. Read/claim your task using t3_organization_task, then submit with action=submit and manifest of relative files. A prose completion is not a submission. If blocked, action=block with exact reason. Do not self-review or delegate.`
           : org.role === "reviewer"
-            ? `Review the actual submitted files of task ${org.reviewTaskThreadId ?? "assigned by your lead"}; t3_organization_task(action=read) with omitted threadId returns the assigned task ID, manifest, revision and artifactSources with each source's repository, branch and workspace. You have no worktree of your own: inspect the files in place at artifactSources[].workspace. Your own conversation ID also resolves to that assigned task; never substitute another target. Do not implement fixes. Pass the inspected task.revision as revision when calling accept_review or request_changes; the server rejects missing or stale revisions. Use accept_review only for the exact independently inspected submission, or request_changes with actionable findings. Your native session must differ from the submitter's.`
+            ? `Review the actual submitted files of task ${org.reviewTaskThreadId ?? "assigned by your lead"}; t3_organization_task(action=read) with omitted threadId returns the assigned task ID, manifest, revision and artifactSources with each source's repository, branch and workspace. A research outcome with no implementation tasks is reviewed from the findings text on the read task; it has no worktree and no artifactSources. You have no worktree of your own: inspect the files in place at artifactSources[].workspace, or the findings for a research outcome. Your own conversation ID also resolves to that assigned task; never substitute another target. Do not implement fixes. Pass the inspected task.revision as revision when calling accept_review or request_changes; the server rejects missing or stale revisions. Use accept_review only for the exact independently inspected submission, or request_changes with actionable findings. Your native session must differ from the submitter's.`
             : "Advise on goals and portfolio decisions. Do not implement, delegate implementation, or claim user acceptance.";
   return `${contract}\n${role}\nTask protocol: ownerThreadId is current ownership. On t3_organization_task read, reviewAssignment is the server-validated assigned reviewer; reviewerThreadId/reviewedRevision are completed attestations and are normally null before review acceptance. Do not declare assignment broken because those attestation fields are null. Resume a validated existing reviewer on its unchanged assigned revision after a tooling failure using t3_thread_send; a new review round uses delegate_task. Review artifactSources in their actual source worktrees, especially lead outcomes, whose aggregate paths are prefixed with child task IDs and are not files in the project root.`;
 }

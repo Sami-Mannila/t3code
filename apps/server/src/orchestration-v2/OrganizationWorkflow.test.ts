@@ -1,4 +1,5 @@
 import { organizationTaskContext } from "./OrganizationTaskContext.ts";
+import * as NodeCrypto from "node:crypto";
 import {
   organizationInstructions,
   organizationPreparationBlock,
@@ -1028,6 +1029,252 @@ it.effect(
       assert.equal(
         aggregate.artifactSources[0]?.acceptedRevision,
         approved.reviewAttestation?.revision,
+      );
+    }).pipe(
+      Effect.provide(
+        Layer.mergeAll(ProcessRunner.layer, NativeToolkitLayer).pipe(
+          Layer.provideMerge(NodeServices.layer),
+        ),
+      ),
+    ),
+);
+
+it.effect(
+  "a research-only lead outcome is submitted as findings, independently reviewed and accepted without a worktree",
+  () =>
+    Effect.gen(function* () {
+      const orchestrator = yield* Orchestrator.OrchestratorV2;
+      const threads = yield* ThreadManagement.ThreadManagementService;
+      const projects = yield* ProjectService.ProjectService;
+      const sink = yield* EventSink.EventSinkV2;
+      const fs = yield* FileSystem.FileSystem;
+      const workspace = yield* fs.makeTempDirectoryScoped();
+      const projectId = ProjectId.make("research-outcome-project");
+      yield* projects.create({
+        commandId: CommandId.make("research-outcome-project"),
+        projectId,
+        title: "Research outcome",
+        workspaceRoot: workspace,
+      });
+      const chief = ThreadId.make("research-chief");
+      const lead = ThreadId.make("research-lead");
+      const gateLead = ThreadId.make("research-gate-lead");
+      const gateExecutor = ThreadId.make("research-gate-executor");
+      const emptyTask = (id: ThreadId): OrganizationTask => ({
+        title: `${id} work`,
+        ownerThreadId: id,
+        dependencyThreadIds: [],
+        state: "queued",
+        revision: null,
+        reviewedRevision: null,
+        reviewerThreadId: null,
+        notes: null,
+      });
+      const create = (id: ThreadId, organization: OrganizationThread) =>
+        orchestrator.dispatch({
+          type: "thread.create",
+          commandId: CommandId.make(`research-create-${id}`),
+          threadId: id,
+          projectId,
+          title: id,
+          modelSelection,
+          runtimeMode: "full-access",
+          interactionMode: "default",
+          branch: null,
+          worktreePath: null,
+          createdBy: "user",
+          creationSource: "web",
+          organization,
+        });
+      yield* create(chief, { role: "chief", parentThreadId: null });
+      yield* create(lead, { role: "lead", parentThreadId: chief, task: emptyTask(lead) });
+      yield* create(gateLead, { role: "lead", parentThreadId: chief, task: emptyTask(gateLead) });
+      yield* create(gateExecutor, {
+        role: "executor",
+        parentThreadId: gateLead,
+        task: emptyTask(gateExecutor),
+      });
+      // A lead run is required to delegate its own outcome review.
+      yield* orchestrator.dispatch({
+        type: "message.dispatch",
+        commandId: CommandId.make("research-lead-run"),
+        threadId: lead,
+        messageId: MessageId.make("research-lead-run"),
+        text: "Research the question and submit findings",
+        attachments: [],
+        dispatchMode: { type: "start_immediately" },
+        createdBy: "user",
+        creationSource: "web",
+      });
+      const server = yield* McpServer.McpServer;
+      const invoke = (args: Record<string, unknown>, actorId: ThreadId) =>
+        server.callTool({ name: "t3_organization_task", arguments: args }).pipe(
+          Effect.provideService(McpInvocationContext.McpInvocationContext, {
+            environmentId: EnvironmentId.make("organization-test"),
+            threadId: actorId,
+            providerSessionId: `research-${actorId}-session`,
+            providerInstanceId: modelSelection.instanceId,
+            capabilities: new Set(["orchestration"] as const),
+            issuedAt: 1,
+          }),
+          Effect.provideService(McpSchema.McpServerClient, mcpClient),
+        );
+
+      // A lead with no children and no findings is rejected with a message that says to pass them.
+      const noFindings = yield* invoke(
+        { action: "submit", clientRequestId: "research-submit-empty" },
+        lead,
+      );
+      assert.equal((noFindings.structuredContent as { code?: string }).code, "orchestration_error");
+      assert.include(
+        (noFindings.structuredContent as { message?: string }).message ?? "",
+        "submits its findings",
+      );
+      assert.equal(
+        (yield* threads.getThreadProjection(lead)).thread.organization!.task!.state,
+        "queued",
+      );
+
+      // A lead with an unaccepted executor child is still refused by the children gate, even
+      // when it passes findings.
+      const gated = yield* threads
+        .dispatch({
+          type: "thread.metadata.update",
+          commandId: CommandId.make("research-gate-submit"),
+          threadId: gateLead,
+          organizationActorThreadId: gateLead,
+          organization: {
+            ...(yield* threads.getThreadProjection(gateLead)).thread.organization!,
+            task: {
+              ...emptyTask(gateLead),
+              findings: "Findings that do not bypass the children gate.",
+              state: "awaiting_review",
+            },
+          },
+        })
+        .pipe(Effect.result);
+      assert.equal(gated._tag, "Failure");
+      if (gated._tag === "Failure" && gated.failure._tag === "OrchestratorDispatchError")
+        assert.include(
+          String(gated.failure.cause),
+          "independently accepted implementation artifacts",
+        );
+      else assert.fail("Expected the children gate to refuse a lead with an unaccepted executor");
+
+      const findings = "The answer is 42.\n\nEvidence: the linked report, sections 2 and 3.";
+      const submitted = yield* invoke(
+        { action: "submit", findings, clientRequestId: "research-submit" },
+        lead,
+      );
+      assert.equal((submitted.structuredContent as { threadId?: string }).threadId, lead);
+      const afterSubmit = (yield* threads.getThreadProjection(lead)).thread.organization!.task!;
+      assert.equal(afterSubmit.state, "awaiting_review");
+      assert.equal(afterSubmit.findings, findings);
+      assert.equal(afterSubmit.revision?.length, 64);
+      assert.deepEqual(afterSubmit.dependencyThreadIds, []);
+      assert.deepEqual(afterSubmit.files ?? [], []);
+      assert.equal(
+        afterSubmit.revision,
+        NodeCrypto.createHash("sha256")
+          .update("research-findings\0")
+          .update(findings)
+          .digest("hex"),
+      );
+
+      // The lead dispatches an independent outcome review targeting itself.
+      const parent = yield* orchestrator.getThreadProjection(lead);
+      const run = parent.runs[0]!;
+      const reviewResult = yield* orchestrator.dispatch({
+        type: "delegated_task.request",
+        commandId: CommandId.make("research-review"),
+        parentThreadId: lead,
+        parentRunId: run.id,
+        parentNodeId: run.rootNodeId!,
+        task: "Independently review the research findings",
+        title: "Research review",
+        modelSelection,
+        runtimeMode: "full-access",
+        interactionMode: "default",
+        createdBy: "agent",
+        creationSource: "mcp",
+        organizationReview: true,
+        organizationReviewTaskThreadId: lead,
+      });
+      const reviewerId = reviewResult.storedEvents.find(
+        (event) => event.event.type === "thread.created",
+      )!.event.threadId;
+      // The reviewer must be a distinct recorded native provider conversation.
+      const now = yield* DateTime.now;
+      for (const [id, nativeId] of [
+        [lead, "research-native-lead"],
+        [reviewerId, "research-native-reviewer"],
+      ] as const) {
+        yield* sink.write({
+          commandId: CommandId.make(`research-native-${id}`),
+          events: [
+            {
+              id: EventId.make(`research-native-${id}`),
+              type: "provider-thread.updated",
+              threadId: id,
+              driver,
+              providerInstanceId: modelSelection.instanceId,
+              occurredAt: now,
+              payload: {
+                id: ProviderThreadId.make(`research-provider-${id}`),
+                driver,
+                providerInstanceId: modelSelection.instanceId,
+                providerSessionId: null,
+                appThreadId: id,
+                ownerNodeId: NodeId.make(`research-node-${id}`),
+                nativeThreadRef: { driver, nativeId, strength: "strong" },
+                nativeConversationHeadRef: null,
+                status: "active",
+                firstRunOrdinal: 1,
+                lastRunOrdinal: 1,
+                handoffIds: [],
+                forkedFrom: null,
+                createdAt: now,
+                updatedAt: now,
+              },
+            },
+          ],
+        });
+      }
+
+      const read = yield* invoke({ action: "read", clientRequestId: "research-read" }, reviewerId);
+      const context = read.structuredContent as {
+        threadId: string;
+        organization: OrganizationThread;
+      } & ReturnType<typeof organizationTaskContext>;
+      assert.equal(context.threadId, lead);
+      assert.equal(context.organization.task?.findings, findings);
+      assert.equal(context.reviewAssignment?.reviewerThreadId, reviewerId);
+      assert.equal(context.reviewAssignment?.revision, afterSubmit.revision);
+      assert.deepEqual(context.artifactSources, []);
+
+      const acceptedReview = yield* invoke(
+        {
+          action: "accept_review",
+          revision: afterSubmit.revision,
+          notes: "Reviewed the findings independently.",
+          clientRequestId: "research-accept-review",
+        },
+        reviewerId,
+      );
+      assert.equal((acceptedReview.structuredContent as { threadId?: string }).threadId, lead);
+      const reviewed = (yield* threads.getThreadProjection(lead)).thread.organization!.task!;
+      assert.equal(reviewed.state, "awaiting_review");
+      assert.equal(reviewed.reviewedRevision, afterSubmit.revision);
+      assert.equal(reviewed.reviewerThreadId, reviewerId);
+
+      // The server accepts the reviewed outcome on its review alone: it opened no pull request.
+      const reactor = yield* makeReactor;
+      yield* reactor.sweep();
+      const accepted = (yield* threads.getThreadProjection(lead)).thread.organization!.task!;
+      assert.equal(accepted.state, "accepted");
+      assert.equal(
+        accepted.notes,
+        "Accepted after independent review; no pull request was opened.",
       );
     }).pipe(
       Effect.provide(

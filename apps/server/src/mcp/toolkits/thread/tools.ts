@@ -264,7 +264,7 @@ const ScheduledTaskRunTool = Tool.make("run_scheduled_task_now", {
 const OrganizationTaskTool = Tool.make("t3_organization_task", {
   ...commandTool,
   description:
-    "Read or update a canonical organization task. Actor identity is bound to this conversation. Omit threadId to use your task; reviewers automatically target their explicitly assigned submission (their own conversation ID is an alias for that target). Other reviewer targets are rejected. Submit hashes actual manifest files; reviewers must supply the exact revision returned by read when calling accept_review or request_changes; mismatched revisions are rejected; the server accepts a reviewed lead outcome when every pull request it opened has merged, or after that review when it opened none; agents never accept outcomes. Read results distinguish reviewAssignment (current assigned reviewer) from reviewAttestation (completed review); null task.reviewerThreadId is normal before acceptance. artifactSources gives each source's repository (relative to the project root), branch and physical worktree location, including child sources for a consolidated outcome. A lead may adopt an executor task whose parent lead was archived under the same Chief (action='adopt'), which changes only its reporting parent. Keep user-facing updates in the Chief conversation.",
+    "Read or update a canonical organization task. Actor identity is bound to this conversation. Omit threadId to use your task; reviewers automatically target their explicitly assigned submission (their own conversation ID is an alias for that target). Other reviewer targets are rejected. Submit hashes actual manifest files; a lead with no implementation tasks submits its findings instead (findings), which become the outcome's artifact and revision. Reviewers must supply the exact revision returned by read when calling accept_review or request_changes; mismatched revisions are rejected; the server accepts a reviewed lead outcome when every pull request it opened has merged, or after that review when it opened none; agents never accept outcomes. Read results distinguish reviewAssignment (current assigned reviewer) from reviewAttestation (completed review); null task.reviewerThreadId is normal before acceptance. artifactSources gives each source's repository (relative to the project root), branch and physical worktree location, including child sources for a consolidated outcome. A lead may adopt an executor task whose parent lead was archived under the same Chief (action='adopt'), which changes only its reporting parent. Keep user-facing updates in the Chief conversation.",
   parameters: Schema.Struct({
     threadId: Schema.optional(ThreadId),
     action: Schema.Literals([
@@ -280,6 +280,7 @@ const OrganizationTaskTool = Tool.make("t3_organization_task", {
     ]),
     revision: Schema.optional(TrimmedNonEmptyString),
     manifest: Schema.optional(Schema.Array(TrimmedNonEmptyString)),
+    findings: Schema.optional(TrimmedNonEmptyString.check(Schema.isMaxLength(20_000))),
     title: Schema.optional(TrimmedNonEmptyString),
     dependencyThreadIds: Schema.optional(Schema.Array(ThreadId)),
     reviewerThreadId: Schema.optional(ThreadId),
