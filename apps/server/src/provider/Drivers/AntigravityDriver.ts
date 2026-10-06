@@ -61,6 +61,7 @@ import {
   type ProviderInstance,
 } from "../ProviderDriver.ts";
 import { mergeProviderInstanceEnvironment } from "../ProviderInstanceEnvironment.ts";
+import { agentCommandGuardDirectory, withAgentCommandGuard } from "../AgentCommandGuard.ts";
 import { withInstanceIdentity } from "./instanceIdentity.ts";
 import { discoverAntigravitySkills, resolveAntigravityUserHome } from "./AntigravitySkills.ts";
 
@@ -242,7 +243,10 @@ export const AntigravityDriver: ProviderDriver<AntigravitySettings, AntigravityD
             installation: executable,
             profile,
             cwd: input.cwd,
-            baseEnv: withAgentDeviceEnvironment(processEnvironment, input),
+            baseEnv: yield* withAgentCommandGuard(
+              withAgentDeviceEnvironment(processEnvironment, input),
+              agentCommandGuardDirectory(serverConfig.stateDir),
+            ),
             auth,
             runtimeTempDirectory,
           }),

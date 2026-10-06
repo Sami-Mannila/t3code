@@ -107,6 +107,10 @@ import {
   resolveCodexLaunchArgs,
 } from "../../provider/Layers/codexLaunchArgs.ts";
 import { mergeProviderInstanceEnvironment } from "../../provider/ProviderInstanceEnvironment.ts";
+import {
+  agentCommandGuardDirectory,
+  withAgentCommandGuard,
+} from "../../provider/AgentCommandGuard.ts";
 import * as McpProviderSession from "../../mcp/McpProviderSession.ts";
 import {
   ProviderAdapterDriverCreateError,
@@ -1477,7 +1481,10 @@ export const createCodexAdapterV2 = (
     return makeCodexAdapterV2({
       instanceId,
       settings,
-      environment: mergeProviderInstanceEnvironment(environment, hostEnvironment),
+      environment: yield* withAgentCommandGuard(
+        mergeProviderInstanceEnvironment(environment, hostEnvironment),
+        agentCommandGuardDirectory(serverConfig.stateDir),
+      ),
       clientFactory,
       fileSystem,
       idAllocator,

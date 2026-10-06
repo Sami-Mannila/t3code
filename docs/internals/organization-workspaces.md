@@ -36,7 +36,16 @@ repositories, so worktrees are tied to tasks, not to the root.
   does, once the reviewed revision's dependency tasks are accepted and every pull request the
   outcome owns has merged, or on the review alone when it owns none. A thread owns only links
   added after it was created; delegated roles start with no links, since inherited ones would
-  gate the wrong work. Removal and preparation take the same workspace lease, and removal re-checks for a
+  gate the wrong work. An open pull request from a reviewed executor's branch counts even when
+  nobody linked it; a legacy single link on the lead counts unless its parent has the same one.
+  Each attempt's command id hashes the inputs it decided on, so a refused acceptance is
+  reported to the Chief once and a later attempt can still succeed.
+- A merged pull request has to mean the user accepted the work, so agents must not merge.
+  No MCP tool merges or lets an organization agent unlink, and provider sessions get a `gh`
+  shim first on PATH
+  ([`AgentCommandGuard`](../../apps/server/src/provider/AgentCommandGuard.ts)) that refuses
+  `gh pr merge` and merge API calls. It is not a sandbox: an agent can still reach the host API
+  without `gh` (curl with a token, a query read from a file). Removal and preparation take the same workspace lease, and removal re-checks for a
   queued or active run as its last step, so a run that is preparing keeps its checkout.
 - A Git exit during preparation is usually deterministic, so the effect worker fails the run on the
   first attempt, with the command's stderr in the task notes that reach the parent and the Chief.

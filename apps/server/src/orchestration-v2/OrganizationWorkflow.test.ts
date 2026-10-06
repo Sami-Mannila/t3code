@@ -59,6 +59,7 @@ import { CodexProviderCapabilitiesV2 } from "./Adapters/CodexAdapterV2.ts";
 import * as EventSink from "./EventSink.ts";
 import * as Orchestrator from "./Orchestrator.ts";
 import * as OrganizationOutcomeAcceptanceReactor from "./OrganizationOutcomeAcceptanceReactor.ts";
+import * as GitManager from "../git/GitManager.ts";
 import type { ProviderAdapterV2Shape } from "./ProviderAdapter.ts";
 import {
   OrchestrationV2EventSinkLayerLive,
@@ -169,6 +170,29 @@ const TestLayer = Layer.mergeAll(
   Layer.provide(ServerSettings.layerTest()),
   Layer.provide(TestProviderInstanceRegistry),
   Layer.provide(PlatformTestLayer),
+);
+
+/** Pull requests open from a branch, as the host would report them; nothing by default. */
+const branchPullRequests = new Map<string, { number: number; state: "open" | "merged" }>();
+const makeReactor = OrganizationOutcomeAcceptanceReactor.make.pipe(
+  Effect.provide(
+    Layer.mock(GitManager.GitManager)({
+      branchPullRequest: ({ branch }) =>
+        Effect.succeed(
+          branchPullRequests.has(branch)
+            ? ({
+                ...branchPullRequests.get(branch)!,
+                title: "Work",
+                url: `https://github.com/acme/app/pull/${branchPullRequests.get(branch)!.number}`,
+                baseRef: "main",
+                headRef: branch,
+                repositoryKey: "github.com/acme/app",
+                updatedAt: null,
+              } as unknown as GitManager.GitBranchPullRequest)
+            : null,
+        ),
+    }),
+  ),
 );
 
 const NativeToolkitLayer = McpHttpServer.ThreadToolkitRegistrationLive.pipe(
@@ -397,7 +421,7 @@ it.effect(
       assert.equal(forbidden._tag, "Failure");
 
       // The server accepts the outcome once the pull requests it owns merge.
-      const reactor = yield* OrganizationOutcomeAcceptanceReactor.make;
+      const reactor = yield* makeReactor;
       const leadTask = threads
         .getThreadProjection(lead)
         .pipe(Effect.map((projection) => projection.thread.organization!.task!));
@@ -480,8 +504,19 @@ it.effect(
       assert.include(closedNotices[0]?.text, "PR #12 closed without merging");
 
       yield* linkPullRequests(executor, "executor-pr-merged", [link(12, linkedAt, "merged")]);
+      // A refused acceptance tells the Chief once and does not stop a later attempt.
+      yield* fs.writeFileString(`${workspace}/result.txt`, "changed before acceptance");
+      yield* reactor.sweep();
+      yield* reactor.sweep();
+      assert.equal((yield* leadTask).state, "awaiting_review");
+      const refusals = (yield* threads.getThreadProjection(chief)).messages.filter((message) =>
+        message.id.startsWith("organization-acceptance:"),
+      );
+      assert.lengthOf(refusals, 1);
+      assert.include(refusals[0]?.text, "A reviewed child artifact changed");
+      yield* fs.writeFileString(`${workspace}/result.txt`, "organization proof\n");
       // A restarted server's startup sweep finds the merge.
-      const restarted = yield* OrganizationOutcomeAcceptanceReactor.make;
+      const restarted = yield* makeReactor;
       yield* restarted.start();
       yield* restarted.drain;
       const accepted = yield* leadTask;
@@ -1434,14 +1469,23 @@ it.effect(
         { reviewedRevision: outcome.revision, reviewerThreadId: outcomeReviewer.id },
         outcomeReviewer.id,
       );
-      // No pull request was opened: the server accepts the outcome on its review.
-      yield* (yield* OrganizationOutcomeAcceptanceReactor.make).sweep();
-      const accepted = (yield* threads.getThreadProjection(lead.id)).thread.organization!.task!;
+      // The executor opened a pull request from its branch without linking it: it still holds
+      // the outcome until it merges.
+      const executorBranch = (yield* threads.getThreadProjection(executor.id)).thread.branch!;
+      const reactor = yield* makeReactor;
+      branchPullRequests.set(executorBranch, { number: 31, state: "open" });
+      yield* reactor.sweep();
+      const leadState = threads
+        .getThreadProjection(lead.id)
+        .pipe(Effect.map((projection) => projection.thread.organization!.task!));
+      assert.equal((yield* leadState).state, "awaiting_review");
+      branchPullRequests.set(executorBranch, { number: 31, state: "merged" });
+      // A fresh reactor: the branch lookup is cached for a minute.
+      yield* (yield* makeReactor).sweep();
+      branchPullRequests.delete(executorBranch);
+      const accepted = yield* leadState;
       assert.equal(accepted.state, "accepted");
-      assert.equal(
-        accepted.notes,
-        "Accepted after independent review; no pull request was opened.",
-      );
+      assert.equal(accepted.notes, "Accepted after merge of #31.");
     }).pipe(
       Effect.provide(
         Layer.mergeAll(ProcessRunner.layer, NativeToolkitLayer).pipe(

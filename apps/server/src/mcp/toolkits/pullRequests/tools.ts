@@ -108,6 +108,15 @@ export class PullRequestUnlinkFailedError extends Schema.TaggedError<PullRequest
   }
 }
 
+export class PullRequestUnlinkRefusedError extends Schema.TaggedError<PullRequestUnlinkRefusedError>()(
+  "PullRequestUnlinkRefusedError",
+  {},
+) {
+  override get message(): string {
+    return "Organization conversations keep their pull request links: they decide when the outcome is accepted. Ask the Chief if a link is wrong; only the user can remove it.";
+  }
+}
+
 export class PullRequestWatchFailedError extends Schema.TaggedError<PullRequestWatchFailedError>()(
   "PullRequestWatchFailedError",
   { cause: Schema.Defect() },
@@ -143,6 +152,7 @@ export const PullRequestToolError = Schema.Union([
   PullRequestThreadNotFoundError,
   PullRequestLinkFailedError,
   PullRequestUnlinkFailedError,
+  PullRequestUnlinkRefusedError,
   PullRequestListFailedError,
   PullRequestWatchFailedError,
   PullRequestNotOpenError,
@@ -232,7 +242,7 @@ const LinkPullRequestTool = Tool.make("link_pull_request", {
 
 const UnlinkPullRequestTool = Tool.make("unlink_pull_request", {
   description:
-    "Remove a pull request link from this thread, for example after closing a pull request you opened by mistake. Pass the URL, or repository plus number. Unlinking a pull request that is not linked succeeds with wasLinked=false.",
+    "Remove a pull request link from this thread, for example after closing a pull request you opened by mistake. Pass the URL, or repository plus number. Unlinking a pull request that is not linked succeeds with wasLinked=false. Organization conversations cannot unlink; their links gate outcome acceptance.",
   parameters: PullRequestTargetInput,
   success: UnlinkPullRequestResult,
   failure: PullRequestToolError,

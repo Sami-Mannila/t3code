@@ -97,6 +97,7 @@ const outcomeThread = (thread: Shell): OutcomeThread => ({
   title: thread.title,
   organization: thread.source.organization,
   pullRequests: thread.source.pullRequests,
+  linkedPullRequest: thread.source.linkedPullRequest,
   createdAtMs: Date.parse(thread.createdAt),
 });
 

@@ -1,6 +1,15 @@
-import type { OrganizationThread, ThreadId, ThreadPullRequestLink } from "@t3tools/contracts";
+import type {
+  OrganizationThread,
+  ThreadId,
+  ThreadLinkedPullRequest,
+  ThreadPullRequestLink,
+} from "@t3tools/contracts";
 
-import { threadPullRequestKeyOf, visibleThreadPullRequests } from "./threadPullRequests.ts";
+import {
+  threadPullRequestKeyOf,
+  threadPullRequestsOf,
+  visibleThreadPullRequests,
+} from "./threadPullRequests.ts";
 
 /** The thread fields an outcome's acceptance reads; server and client shells both map to it. */
 export interface OutcomeThread {
@@ -8,8 +17,15 @@ export interface OutcomeThread {
   readonly title: string;
   readonly organization?: OrganizationThread | null | undefined;
   readonly pullRequests?: ReadonlyArray<ThreadPullRequestLink> | undefined;
+  /** A single link from before pull request lists; it has no time it was linked. */
+  readonly linkedPullRequest?: ThreadLinkedPullRequest | null | undefined;
   /** When the thread was created. A link older than its thread was inherited, not opened by it. */
   readonly createdAtMs: number;
+  /**
+   * The pull request open from an implementation task's branch, which the server looks up; an
+   * executor can open one without linking it.
+   */
+  readonly branchPullRequest?: OutcomePullRequest | null | undefined;
 }
 
 export interface OutcomePullRequest {
@@ -61,17 +77,26 @@ export function ownedOutcomePullRequests(
     owner === lead && roundStartedAt
       ? Math.max(owner.createdAtMs, Date.parse(roundStartedAt))
       : owner.createdAtMs;
-  for (const owner of owners)
-    for (const link of visibleThreadPullRequests(owner.pullRequests ?? [])) {
-      if (Date.parse(link.linkedAt) < since(owner)) continue;
+  const add = (pullRequest: OutcomePullRequest) => {
+    if (!pullRequests.has(pullRequest.key)) pullRequests.set(pullRequest.key, pullRequest);
+  };
+  const linkKeys = (thread: OutcomeThread | undefined) =>
+    new Set(thread ? threadPullRequestsOf(thread).map(threadPullRequestKeyOf) : []);
+  for (const owner of owners) {
+    // A legacy single link has no link time. On the lead it counts unless its parent holds the
+    // same link (inherited); it then holds acceptance until it syncs, which is the safe side.
+    const legacy = owner.pullRequests === undefined && owner === lead;
+    const inherited = legacy
+      ? linkKeys(byId.get(owner.organization?.parentThreadId ?? ("" as ThreadId)))
+      : new Set<string>();
+    const links = legacy ? threadPullRequestsOf(owner) : (owner.pullRequests ?? []);
+    for (const link of visibleThreadPullRequests(links)) {
       const key = threadPullRequestKeyOf(link);
-      if (!pullRequests.has(key))
-        pullRequests.set(key, {
-          key,
-          number: link.number,
-          state: link.snapshot?.state ?? "unknown",
-        });
+      if (legacy ? inherited.has(key) : Date.parse(link.linkedAt) < since(owner)) continue;
+      add({ key, number: link.number, state: link.snapshot?.state ?? "unknown" });
     }
+    if (owner !== lead && owner.branchPullRequest) add(owner.branchPullRequest);
+  }
   // `sort` on a copy, not `toSorted`: shared code also runs on Hermes.
   return [...pullRequests.values()].sort((a, b) => a.number - b.number);
 }
